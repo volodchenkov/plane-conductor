@@ -1,0 +1,37 @@
+# Environments
+.env
+.env.local
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Operations
+logs/
+*.log
+plane-config.local.md
+plane-config.local.yaml
+plane-config.local.json
+
+# Built docs
+site/
