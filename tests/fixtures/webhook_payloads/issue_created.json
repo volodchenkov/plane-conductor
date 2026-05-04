@@ -1,0 +1,10 @@
+{
+  "event": "issue",
+  "action": "created",
+  "workspace": "example_ws",
+  "data": {
+    "id": "44444444-4444-4444-4444-444444444444",
+    "name": "Implement the cart drawer",
+    "project": "00000000-0000-0000-0000-000000000001"
+  }
+}

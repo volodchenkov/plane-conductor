@@ -1,3 +1,10 @@
+> **Design intent at v0.1.0** — captured before implementation began.
+> Current behaviour: see [`CHANGELOG.md`](../../CHANGELOG.md) and the code.
+> This document is updated on **major** architectural changes only;
+> bug-fixes and minor features do not touch it.
+
+---
+
 # Plane Conductor — Technical Specification
 
 > **Role of this document:** technical specification (how the product is built).
@@ -99,7 +106,7 @@ plane-conductor/
 │   ├── webhooks.md                      # Plane webhook setup walkthrough
 │   ├── prompts.md                       # how the agent prompt directory is structured
 │   └── examples/
-│       └── qsale-deployment.md          # case study of QSale (anonymized if needed)
+│       └── example-deployment.md       # an end-to-end case study
 │
 ├── src/
 │   └── plane_conductor/
@@ -180,7 +187,7 @@ class ResolvedMention(BaseModel):
     member_id: UUID                      # Plane member UUID
     nickname: str                        # email local part: "sark"
     prompt_role: str                     # mapped role: "system-analyst"
-    issue_identifier: str                # "QSALE-42"
+    issue_identifier: str                # "EXAMPLE-42"
     issue_uuid: UUID
     triggered_by: UUID                   # Dmitry's UUID
     triggered_at: datetime
@@ -256,9 +263,9 @@ claude --agent <nickname> --print
 ```
 
 The prompt content passed to stdin (or as positional arg) includes:
-- `Issue: QSALE-42`
+- `Issue: EXAMPLE-42`
 - `Triggered by: <member email>`
-- `Plane URL: https://plane.suze.io/qsale/projects/.../issues/<uuid>/`
+- `Plane URL: https://plane.example.io/example_ws/projects/.../issues/<uuid>/`
 
 Inside Claude Code, the agent prompt (e.g. `python-developer.md`) defines its own re-entry logic (read root issue → check own sub-issue exists → continuation/rework/first-run, see plane-api.md §7). Plane Conductor doesn't manage agent state — it only spawns and logs.
 
@@ -270,10 +277,10 @@ Inside Claude Code, the agent prompt (e.g. `python-developer.md`) defines its ow
 
 ```bash
 # Plane connection
-PLANE_BASE_URL=https://plane.suze.io
+PLANE_BASE_URL=https://plane.example.io
 PLANE_API_KEY=plane_api_xxxxxxxxxxxxx
-PLANE_WORKSPACE_SLUG=qsale
-PLANE_PROJECT_ID=ba6d77f4-5086-4a35-8cef-a4e45111e91f
+PLANE_WORKSPACE_SLUG=example_ws
+PLANE_PROJECT_ID=00000000-0000-0000-0000-000000000001
 
 # Webhook
 WEBHOOK_SECRET=use-openssl-rand-hex-32-here
@@ -281,9 +288,9 @@ WEBHOOK_HOST=0.0.0.0
 WEBHOOK_PORT=8000
 
 # Agent invocation
-EMAIL_DOMAIN=qsale.io                         # used to construct bot emails: <nick>@qsale.io
-PROMPTS_DIR=/home/user/Projects/qsale/.claude/agents
-INITIATOR_UUID=d3ee78fe-dfe4-4cbe-a60f-bc24b18f2f92  # Dmitry, ignored as mention target
+EMAIL_DOMAIN=example.io                         # used to construct bot emails: <nick>@example.io
+PROMPTS_DIR=/home/user/Projects/yourproject/.claude/agents
+INITIATOR_UUID=00000000-0000-0000-0000-000000000099  # Dmitry, ignored as mention target
 
 # Operations
 LOG_DIR=/var/log/plane-conductor
@@ -356,7 +363,7 @@ services:
 ```nginx
 # examples/nginx.conf
 server {
-    server_name conductor.suze.io;
+    server_name conductor.example.io;
     listen 443 ssl;
     location /webhook {
         proxy_pass http://localhost:8000;

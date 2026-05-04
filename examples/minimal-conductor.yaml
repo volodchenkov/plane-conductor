@@ -1,0 +1,15 @@
+# Minimal example workflow — one developer agent, no labels, no states.
+# Useful as a starting template: copy, edit, point CONDUCTOR_CONFIG at it.
+
+agents:
+  - nickname: dev
+    prompt_role: developer
+    display_name: Dev
+
+labels:
+  artifacts: []
+  roles: []
+
+states: []
+
+announce_spawn: true

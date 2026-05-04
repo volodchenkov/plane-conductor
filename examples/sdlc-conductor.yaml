@@ -1,0 +1,91 @@
+# Example workflow config — full SDLC pipeline
+# (analyst → architect → designer → coders → testers → reviewer)
+#
+# This is the SDLC workflow that ships as a starter. Copy to
+# /etc/plane-conductor/conductor.yaml (or wherever CONDUCTOR_CONFIG points)
+# and edit to taste — change agent nicknames, add/remove roles, swap labels.
+#
+# How nickname → agent works:
+#   1. The user mentions @<nickname> in a Plane issue comment.
+#   2. Plane sends a webhook; the orchestrator looks up the mentioned member's
+#      email (e.g. <nickname>@<EMAIL_DOMAIN>) and splits the local-part.
+#   3. The local-part is matched here in `agents` → spawns
+#      `claude --agent <nickname> --print` with the issue context piped to stdin.
+#   4. The agent's prompt file `<prompt_role>.md` lives in $PROMPTS_DIR; that
+#      file is what actually defines the agent's behaviour and Plane operations.
+
+agents:
+  - nickname: castor
+    prompt_role: business-analyst
+    display_name: Castor — Business Analyst
+  - nickname: sark
+    prompt_role: system-analyst
+    display_name: Sark — System Analyst
+  - nickname: flynn
+    prompt_role: architect
+    display_name: Flynn — Architect
+  - nickname: quorra
+    prompt_role: designer
+    display_name: Quorra — Designer
+  - nickname: rinzler
+    prompt_role: python-developer
+    display_name: Rinzler — Python Dev
+  - nickname: ram
+    prompt_role: vue-developer
+    display_name: Ram — Vue Dev
+  - nickname: beck
+    prompt_role: react-developer
+    display_name: Beck — React Dev
+  - nickname: yori
+    prompt_role: api-tester
+    display_name: Yori — API Tester
+  - nickname: gem
+    prompt_role: ui-tester
+    display_name: Gem — UX Tester
+  - nickname: dumont
+    prompt_role: reviewer
+    display_name: Dumont — Reviewer
+
+# Project labels created by `plane-conductor setup`.
+# Two conventional groups:
+#   artifacts:* — tag a sub-issue with the agent role that produced it
+#                 (used by agents to find each other's outputs)
+#   roles:*     — reserve, used when one agent comments inside another's
+#                 sub-issue and wants to mark whose voice it is
+labels:
+  artifacts:
+    - { name: "artifact:requirements", color: "#7c3aed" }
+    - { name: "artifact:spec", color: "#3b82f6" }
+    - { name: "artifact:design", color: "#ec4899" }
+    - { name: "artifact:backend", color: "#10b981" }
+    - { name: "artifact:frontend", color: "#22d3ee" }
+    - { name: "artifact:api-testing", color: "#f59e0b" }
+    - { name: "artifact:ux-testing", color: "#f97316" }
+    - { name: "artifact:review", color: "#ef4444" }
+  roles:
+    - { name: "role:business-analyst", color: "#a78bfa" }
+    - { name: "role:system-analyst", color: "#60a5fa" }
+    - { name: "role:architect", color: "#818cf8" }
+    - { name: "role:designer", color: "#f472b6" }
+    - { name: "role:python-developer", color: "#34d399" }
+    - { name: "role:vue-developer", color: "#4ade80" }
+    - { name: "role:react-developer", color: "#67e8f9" }
+    - { name: "role:api-tester", color: "#fbbf24" }
+    - { name: "role:ui-tester", color: "#fb923c" }
+    - { name: "role:reviewer", color: "#fca5a5" }
+
+# Optional decorative project states (only created with `setup --states`).
+# Plane's stock states (Backlog/Todo/In Progress/Done/Cancelled) are always
+# present — these are extras that match the workflow vocabulary.
+#   group must be one of: backlog | unstarted | started | completed | cancelled
+states:
+  - { name: Review, group: started, color: "#f59e0b" }
+  - { name: Blocked, group: unstarted, color: "#ef4444" }
+
+# Behaviour ------------------------------------------------------------------
+
+# When true, the orchestrator posts a "@<nick> picking up" comment to the issue
+# the moment it spawns the agent, and updates that same comment when the agent
+# exits with the duration + outcome. Recommended — gives instant feedback even
+# if the agent itself is slow to respond.
+announce_spawn: true

@@ -1,0 +1,12 @@
+services:
+  plane-conductor:
+    build: ..
+    image: plane-conductor:local
+    env_file: ../.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/var/log/plane-conductor
+      - ${PROMPTS_DIR:-./prompts}:/prompts:ro
+    restart: unless-stopped
+    command: ["plane-conductor", "serve", "--host", "0.0.0.0", "--port", "8000"]

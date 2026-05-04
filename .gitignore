@@ -35,3 +35,8 @@ plane-config.local.json
 
 # Built docs
 site/
+
+# Personal Claude Code skills (workflow-specific instructions for spawned
+# agents). They live alongside the orchestrator for convenience but are
+# their own concern — not part of Plane Conductor's public surface.
+/skills/

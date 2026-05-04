@@ -1,0 +1,14 @@
+{
+  "event": "issue_comment",
+  "action": "created",
+  "workspace": "example_ws",
+  "data": {
+    "id": "55555555-5555-5555-5555-555555555555",
+    "issue": "44444444-4444-4444-4444-444444444444",
+    "project": "00000000-0000-0000-0000-000000000001",
+    "actor": "00000000-0000-0000-0000-000000000099",
+    "comment_html": "<p>hey <mention-component entity_identifier=\"11111111-1111-1111-1111-111111111111\" entity_name=\"user_mention\"></mention-component>, please draft the spec.</p>",
+    "comment_stripped": "hey @sark, please draft the spec.",
+    "created_at": "2026-04-30T12:34:56Z"
+  }
+}

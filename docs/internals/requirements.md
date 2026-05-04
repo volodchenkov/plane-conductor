@@ -1,3 +1,10 @@
+> **Design intent at v0.1.0** — captured before implementation began.
+> Current behaviour: see [`CHANGELOG.md`](../../CHANGELOG.md) and the code.
+> This document is updated on **major** architectural changes only;
+> bug-fixes and minor features do not touch it.
+
+---
+
 # Plane Conductor — Requirements
 
 > **Role of this document:** business requirements (what the product does and why).
@@ -27,7 +34,7 @@ The user works in Plane as they normally would. Mentioning a bot user (`@sark`, 
 ## 4. Core use cases
 
 ### UC-1: Trigger an agent via Plane mention
-Initiator mentions `@sark` in a comment of issue `QSALE-42`. Plane sends a webhook. Plane Conductor:
+Initiator mentions `@sark` in a comment of issue `EXAMPLE-42`. Plane sends a webhook. Plane Conductor:
 1. Receives the webhook event.
 2. Resolves the mentioned member to an agent role (via member email → nickname → prompt file mapping).
 3. Spawns a Claude Code subprocess with the corresponding agent and the issue ID as context.
@@ -60,7 +67,7 @@ The user can see:
 
 ### FR-3: Agent dispatcher
 - For each resolved agent, spawns `claude --agent <nickname>` as a subprocess.
-- Passes issue identifier (e.g. `QSALE-42`) as context.
+- Passes issue identifier (e.g. `EXAMPLE-42`) as context.
 - Captures stdout/stderr to a per-run log file with timestamp.
 - Manages a registry of running sessions to prevent duplicates (same agent + same issue should not run twice in parallel).
 
@@ -118,7 +125,7 @@ The user can see:
 ## 8. Constraints
 
 - The pipeline protocol is defined in `~/Projects/claude-workspace/projects/qa/.agents/knowledge/plane-api.md`. Plane Conductor must follow its mapping table (§3) for member→prompt routing.
-- Agent prompts live in a separate directory (`~/Projects/qsale/.claude/agents/` for QSale, configurable). Plane Conductor only invokes Claude Code; it does not inline prompts.
+- Agent prompts live in a separate directory (`~/Projects/yourproject/.claude/agents/` for the example workflow, configurable). Plane Conductor only invokes Claude Code; it does not inline prompts.
 - Self-hosted Plane (Plane Community Edition). The Plane MCP server (makeplane/plane-mcp-server) is used by **agents**, not by Plane Conductor itself. Plane Conductor talks to Plane via the REST API directly (it needs access that MCP doesn't expose, e.g. invite users, create labels in bulk).
 
 ## 9. Success criteria
