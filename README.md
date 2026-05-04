@@ -13,16 +13,16 @@
 
 ```mermaid
 flowchart LR
-    Human["💬 @sark draft a SPEC<br/><i>(Plane comment)</i>"]
+    Human["💬 @dev implement the cart drawer<br/><i>(Plane comment)</i>"]
     Plane[Plane]
     Conductor["Plane<br/>Conductor"]
-    Claude["claude --agent sark<br/>--print<br/><i>(local subprocess)</i>"]
+    Claude["claude --agent dev<br/>--print<br/><i>(local subprocess)</i>"]
 
     Human --> Plane
     Plane -->|webhook<br/>HMAC-signed| Conductor
     Conductor -->|spawn| Claude
-    Claude -.->|writes SPEC<br/>sub-issue| Plane
-    Conductor -->|"comment:<br/>@sark picking up.<br/>…done. 3m12s."| Plane
+    Claude -.->|writes results<br/>back into the issue| Plane
+    Conductor -->|"comment:<br/>@dev picking up.<br/>…done. 3m12s."| Plane
 ```
 
 What it looks like once a mention lands:
@@ -30,26 +30,27 @@ What it looks like once a mention lands:
 ```text
 $ journalctl -u plane-conductor -f
 … POST /webhook 200
-… agent_spawned   nickname=sark issue=6f042494 pid=500013
+… agent_spawned   nickname=dev issue=6f042494 pid=500013
 … (3m12s later)
-… agent_exited    nickname=sark exit_code=0 duration_s=192.4
+… agent_exited    nickname=dev exit_code=0 duration_s=192.4
 ```
 
 Plane shows one comment that was posted at spawn and then *edited* on
 exit:
 
-> **`@sark` picking up.** Working on it — this comment will be updated when the agent finishes.
+> **`@dev` picking up.** Working on it — this comment will be updated when the agent finishes.
 >
 > *(3m12s later, edited:)*
 >
-> **`@sark` done.** Duration: 3m12s.
+> **`@dev` done.** Duration: 3m12s.
 
 ---
 
 ## What it does
 
-You configure a roster of agents in `conductor.yaml` (e.g. `castor →
-business-analyst`, `sark → system-analyst`, …). Each becomes a bot
+You configure a roster of agents in `conductor.yaml` (each entry maps a
+`<nickname>` to a `<prompt-role>.md` file in your local prompts dir).
+Each becomes a bot
 account in Plane. Mention `@<nickname>` in any issue comment — Plane
 sends a webhook, Plane Conductor verifies the signature, resolves the
 mention, and spawns `claude --agent <nickname> --print` on the host

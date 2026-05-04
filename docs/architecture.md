@@ -22,15 +22,15 @@ sequenceDiagram
     participant Tunnel as cloudflared / proxy
     participant Conductor
     participant PlaneAPI as Plane REST API
-    participant Claude as claude --agent X --print
+    participant Claude as claude --agent dev --print
 
-    Human->>Plane: comment "@sark draft a SPEC"
+    Human->>Plane: comment "@dev implement the cart drawer"
     Plane->>Tunnel: POST /webhook (HMAC-signed body)
     Tunnel->>Conductor: forward
     Conductor->>Conductor: verify HMAC, parse mention UUID
     Conductor->>PlaneAPI: GET /workspaces/.../members/
     PlaneAPI-->>Conductor: members list (find by UUID)
-    Conductor->>PlaneAPI: POST comment "@sark picking up. Working…"
+    Conductor->>PlaneAPI: POST comment "@dev picking up. Working…"
     PlaneAPI-->>Conductor: { id: c1 }
     Conductor->>Claude: spawn (start_new_session=True)
     Conductor-->>Plane: 200 OK
