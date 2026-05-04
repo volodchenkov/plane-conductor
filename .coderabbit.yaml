@@ -1,0 +1,86 @@
+# CodeRabbit configuration for plane-conductor.
+# Reference: https://docs.coderabbit.ai/getting-started/configure-coderabbit
+#
+# Tone: "chill" — we're a small project, low-volume PRs; not a corporate codebase
+# that benefits from aggressive nitpicking. Reviews still cover correctness,
+# security, type-safety, missing tests — just no poem and no drama.
+
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill                  # chill | assertive
+  request_changes_workflow: false # don't auto-request changes; suggestions only
+  high_level_summary: true        # post a one-paragraph PR summary
+  high_level_summary_placeholder: "@coderabbitai summary"
+  poem: false                     # no haiku, please
+  review_status: true             # post a status comment
+  collapse_walkthrough: false     # keep walkthrough expanded by default
+  changed_files_summary: true     # per-file summary table
+
+  # Auto-trigger on every PR opened or new commits on existing PRs.
+  auto_review:
+    enabled: true
+    drafts: false                 # don't waste cycles on drafts
+    base_branches:
+      - main
+
+  # Skip noise that doesn't benefit from a code review:
+  #   - lock files (pinned by tooling, no human-decision content)
+  #   - bootstrap design docs (frozen "intent at v0.1")
+  #   - logs / generated artifacts
+  path_filters:
+    - "!**/uv.lock"
+    - "!**/poetry.lock"
+    - "!**/pnpm-lock.yaml"
+    - "!**/package-lock.json"
+    - "!docs/internals/**"
+    - "!logs/**"
+    - "!**/*.log"
+
+  # Per-path instructions tell CodeRabbit what we actually care about in each
+  # corner of the codebase. These bias the review toward our priorities.
+  path_instructions:
+    - path: "src/plane_conductor/**/*.py"
+      instructions: |
+        Type-checked with mypy strict. Flag any `# type: ignore` that lacks a
+        reason comment. Flag bare `except` clauses. Flag missing await on
+        async calls. Pydantic models use `extra="forbid"` — don't suggest
+        relaxing it.
+    - path: "src/plane_conductor/runner.py"
+      instructions: |
+        This file owns subprocess lifecycle. Be especially careful about:
+        process-group cleanup (start_new_session=True + killpg), sentinel
+        file lifecycle (write before spawn, remove on any exit path),
+        timeout escalation (SIGTERM → SIGKILL after 5s), and the dedup +
+        capacity guards. Race conditions here are real. Tests live in
+        tests/test_runner.py.
+    - path: "src/plane_conductor/webhook.py"
+      instructions: |
+        HMAC verification must be constant-time. Plane sends webhooks
+        at-least-once — the handler must be idempotent (the dedup is in
+        Runner, not here, but webhook must surface SessionAlreadyRunningError
+        as `skipped`, not 500). Transient Plane API errors must return 503;
+        4xx must return 200 with a skipped[] entry.
+    - path: "tests/**/*.py"
+      instructions: |
+        Tests should not call out to real services unless gated by
+        `PLANE_E2E=1`. New tests for Runner that spawn real subprocesses
+        must use `/bin/true` / `/bin/false` / a temporary shell script in
+        tmp_path, never something that depends on $PATH or network.
+    - path: "setup/install.sh"
+      instructions: |
+        This script runs as root. Must remain idempotent (re-running is
+        safe). Must not write outside its declared paths
+        (/opt/plane-conductor, /etc/plane-conductor, /var/log/plane-conductor,
+        /etc/systemd/system/plane-conductor.service,
+        /etc/logrotate.d/plane-conductor). Must never overwrite an existing
+        /etc/plane-conductor/.env (only create when absent).
+    - path: "examples/*.yaml"
+      instructions: |
+        These are user-facing example configs. Must validate against
+        ConductorConfig (extra="forbid"); a typo here breaks first-time
+        users.
+
+chat:
+  auto_reply: true                # answer @coderabbitai mentions in PR threads
