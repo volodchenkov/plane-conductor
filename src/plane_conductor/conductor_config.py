@@ -16,11 +16,12 @@ concerns (port, log dir, capacity, timeouts) — nothing workspace-specific.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from uuid import UUID
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class AgentDef(BaseModel):
@@ -126,9 +127,43 @@ class WorkspaceConfig(BaseModel):
 
     # --- validators / helpers ---------------------------------------------
 
+    @field_validator("workspace_slug", mode="before")
+    @classmethod
+    def _validate_slug(cls, v: object) -> str:
+        # Slug becomes the URL path segment (`/<slug>/webhook`) and the prefix
+        # of every log/sentinel filename. Reject anything that is not safe in
+        # both contexts: lowercase a-z/0-9/-, must start alphanumeric, max 63.
+        if not isinstance(v, str):
+            raise ValueError("workspace_slug must be a string")
+        s = v.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", s):
+            raise ValueError(
+                "workspace_slug must be 1-63 chars, lowercase a-z/0-9/-, starting with a-z or 0-9"
+            )
+        return s
+
+    @field_validator("webhook_secret", mode="after")
+    @classmethod
+    def _validate_webhook_secret(cls, v: str) -> str:
+        # Each workspace's HMAC secret is the only thing standing between an
+        # attacker who knows the URL and a remote agent spawn. Reject the
+        # shipped placeholder and anything below 32 chars (one workspace ==
+        # one openssl-rand-hex-32 secret).
+        secret = v.strip()
+        if secret == "replace-me-with-openssl-rand-hex-32":
+            raise ValueError(
+                "webhook_secret is still the example placeholder; replace it "
+                "(generate a fresh secret with `openssl rand -hex 32`)"
+            )
+        if len(secret) < 32:
+            raise ValueError(
+                "webhook_secret must be at least 32 characters (use "
+                "`openssl rand -hex 32` to generate a strong one)"
+            )
+        return secret
+
     @model_validator(mode="after")
     def _normalize(self) -> WorkspaceConfig:
-        object.__setattr__(self, "workspace_slug", self.workspace_slug.lower())
         object.__setattr__(self, "plane_base_url", self.plane_base_url.rstrip("/"))
         object.__setattr__(
             self,

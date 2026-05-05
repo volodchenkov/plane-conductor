@@ -16,10 +16,10 @@
 # Steps (idempotent):
 #   1. Pick service user (your user or system 'conductor' on --system-user)
 #   2. Sync source + venv to <prefix>
-#   3. Drop /etc/plane-conductor/.env skeleton if absent
+#   3. Drop /etc/plane-conductor/runtime.env skeleton if absent
 #   4. Set up /var/log/plane-conductor with logrotate
 #   5. Install the systemd unit
-#   6. Print next steps (does NOT auto-start until you edit .env)
+#   6. Print next steps (does NOT auto-start until you edit runtime.env)
 
 set -euo pipefail
 
@@ -166,7 +166,10 @@ chown "root:${SERVICE_GROUP}" "$WORKSPACES_DIR"
 
 # Drop a starter SDLC workspace if the directory is empty. User renames the
 # file to match their actual workspace_slug, edits secrets/creds, chmod 600.
-if ! ls -1 "$WORKSPACES_DIR"/*.yaml "$WORKSPACES_DIR"/*.yml >/dev/null 2>&1; then
+shopt -s nullglob
+_existing_ws=("$WORKSPACES_DIR"/*.yaml "$WORKSPACES_DIR"/*.yml)
+shopt -u nullglob
+if [[ ${#_existing_ws[@]} -eq 0 ]]; then
     log "writing workspace skeleton → ${WORKSPACES_DIR}/sdlc.yaml (rename to match your workspace slug)"
     cp "${PREFIX}/examples/conductor.d/sdlc.yaml" "${WORKSPACES_DIR}/sdlc.yaml"
     chmod 600 "${WORKSPACES_DIR}/sdlc.yaml"
@@ -261,7 +264,7 @@ systemctl daemon-reload
 # ---------------------------------------------------------------------------
 if ! sudo -u "$SERVICE_USER" -- bash -lc 'command -v claude' >/dev/null 2>&1; then
     warn "the 'claude' CLI is not on the PATH for user '$SERVICE_USER'."
-    warn "install Claude Code or set CLAUDE_BINARY=/full/path in ${CONFIG_DIR}/.env"
+    warn "install Claude Code or set CLAUDE_BINARY=/full/path in ${CONFIG_DIR}/runtime.env"
 fi
 
 if [[ -n "${SERVICE_HOME}" ]] && [[ ! -f "${SERVICE_HOME}/.claude.json" ]]; then

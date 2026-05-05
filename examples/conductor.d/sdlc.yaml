@@ -22,7 +22,8 @@ project_id: 00000000-0000-0000-0000-000000000000
 initiator_uuid: 00000000-0000-0000-0000-000000000099
 
 # --- Webhook ---
-webhook_secret: replace-me-with-openssl-rand-hex-32
+# Replace with: openssl rand -hex 32
+webhook_secret: "0000000000000000000000000000000000000000000000000000000000000000"
 
 # --- Agent invocation ---
 email_domain: example.io

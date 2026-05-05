@@ -145,7 +145,7 @@ agents:
 When a Plane mention resolves to email `castor@<email_domain>` and there's an
 `agents` entry with `nickname: castor`, the orchestrator runs:
 
-```
+```bash
 claude --agent castor --print
 ```
 
@@ -213,7 +213,7 @@ Set to `false` only if you specifically want the issue thread to look
 
 Directory layout on the host:
 
-```
+```text
 /etc/plane-conductor/
   runtime.env                       # 640, root:<your-group>
   conductor.d/
@@ -275,7 +275,7 @@ One process serves both. `MAX_CONCURRENT_SESSIONS` is the host-wide cap.
 
 ## Where the orchestrator looks at startup
 
-```
+```text
 /etc/plane-conductor/runtime.env  ← system runtime config (loaded first)
 /etc/plane-conductor/.env         ← legacy filename, still honoured
 ./runtime.env                     ← cwd runtime config (overrides)

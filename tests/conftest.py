@@ -30,7 +30,7 @@ def project_uuid() -> UUID:
 
 @pytest.fixture
 def webhook_secret() -> str:
-    return "test-secret-do-not-use"
+    return "test-secret-do-not-use-please-this-is-32-chars-long"
 
 
 @pytest.fixture

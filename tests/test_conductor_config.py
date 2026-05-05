@@ -29,7 +29,7 @@ def _ws(slug: str = "acme", **overrides: object) -> WorkspaceConfig:
         "plane_api_key": "k",
         "project_id": PROJECT,
         "initiator_uuid": INITIATOR,
-        "webhook_secret": "s",
+        "webhook_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         "email_domain": "x.io",
         "prompts_dir": Path("/tmp/prompts"),
         "agents": [AgentDef(nickname="dev", prompt_role="developer")],
@@ -116,7 +116,7 @@ def _write_ws_yaml(path: Path, slug: str = "acme") -> None:
         "plane_api_key: k\n"
         f"project_id: {PROJECT}\n"
         f"initiator_uuid: {INITIATOR}\n"
-        "webhook_secret: s\n"
+        "webhook_secret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
         "email_domain: x.io\n"
         "prompts_dir: /tmp/prompts\n"
         "agents:\n"
@@ -221,3 +221,46 @@ def test_example_states_have_valid_groups() -> None:
         StateDef(name="Review", group="started", color="#f59e0b"),
         StateDef(name="Blocked", group="unstarted", color="#ef4444"),
     ]
+
+
+# --- security validators -----------------------------------------------------
+
+
+def test_webhook_secret_rejects_placeholder() -> None:
+    with pytest.raises(ValidationError, match="placeholder"):
+        _ws(webhook_secret="replace-me-with-openssl-rand-hex-32")
+
+
+def test_webhook_secret_rejects_too_short() -> None:
+    with pytest.raises(ValidationError, match="at least 32"):
+        _ws(webhook_secret="short")
+
+
+def test_webhook_secret_accepts_32_chars() -> None:
+    cfg = _ws(webhook_secret="x" * 32)
+    assert cfg.webhook_secret == "x" * 32
+
+
+@pytest.mark.parametrize(
+    "bad_slug",
+    [
+        "Has Space",
+        "with/slash",
+        "{templated}",
+        "with:colon",
+        "-leading-dash",
+        "",
+        "a" * 64,  # too long
+        "trailing.",
+        "uppercase.allowed.through.lowercase.but.dot.is.bad",
+    ],
+)
+def test_workspace_slug_rejects_unsafe_characters(bad_slug: str) -> None:
+    with pytest.raises(ValidationError, match="workspace_slug"):
+        _ws(slug=bad_slug)
+
+
+@pytest.mark.parametrize("good_slug", ["acme", "acme-prod", "qsale", "ws1", "0-1-2", "a"])
+def test_workspace_slug_accepts_safe_characters(good_slug: str) -> None:
+    cfg = _ws(slug=good_slug)
+    assert cfg.workspace_slug == good_slug

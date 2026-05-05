@@ -13,7 +13,8 @@ plane_base_url: https://plane.example.io
 plane_api_key: plane_api_xxxxxxxxxxxxxxxxxxxxxxxx
 project_id: 00000000-0000-0000-0000-000000000000
 initiator_uuid: 00000000-0000-0000-0000-000000000099
-webhook_secret: replace-me-with-openssl-rand-hex-32
+# Replace with: openssl rand -hex 32
+webhook_secret: "0000000000000000000000000000000000000000000000000000000000000000"
 
 email_domain: example.io
 prompts_dir: /home/you/Projects/content/.claude/agents
