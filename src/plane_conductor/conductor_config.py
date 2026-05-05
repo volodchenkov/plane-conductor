@@ -1,18 +1,23 @@
-"""Workflow config — agents, labels, states. Loaded from a YAML file.
+"""Workspace config — one self-contained YAML per workspace.
 
-This is separate from `Settings` (which holds *runtime* config — ports, secrets,
-paths). `ConductorConfig` describes *what* the orchestrator should do: which
-nicknames map to which prompt roles, what labels the project should have,
-whether to publish a "spawning…" comment when an agent starts.
+Layout (nginx-vhost style):
 
-A workflow config file is **mandatory** for `serve` and `setup`. Ship one or
-more example configs in `examples/`; users copy + edit + point
-`CONDUCTOR_CONFIG=` at it.
+    /etc/plane-conductor/conductor.d/
+        qsale.yaml      # full self-contained workspace (creds + workflow)
+        aist.yaml
+
+Each file describes ONE workspace: Plane creds, project, initiator, agent
+working dir, prompts dir, plus the agents / labels / states for that
+workspace's workflow. Files are gitignored on the host (they hold secrets).
+
+The top-level `Settings` (see `config.py`) keeps only host-wide runtime
+concerns (port, log dir, capacity, timeouts) — nothing workspace-specific.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import UUID
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -37,7 +42,6 @@ class AgentDef(BaseModel):
 
     @model_validator(mode="after")
     def _normalize(self) -> AgentDef:
-        # Nicknames are case-insensitive; canonicalise to lower so dedup works.
         object.__setattr__(self, "nickname", self.nickname.lower())
         return self
 
@@ -67,30 +71,74 @@ class LabelsConfig(BaseModel):
     roles: list[LabelDef] = Field(default_factory=list)
 
 
-class ConductorConfig(BaseModel):
-    """Top-level workflow config (loaded from YAML)."""
+class WorkspaceConfig(BaseModel):
+    """Self-contained per-workspace config. One YAML file per workspace."""
 
     model_config = ConfigDict(extra="forbid")
 
+    # --- identity / Plane connection ---------------------------------------
+    workspace_slug: str = Field(
+        ...,
+        description="Workspace slug (lowercase). Path segment of the webhook URL: /<slug>/webhook.",
+    )
+    plane_base_url: str = Field(..., description="Plane base URL, e.g. https://plane.example.io")
+    plane_api_key: str = Field(..., description="Plane API token (workspace-scoped)")
+    project_id: UUID = Field(..., description="Project UUID inside the workspace.")
+    initiator_uuid: UUID = Field(
+        ...,
+        description="Human initiator UUID — ignored as a target so we don't trigger you as an agent.",
+    )
+
+    # --- webhook -----------------------------------------------------------
+    webhook_secret: str = Field(
+        ..., description="HMAC secret for inbound webhook verification (per workspace)."
+    )
+    webhook_signature_header: str = Field(
+        default="X-Plane-Signature", description="Header Plane uses to send the signature."
+    )
+
+    # --- agent invocation --------------------------------------------------
+    email_domain: str = Field(
+        ..., description="Bot email domain. setup invites <nickname>@<email_domain>."
+    )
+    prompts_dir: Path = Field(..., description="Directory holding agent prompt files (<role>.md).")
+    agent_working_dir: Path | None = Field(
+        default=None, description="Working dir for spawned claude. Defaults to cwd."
+    )
+
+    # --- workflow ----------------------------------------------------------
     agents: list[AgentDef]
     labels: LabelsConfig = Field(default_factory=LabelsConfig)
     states: list[StateDef] = Field(default_factory=list)
 
-    # Behaviour flags --------------------------------------------------------
-
+    # --- behaviour ---------------------------------------------------------
     announce_spawn: bool = Field(
         default=True,
         description=(
-            "When true, Plane Conductor posts a 'Picking up @nick…' comment to the issue "
-            "as soon as an agent is spawned, and updates it to a final status on exit. "
+            "When true, post a 'Picking up @nick…' comment on spawn and update it on exit. "
             "Gives instant feedback in Plane even before the agent itself produces output."
         ),
     )
+    allowed_nicknames: list[str] = Field(
+        default_factory=list,
+        description="Allow-list of nicknames. Empty = allow all configured agents.",
+    )
 
-    # Helpers ----------------------------------------------------------------
+    # --- validators / helpers ---------------------------------------------
 
     @model_validator(mode="after")
-    def _ensure_unique_nicknames(self) -> ConductorConfig:
+    def _normalize(self) -> WorkspaceConfig:
+        object.__setattr__(self, "workspace_slug", self.workspace_slug.lower())
+        object.__setattr__(self, "plane_base_url", self.plane_base_url.rstrip("/"))
+        object.__setattr__(
+            self,
+            "allowed_nicknames",
+            [n.lower().strip() for n in self.allowed_nicknames if n and n.strip()],
+        )
+        return self
+
+    @model_validator(mode="after")
+    def _ensure_unique_nicknames(self) -> WorkspaceConfig:
         seen: set[str] = set()
         for a in self.agents:
             if a.nickname in seen:
@@ -107,10 +155,46 @@ class ConductorConfig(BaseModel):
     def all_label_names(self) -> list[str]:
         return [lbl.name for lbl in self.all_labels()]
 
+    @property
+    def allowed_nicknames_set(self) -> frozenset[str]:
+        return frozenset(self.allowed_nicknames)
 
-def load_config(path: Path) -> ConductorConfig:
-    """Load + validate a conductor.yaml. Raises pydantic ValidationError on bad input."""
+
+def load_workspace(path: Path) -> WorkspaceConfig:
+    """Load + validate one workspace YAML."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: top-level must be a mapping, got {type(raw).__name__}")
-    return ConductorConfig.model_validate(raw)
+    return WorkspaceConfig.model_validate(raw)
+
+
+def load_workspaces(directory: Path) -> dict[str, WorkspaceConfig]:
+    """Scan a directory for `*.yaml` / `*.yml` workspace configs.
+
+    Returns a slug-keyed dict. Validates that:
+      - the directory exists and contains at least one workspace file
+      - every file's filename stem matches its `workspace_slug` (catches typos)
+      - slugs are unique across files
+    """
+    if not directory.exists():
+        raise FileNotFoundError(f"conductor dir not found: {directory}")
+    if not directory.is_dir():
+        raise NotADirectoryError(f"conductor dir is not a directory: {directory}")
+
+    files = sorted(
+        [p for p in directory.iterdir() if p.suffix in {".yaml", ".yml"} and p.is_file()]
+    )
+    if not files:
+        raise FileNotFoundError(f"no *.yaml workspace configs found in {directory}")
+
+    workspaces: dict[str, WorkspaceConfig] = {}
+    for path in files:
+        ws = load_workspace(path)
+        if ws.workspace_slug != path.stem.lower():
+            raise ValueError(
+                f"{path}: workspace_slug={ws.workspace_slug!r} does not match filename stem {path.stem!r}"
+            )
+        if ws.workspace_slug in workspaces:
+            raise ValueError(f"duplicate workspace_slug {ws.workspace_slug!r} across files")
+        workspaces[ws.workspace_slug] = ws
+    return workspaces

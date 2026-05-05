@@ -1,0 +1,34 @@
+# Minimal example workspace — single dev agent. Copy to
+# /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, set chmod 600.
+#
+# IMPORTANT: this file holds secrets. Do NOT commit your edited copy.
+
+# --- Identity / Plane connection ---
+workspace_slug: minimal           # MUST match the filename stem.
+plane_base_url: https://plane.example.io
+plane_api_key: plane_api_xxxxxxxxxxxxxxxxxxxxxxxx
+project_id: 00000000-0000-0000-0000-000000000000
+initiator_uuid: 00000000-0000-0000-0000-000000000099  # your Plane member UUID
+
+# --- Webhook ---
+# openssl rand -hex 32
+webhook_secret: replace-me-with-openssl-rand-hex-32
+
+# --- Agent invocation ---
+email_domain: example.io
+prompts_dir: /home/you/Projects/yourproject/.claude/agents
+agent_working_dir: /home/you/Projects/yourproject
+
+# --- Workflow ---
+agents:
+  - nickname: dev
+    prompt_role: developer
+    display_name: Dev
+
+labels:
+  artifacts: []
+  roles: []
+
+states: []
+
+announce_spawn: true

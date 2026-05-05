@@ -1,19 +1,35 @@
-# Example workflow config — full SDLC pipeline
-# (analyst → architect → designer → coders → testers → reviewer)
+# SDLC example workspace — full pipeline (analyst → architect → designer →
+# coders → testers → reviewer). 10 agents.
 #
-# This is the SDLC workflow that ships as a starter. Copy to
-# /etc/plane-conductor/conductor.yaml (or wherever CONDUCTOR_CONFIG points)
-# and edit to taste — change agent nicknames, add/remove roles, swap labels.
+# Copy to /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, chmod 600.
+# IMPORTANT: this file holds secrets. Do NOT commit your edited copy.
 #
 # How nickname → agent works:
 #   1. The user mentions @<nickname> in a Plane issue comment.
-#   2. Plane sends a webhook; the orchestrator looks up the mentioned member's
-#      email (e.g. <nickname>@<EMAIL_DOMAIN>) and splits the local-part.
-#   3. The local-part is matched here in `agents` → spawns
-#      `claude --agent <nickname> --print` with the issue context piped to stdin.
-#   4. The agent's prompt file `<prompt_role>.md` lives in $PROMPTS_DIR; that
-#      file is what actually defines the agent's behaviour and Plane operations.
+#   2. Plane sends a webhook to /<workspace_slug>/webhook.
+#   3. The orchestrator looks up the mentioned member's email
+#      (e.g. <nickname>@<email_domain>) and splits the local-part.
+#   4. The local-part matches `agents` here → spawns
+#      `claude --agent <nickname> --print` with issue context piped to stdin.
+#   5. The agent's prompt file `<prompt_role>.md` lives in `prompts_dir`;
+#      that file is what defines the agent's behaviour.
 
+# --- Identity / Plane connection ---
+workspace_slug: sdlc              # MUST match the filename stem.
+plane_base_url: https://plane.example.io
+plane_api_key: plane_api_xxxxxxxxxxxxxxxxxxxxxxxx
+project_id: 00000000-0000-0000-0000-000000000000
+initiator_uuid: 00000000-0000-0000-0000-000000000099
+
+# --- Webhook ---
+webhook_secret: replace-me-with-openssl-rand-hex-32
+
+# --- Agent invocation ---
+email_domain: example.io
+prompts_dir: /home/you/Projects/yourproject/.claude/agents
+agent_working_dir: /home/you/Projects/yourproject
+
+# --- Agents ---
 agents:
   - nickname: castor
     prompt_role: business-analyst
@@ -46,12 +62,6 @@ agents:
     prompt_role: reviewer
     display_name: Dumont — Reviewer
 
-# Project labels created by `plane-conductor setup`.
-# Two conventional groups:
-#   artifacts:* — tag a sub-issue with the agent role that produced it
-#                 (used by agents to find each other's outputs)
-#   roles:*     — reserve, used when one agent comments inside another's
-#                 sub-issue and wants to mark whose voice it is
 labels:
   artifacts:
     - { name: "artifact:requirements", color: "#7c3aed" }
@@ -74,18 +84,8 @@ labels:
     - { name: "role:ui-tester", color: "#fb923c" }
     - { name: "role:reviewer", color: "#fca5a5" }
 
-# Optional decorative project states (only created with `setup --states`).
-# Plane's stock states (Backlog/Todo/In Progress/Done/Cancelled) are always
-# present — these are extras that match the workflow vocabulary.
-#   group must be one of: backlog | unstarted | started | completed | cancelled
 states:
   - { name: Review, group: started, color: "#f59e0b" }
   - { name: Blocked, group: unstarted, color: "#ef4444" }
 
-# Behaviour ------------------------------------------------------------------
-
-# When true, the orchestrator posts a "@<nick> picking up" comment to the issue
-# the moment it spawns the agent, and updates that same comment when the agent
-# exits with the duration + outcome. Recommended — gives instant feedback even
-# if the agent itself is slow to respond.
 announce_spawn: true

@@ -10,10 +10,10 @@ import pytest
 
 from plane_conductor.conductor_config import (
     AgentDef,
-    ConductorConfig,
     LabelDef,
     LabelsConfig,
     StateDef,
+    WorkspaceConfig,
 )
 from plane_conductor.config import Settings
 
@@ -34,25 +34,25 @@ def webhook_secret() -> str:
 
 
 @pytest.fixture
-def conductor_config_path(tmp_path: Path) -> Path:
-    """Path to a minimal conductor.yaml on disk (for tests that load it via I/O)."""
-    p = tmp_path / "conductor.yaml"
-    p.write_text(
-        "agents:\n"
-        "  - { nickname: sark, prompt_role: system-analyst }\n"
-        "  - { nickname: rinzler, prompt_role: python-developer }\n"
-        "labels: { artifacts: [], roles: [] }\n"
-        "states: []\n"
-        "announce_spawn: false\n",
-        encoding="utf-8",
-    )
-    return p
-
-
-@pytest.fixture
-def conductor_config() -> ConductorConfig:
-    """In-memory ConductorConfig — used by most unit tests."""
-    return ConductorConfig(
+def workspace_config(
+    tmp_path: Path,
+    initiator_uuid: UUID,
+    project_uuid: UUID,
+    webhook_secret: str,
+) -> WorkspaceConfig:
+    """In-memory WorkspaceConfig used by most unit tests."""
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir(exist_ok=True)
+    return WorkspaceConfig(
+        workspace_slug="testws",
+        plane_base_url="https://plane.test",
+        plane_api_key="test-key",
+        project_id=project_uuid,
+        initiator_uuid=initiator_uuid,
+        webhook_secret=webhook_secret,
+        email_domain="example.io",
+        prompts_dir=prompts_dir,
+        agent_working_dir=tmp_path,
         agents=[
             AgentDef(nickname="sark", prompt_role="system-analyst", display_name="Sark"),
             AgentDef(nickname="rinzler", prompt_role="python-developer", display_name="Rinzler"),
@@ -71,53 +71,44 @@ def conductor_config() -> ConductorConfig:
             StateDef(name="Review", group="started", color="#f59e0b"),
         ],
         announce_spawn=False,
+        allowed_nicknames=[],
     )
+
+
+@pytest.fixture
+def workspaces(workspace_config: WorkspaceConfig) -> dict[str, WorkspaceConfig]:
+    """Single-workspace dict in the same shape the server uses."""
+    return {workspace_config.workspace_slug: workspace_config}
 
 
 @pytest.fixture
 def settings(
     tmp_path: Path,
-    initiator_uuid: UUID,
-    project_uuid: UUID,
-    webhook_secret: str,
-    conductor_config_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[Settings]:
-    # Make sure no real .env leaks in.
+    # Make sure no real env or .env leaks in.
     for var in (
-        "PLANE_BASE_URL",
-        "PLANE_API_KEY",
-        "PLANE_WORKSPACE_SLUG",
-        "PLANE_PROJECT_ID",
-        "WEBHOOK_SECRET",
-        "EMAIL_DOMAIN",
-        "PROMPTS_DIR",
-        "INITIATOR_UUID",
+        "WEBHOOK_HOST",
+        "WEBHOOK_PORT",
+        "CONDUCTOR_DIR",
         "LOG_DIR",
-        "ALLOWED_NICKNAMES",
-        "CONDUCTOR_CONFIG",
+        "LOG_LEVEL",
+        "LOG_FORMAT",
+        "MAX_CONCURRENT_SESSIONS",
+        "SESSION_TIMEOUT_SECONDS",
+        "SHUTDOWN_GRACE_SECONDS",
+        "CLAUDE_BINARY",
     ):
         monkeypatch.delenv(var, raising=False)
 
-    prompts_dir = tmp_path / "prompts"
-    prompts_dir.mkdir()
     log_dir = tmp_path / "logs"
-
     yield Settings(
-        plane_base_url="https://plane.test",
-        plane_api_key="test-key",
-        plane_workspace_slug="testws",
-        plane_project_id=project_uuid,
-        webhook_secret=webhook_secret,
-        conductor_config=conductor_config_path,
-        email_domain="example.io",
-        prompts_dir=prompts_dir,
-        initiator_uuid=initiator_uuid,
+        webhook_host="127.0.0.1",
+        webhook_port=8000,
+        conductor_dir=tmp_path / "conductor.d",
         log_dir=log_dir,
         log_level="WARNING",
         log_format="pretty",
-        allowed_nicknames="",
-        agent_working_dir=tmp_path,
         claude_binary="claude",
         _env_file=None,  # type: ignore[call-arg]
     )

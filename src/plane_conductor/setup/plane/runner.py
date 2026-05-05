@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from plane_conductor.conductor_config import ConductorConfig
-from plane_conductor.config import Settings
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
@@ -33,45 +32,40 @@ def _summarise(title: str, statuses: dict[str, str]) -> int:
 
 
 async def run_setup(
-    settings: Settings,
-    config: ConductorConfig,
+    workspace: WorkspaceConfig,
     *,
     create_states: bool = False,
     dry_run: bool = False,
 ) -> int:
-    """Run the full setup. Returns 0 on success, 1 if any step had failures."""
+    """Run the full setup for one workspace. Returns 0 on success, 1 if any step failed."""
     async with PlaneClient(
-        settings.plane_base_url,
-        settings.plane_api_key,
-        settings.plane_workspace_slug,
+        workspace.plane_base_url,
+        workspace.plane_api_key,
+        workspace.workspace_slug,
     ) as plane:
         try:
             projects = await plane.ping()
         except PlaneAPIError as exc:
-            _print(f"cannot reach Plane workspace '{settings.plane_workspace_slug}': {exc}")
+            _print(f"cannot reach Plane workspace '{workspace.workspace_slug}': {exc}")
             return 1
 
         _print(
-            f"connected: workspace={settings.plane_workspace_slug} "
-            f"({len(projects)} project(s) visible)"
+            f"connected: workspace={workspace.workspace_slug} ({len(projects)} project(s) visible)"
         )
         _print(
-            f"using config: {settings.conductor_config} "
-            f"({len(config.agents)} agents, {len(config.all_labels())} labels, "
-            f"{len(config.states)} states)"
+            f"agents={len(workspace.agents)} labels={len(workspace.all_labels())} "
+            f"states={len(workspace.states)}"
         )
 
-        users_status = await invite_roster_step(
-            plane, config, settings.email_domain, dry_run=dry_run
-        )
+        users_status = await invite_roster_step(plane, workspace, dry_run=dry_run)
         labels_status = await create_labels_step(
-            plane, settings.plane_project_id, config, dry_run=dry_run
+            plane, workspace.project_id, workspace, dry_run=dry_run
         )
 
         states_failed = 0
-        if create_states and config.states:
+        if create_states and workspace.states:
             states_status = await create_states_step(
-                plane, settings.plane_project_id, config, dry_run=dry_run
+                plane, workspace.project_id, workspace, dry_run=dry_run
             )
             states_failed = _summarise("states", states_status)
 

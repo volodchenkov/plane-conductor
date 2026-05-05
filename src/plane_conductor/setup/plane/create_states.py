@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from plane_conductor.conductor_config import ConductorConfig
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
@@ -20,15 +20,15 @@ def _existing_state_names(states: list[dict[str, Any]]) -> set[str]:
 async def create_states(
     plane: PlaneClient,
     project_id: UUID,
-    config: ConductorConfig,
+    workspace: WorkspaceConfig,
     *,
     dry_run: bool = False,
 ) -> dict[str, str]:
-    """Create every state declared in `config.states`. Returns {state_name: status}."""
+    """Create every state declared in `workspace.states`. Returns {state_name: status}."""
     existing = _existing_state_names(await plane.list_states(project_id))
 
     statuses: dict[str, str] = {}
-    for state in config.states:
+    for state in workspace.states:
         if state.name.lower() in existing:
             log.info("state_exists", name=state.name)
             statuses[state.name] = "exists"

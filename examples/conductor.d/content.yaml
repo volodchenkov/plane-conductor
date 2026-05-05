@@ -1,0 +1,61 @@
+# Content / editorial example workspace — non-SDLC pipeline.
+# Demonstrates that conductor is workflow-agnostic: any task tracker, any
+# roster of agents.
+#
+# Pipeline shape (one suggestion — adapt freely):
+#   briefer → researcher → drafter → editor → seo → fact-checker → publisher
+#
+# Copy to /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, chmod 600.
+# IMPORTANT: this file holds secrets. Do NOT commit your edited copy.
+
+workspace_slug: content
+plane_base_url: https://plane.example.io
+plane_api_key: plane_api_xxxxxxxxxxxxxxxxxxxxxxxx
+project_id: 00000000-0000-0000-0000-000000000000
+initiator_uuid: 00000000-0000-0000-0000-000000000099
+webhook_secret: replace-me-with-openssl-rand-hex-32
+
+email_domain: example.io
+prompts_dir: /home/you/Projects/content/.claude/agents
+agent_working_dir: /home/you/Projects/content
+
+agents:
+  - nickname: brief
+    prompt_role: content-briefer
+    display_name: Brief — Content Briefer
+  - nickname: scout
+    prompt_role: researcher
+    display_name: Scout — Researcher
+  - nickname: scribe
+    prompt_role: drafter
+    display_name: Scribe — Drafter
+  - nickname: edit
+    prompt_role: editor
+    display_name: Edit — Editor
+  - nickname: seo
+    prompt_role: seo-optimiser
+    display_name: SEO — Optimiser
+  - nickname: fact
+    prompt_role: fact-checker
+    display_name: Fact — Fact Checker
+  - nickname: pub
+    prompt_role: publisher
+    display_name: Pub — Publisher
+
+labels:
+  artifacts:
+    - { name: "artifact:brief", color: "#7c3aed" }
+    - { name: "artifact:research", color: "#3b82f6" }
+    - { name: "artifact:draft", color: "#10b981" }
+    - { name: "artifact:edited", color: "#22d3ee" }
+    - { name: "artifact:seo", color: "#f59e0b" }
+    - { name: "artifact:fact-check", color: "#ef4444" }
+    - { name: "artifact:published", color: "#a78bfa" }
+  roles: []
+
+states:
+  - { name: "In Review", group: started, color: "#f59e0b" }
+  - { name: "Blocked", group: unstarted, color: "#ef4444" }
+  - { name: "Published", group: completed, color: "#10b981" }
+
+announce_spawn: true
