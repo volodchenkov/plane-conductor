@@ -45,9 +45,13 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
 ]
+mcp = [
+    "mcp>=1.0",
+]
 
 [project.scripts]
 plane-conductor = "plane_conductor.cli:app"
+plane-conductor-mcp = "plane_conductor.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/volodchenkov/plane-conductor"
