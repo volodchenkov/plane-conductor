@@ -292,4 +292,16 @@ On startup the loader validates:
 - slugs are unique across files
 
 If anything required is missing or invalid, `plane-conductor serve` fails
-fast with a pydantic ValidationError naming exactly what's wrong.
+fast at startup. Possible exceptions:
+
+- `pydantic.ValidationError` — schema mismatch in a workspace YAML or in
+  `runtime.env` / process env (typos, missing fields, weak secret,
+  invalid slug pattern, etc.)
+- `FileNotFoundError` — `conductor_dir` path doesn't exist or contains
+  no `*.yaml`/`*.yml` files
+- `NotADirectoryError` — `conductor_dir` is a file, not a directory
+- `ValueError` — a file's `workspace_slug` doesn't match its filename
+  stem, or two files declare the same slug
+
+The error message names the offending file / field so you can fix and
+restart.

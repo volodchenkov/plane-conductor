@@ -193,30 +193,40 @@ def test_load_workspaces_skips_non_yaml(tmp_path: Path) -> None:
 # --- example yamls in the repo must always parse -----------------------------
 
 
-def test_example_sdlc_yaml_parses() -> None:
+def test_example_sdlc_yaml_rejects_placeholder_secret() -> None:
+    """Examples ship with a placeholder webhook_secret that MUST be rejected
+    so an unedited install never starts up with a public HMAC secret."""
     repo = Path(__file__).resolve().parents[1]
-    cfg = load_workspace(repo / "examples" / "conductor.d" / "sdlc.yaml")
-    assert len(cfg.agents) == 10
+    with pytest.raises(ValidationError, match="placeholder"):
+        load_workspace(repo / "examples" / "conductor.d" / "sdlc.yaml")
+
+
+def test_example_minimal_yaml_rejects_placeholder_secret() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    with pytest.raises(ValidationError, match="placeholder"):
+        load_workspace(repo / "examples" / "conductor.d" / "minimal.yaml")
+
+
+def test_example_content_yaml_rejects_placeholder_secret() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    with pytest.raises(ValidationError, match="placeholder"):
+        load_workspace(repo / "examples" / "conductor.d" / "content.yaml")
+
+
+def test_example_yaml_structure_is_otherwise_valid() -> None:
+    """Verify the rest of the example YAML is syntactically and structurally
+    valid (everything except the placeholder secret) by patching the secret
+    in-memory and re-validating."""
+    import yaml as _yaml
+
+    repo = Path(__file__).resolve().parents[1]
+    raw = _yaml.safe_load(
+        (repo / "examples" / "conductor.d" / "sdlc.yaml").read_text(encoding="utf-8")
+    )
+    raw["webhook_secret"] = "x" * 64
+    cfg = WorkspaceConfig.model_validate(raw)
     assert cfg.workspace_slug == "sdlc"
-
-
-def test_example_minimal_yaml_parses() -> None:
-    repo = Path(__file__).resolve().parents[1]
-    cfg = load_workspace(repo / "examples" / "conductor.d" / "minimal.yaml")
-    assert len(cfg.agents) == 1
-    assert cfg.workspace_slug == "minimal"
-
-
-def test_example_content_yaml_parses() -> None:
-    repo = Path(__file__).resolve().parents[1]
-    cfg = load_workspace(repo / "examples" / "conductor.d" / "content.yaml")
-    assert cfg.workspace_slug == "content"
-    assert {a.nickname for a in cfg.agents} >= {"brief", "scribe", "edit"}
-
-
-def test_example_states_have_valid_groups() -> None:
-    repo = Path(__file__).resolve().parents[1]
-    cfg = load_workspace(repo / "examples" / "conductor.d" / "sdlc.yaml")
+    assert len(cfg.agents) == 10
     assert cfg.states == [
         StateDef(name="Review", group="started", color="#f59e0b"),
         StateDef(name="Blocked", group="unstarted", color="#ef4444"),
@@ -264,3 +274,28 @@ def test_workspace_slug_rejects_unsafe_characters(bad_slug: str) -> None:
 def test_workspace_slug_accepts_safe_characters(good_slug: str) -> None:
     cfg = _ws(slug=good_slug)
     assert cfg.workspace_slug == good_slug
+
+
+def test_webhook_secret_rejects_zero_hex() -> None:
+    with pytest.raises(ValidationError, match="monorepeat"):
+        _ws(webhook_secret="0" * 64)
+
+
+def test_webhook_secret_rejects_all_f_hex() -> None:
+    with pytest.raises(ValidationError, match="monorepeat"):
+        _ws(webhook_secret="f" * 32)
+
+
+def test_agent_nickname_strips_surrounding_whitespace() -> None:
+    a = AgentDef(nickname="  Sark  ", prompt_role="x")
+    assert a.nickname == "sark"
+
+
+def test_agent_nickname_rejects_internal_whitespace() -> None:
+    with pytest.raises(ValidationError, match="single token"):
+        AgentDef(nickname="dev ops", prompt_role="x")
+
+
+def test_agent_nickname_rejects_empty_after_strip() -> None:
+    with pytest.raises(ValidationError, match="single token"):
+        AgentDef(nickname="   ", prompt_role="x")

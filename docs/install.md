@@ -103,6 +103,9 @@ sudoedit /etc/plane-conductor/runtime.env             # host-wide runtime
 # workspaces.
 sudo mv /etc/plane-conductor/conductor.d/sdlc.yaml \
         /etc/plane-conductor/conductor.d/<your-slug>.yaml
+# IMPORTANT: also set workspace_slug: <your-slug> inside the file —
+# the filename stem must match the workspace_slug field (the loader
+# rejects mismatches at startup).
 sudoedit /etc/plane-conductor/conductor.d/<your-slug>.yaml
 
 # (Once per workspace) provision Plane.

@@ -43,7 +43,13 @@ class AgentDef(BaseModel):
 
     @model_validator(mode="after")
     def _normalize(self) -> AgentDef:
-        object.__setattr__(self, "nickname", self.nickname.lower())
+        # Trim and reject whitespace inside — a typo like "dev " would otherwise
+        # turn into an invalid invite email and a nickname that never matches
+        # mentions. Fail fast at config load.
+        nickname = self.nickname.strip().lower()
+        if not nickname or any(ch.isspace() for ch in nickname):
+            raise ValueError("agent nickname must be a non-empty single token")
+        object.__setattr__(self, "nickname", nickname)
         return self
 
 
@@ -145,10 +151,11 @@ class WorkspaceConfig(BaseModel):
     @field_validator("webhook_secret", mode="after")
     @classmethod
     def _validate_webhook_secret(cls, v: str) -> str:
-        # Each workspace's HMAC secret is the only thing standing between an
-        # attacker who knows the URL and a remote agent spawn. Reject the
-        # shipped placeholder and anything below 32 chars (one workspace ==
-        # one openssl-rand-hex-32 secret).
+        # The HMAC secret is the only thing standing between an attacker who
+        # knows the URL and a remote agent spawn. Reject:
+        #   - the shipped placeholder string
+        #   - anything below 32 chars
+        #   - obviously-not-random "secrets" like 64 zeros / 64 fs
         secret = v.strip()
         if secret == "replace-me-with-openssl-rand-hex-32":
             raise ValueError(
@@ -159,6 +166,11 @@ class WorkspaceConfig(BaseModel):
             raise ValueError(
                 "webhook_secret must be at least 32 characters (use "
                 "`openssl rand -hex 32` to generate a strong one)"
+            )
+        if re.fullmatch(r"([0-9a-fA-F])\1{31,}", secret):
+            raise ValueError(
+                "webhook_secret looks like a monorepeat hex string "
+                "(e.g. all zeros) — replace with `openssl rand -hex 32`"
             )
         return secret
 

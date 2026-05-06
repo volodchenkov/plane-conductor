@@ -143,7 +143,7 @@ log "installing plane-conductor (editable)"
 "${PREFIX}/.venv/bin/pip" install --quiet -e "${PREFIX}"
 
 # ---------------------------------------------------------------------------
-# 3. Config dir + .env skeleton
+# 3. Config dir + runtime.env + conductor.d skeletons
 # ---------------------------------------------------------------------------
 mkdir -p "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
