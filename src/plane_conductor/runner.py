@@ -154,7 +154,14 @@ class Runner:
             project_id=workspace.project_id,
             triggered_by_email=triggered_by_email,
         )
-        argv = [self.settings.claude_binary, "--agent", nickname, "--print"]
+        agent_cfg = workspace.agents_by_nickname().get(nickname)
+        agent_name = agent_cfg.prompt_role if agent_cfg else nickname
+        argv = [
+            self.settings.claude_binary,
+            "--agent", agent_name,
+            "--permission-mode", "acceptEdits",
+            "--print",
+        ]
         cwd = workspace.agent_working_dir or Path.cwd()
 
         log_fp = log_path.open("ab", buffering=0)
