@@ -7,6 +7,10 @@ import sys
 from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.plane_client import PlaneClient
+from plane_conductor.setup.plane.add_project_members import (
+    _email_to_member_id,
+    _existing_member_ids,
+)
 from plane_conductor.setup.plane.create_users import _existing_emails
 
 
@@ -36,6 +40,7 @@ async def run_verify(workspace: WorkspaceConfig) -> int:
             _print(f"FAIL members: {exc}")
             return 1
         emails = _existing_emails(members)
+        email_to_id = _email_to_member_id(members)
 
         for agent in workspace.agents:
             email = f"{agent.nickname}@{workspace.email_domain}".lower()
@@ -43,6 +48,25 @@ async def run_verify(workspace: WorkspaceConfig) -> int:
                 _print(f"OK   user {agent.nickname:<10} ({email})")
             else:
                 _print(f"MISS user {agent.nickname:<10} ({email})")
+                problems += 1
+
+        try:
+            project_members = await plane.list_project_members(workspace.project_id)
+        except PlaneAPIError as exc:
+            _print(f"FAIL project members: {exc}")
+            return 1
+        in_project = _existing_member_ids(project_members)
+
+        for agent in workspace.agents:
+            email = f"{agent.nickname}@{workspace.email_domain}".lower()
+            member_id = email_to_id.get(email)
+            if member_id is None:
+                # Already reported above as a workspace MISS — don't double-count.
+                continue
+            if member_id in in_project:
+                _print(f"OK   project-member {agent.nickname:<10} ({email})")
+            else:
+                _print(f"MISS project-member {agent.nickname:<10} ({email})")
                 problems += 1
 
         try:

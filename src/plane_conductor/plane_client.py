@@ -152,6 +152,41 @@ class PlaneClient:
         )
 
     # ------------------------------------------------------------------
+    # project membership
+    # ------------------------------------------------------------------
+
+    async def list_project_members(self, project_id: str | UUID) -> list[dict[str, Any]]:
+        payload = await self._request(
+            "GET",
+            f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/members/",
+        )
+        return self._results(payload)
+
+    async def add_project_member(
+        self,
+        project_id: str | UUID,
+        member_id: str | UUID,
+        *,
+        role: int = 15,
+    ) -> dict[str, Any]:
+        """Attach an existing workspace member to a project. `role` uses Plane's role ints
+        (15 = Member, 20 = Admin). The member must already exist in the workspace —
+        invite via `invite_member` first if not.
+
+        Plane's project-members endpoint takes `member` (singular UUID), not the bulk
+        `members:[...]` shape its label/state cousins use.
+        """
+        payload = {"member": str(member_id), "role": role}
+        return cast(
+            "dict[str, Any]",
+            await self._request(
+                "POST",
+                f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/members/",
+                json=payload,
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # labels
     # ------------------------------------------------------------------
 
