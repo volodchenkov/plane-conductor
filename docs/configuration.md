@@ -74,7 +74,7 @@ Ready-to-edit starters:
   editorial pipeline (briefer → researcher → drafter → editor → SEO → fact-checker → publisher)
 
 > **Important:** these files hold secrets (API key, webhook secret). Treat
-> them like `.env`: chmod 600, do **not** commit your edited copies. The
+> them like `.env`: chmod 640 (root:<service-group>), do **not** commit your edited copies. The
 > versions in `examples/` are templates with placeholder credentials.
 
 ```yaml

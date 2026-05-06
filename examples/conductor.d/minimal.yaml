@@ -1,5 +1,5 @@
 # Minimal example workspace — single dev agent. Copy to
-# /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, set chmod 600.
+# /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, set chmod 640.
 #
 # IMPORTANT: this file holds secrets. Do NOT commit your edited copy.
 

@@ -1,7 +1,7 @@
 # SDLC example workspace — full pipeline (analyst → architect → designer →
 # coders → testers → reviewer). 10 agents.
 #
-# Copy to /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, chmod 600.
+# Copy to /etc/plane-conductor/conductor.d/<your-slug>.yaml, edit, chmod 640.
 # IMPORTANT: this file holds secrets. Do NOT commit your edited copy.
 #
 # How nickname → agent works:

@@ -172,7 +172,7 @@ shopt -u nullglob
 if [[ ${#_existing_ws[@]} -eq 0 ]]; then
     log "writing workspace skeleton → ${WORKSPACES_DIR}/sdlc.yaml (rename to match your workspace slug)"
     cp "${PREFIX}/examples/conductor.d/sdlc.yaml" "${WORKSPACES_DIR}/sdlc.yaml"
-    chmod 600 "${WORKSPACES_DIR}/sdlc.yaml"
+    chmod 640 "${WORKSPACES_DIR}/sdlc.yaml"
     chown "root:${SERVICE_GROUP}" "${WORKSPACES_DIR}/sdlc.yaml"
     EDIT_NEEDED=1
 else
