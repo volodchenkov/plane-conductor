@@ -25,13 +25,12 @@ service from outside — see [Exposing the webhook](#exposing-the-webhook).
   `mcpServers.plane` entry pointing at a Plane MCP server (e.g.
   [`makeplane/plane-mcp-server`](https://github.com/makeplane/plane-mcp-server)).
   This is what lets your agents read/write Plane.
-- **Plane workspace** (cloud or self-hosted) with an API key, a project
-  to work in, and your own Plane member UUID for the `INITIATOR_UUID`
-  setting (so the orchestrator never tries to spawn an agent for you).
-- **Agent prompts and skills** in your local `PROMPTS_DIR`. Plane
-  Conductor itself ships none — it just spawns whatever Claude Code
-  finds. See [`prompts/README.md`](../prompts/README.md) for the
-  expected file layout.
+- **Plane workspace(s)** (cloud or self-hosted) — one or more. Each one
+  needs an API key, a project to work in, and your own Plane member
+  UUID for the workspace's `initiator_uuid` (so the orchestrator never
+  tries to spawn an agent for you).
+- **Agent prompts** in each workspace's `prompts_dir`. Plane Conductor
+  itself ships none — it just spawns whatever Claude Code finds.
 
 ---
 
@@ -44,36 +43,43 @@ cd plane-conductor
 python -m venv .venv && source .venv/bin/activate
 pip install -e .[dev]
 
-# Settings (runtime).
-cp .env.example .env
-# Fill at minimum:
-#   PLANE_BASE_URL, PLANE_API_KEY, PLANE_WORKSPACE_SLUG, PLANE_PROJECT_ID
-#   WEBHOOK_SECRET=$(openssl rand -hex 32)
-#   EMAIL_DOMAIN, PROMPTS_DIR, AGENT_WORKING_DIR, INITIATOR_UUID
-#   CONDUCTOR_CONFIG=./conductor.yaml
+# Host-wide runtime config.
+cp examples/runtime.env.example runtime.env
+# Adjust WEBHOOK_PORT, LOG_DIR, MAX_CONCURRENT_SESSIONS, CONDUCTOR_DIR if needed.
 
-# Workflow (agents/labels/states).
-cp examples/sdlc-conductor.yaml conductor.yaml
-# Or examples/minimal-conductor.yaml for a 1-agent setup.
+# One YAML per workspace. Pick a starter and edit:
+mkdir -p conductor.d
+cp examples/conductor.d/minimal.yaml conductor.d/myws.yaml
+# Then edit conductor.d/myws.yaml — fill in:
+#   workspace_slug (must match the filename stem!), plane_base_url,
+#   plane_api_key, project_id, initiator_uuid, webhook_secret
+#   (openssl rand -hex 32), email_domain, prompts_dir.
+# chmod 600 conductor.d/myws.yaml   (it has secrets)
+
+# Tell the orchestrator where conductor.d/ is (cwd-relative for dev):
+export CONDUCTOR_DIR=$(pwd)/conductor.d
 
 # Smoke checks before spawning anything.
-plane-conductor verify       # connectivity + roster sanity
-plane-conductor setup        # invite bot accounts + create labels (idempotent)
+plane-conductor verify       # connectivity + roster sanity (all workspaces)
+plane-conductor verify --workspace myws   # or just one
+plane-conductor setup        # invite bots + create labels (all workspaces)
 
 # Run.
 plane-conductor serve        # binds to WEBHOOK_HOST:WEBHOOK_PORT
 ```
 
-In a second terminal you can watch what's happening:
+In a second terminal:
 
 ```bash
-plane-conductor agents       # print configured nickname → role map
-ls logs/                     # per-run log files
+plane-conductor agents       # print configured nickname → role for every workspace
+ls logs/                     # per-run log files (carry the workspace slug)
 tail -f logs/<file>.log
+curl http://localhost:8000/health
+# {"status":"ok","version":"...","workspaces":["myws"]}
 ```
 
-The full configuration reference (every `.env` variable + every YAML
-field) is in [`configuration.md`](configuration.md).
+The full configuration reference (every env var + every YAML field) is
+in [`configuration.md`](configuration.md).
 
 ---
 
@@ -83,17 +89,26 @@ The repo ships with an idempotent installer that does everything
 expected for a systemd unit on a Linux host: creates a venv at a
 prefix, lays down a config skeleton, sets up logrotate, installs the
 unit file, runs it under your own user by default (so the spawned
-agents see your `~/.claude.json` and `PROMPTS_DIR`).
+agents see your `~/.claude.json` and your project trees).
 
 ```bash
 git clone https://github.com/volodchenkov/plane-conductor.git
 cd plane-conductor
 
 sudo bash setup/install.sh
-sudoedit /etc/plane-conductor/.env             # secrets, ports, paths
-sudoedit /etc/plane-conductor/conductor.yaml   # agents, labels, states
+sudoedit /etc/plane-conductor/runtime.env             # host-wide runtime
 
-# (Once) provision the Plane workspace.
+# The installer drops a starter sdlc.yaml into conductor.d/. Rename it
+# to match your real workspace slug, then edit. Add more files for more
+# workspaces.
+sudo mv /etc/plane-conductor/conductor.d/sdlc.yaml \
+        /etc/plane-conductor/conductor.d/<your-slug>.yaml
+# IMPORTANT: also set workspace_slug: <your-slug> inside the file —
+# the filename stem must match the workspace_slug field (the loader
+# rejects mismatches at startup).
+sudoedit /etc/plane-conductor/conductor.d/<your-slug>.yaml
+
+# (Once per workspace) provision Plane.
 sudo -u "$USER" /opt/plane-conductor/.venv/bin/plane-conductor verify
 sudo -u "$USER" /opt/plane-conductor/.venv/bin/plane-conductor setup
 
@@ -123,9 +138,11 @@ multi-tenant / shared boxes where you'd rather isolate.
 ```
 /opt/plane-conductor/         # source + venv (rsync'd from the repo, editable install)
 /etc/plane-conductor/
-  .env                         # 640, root:<your-group>
-  conductor.yaml               # 640, root:<your-group>
-/var/log/plane-conductor/      # per-run agent logs + .active/ sentinels
+  runtime.env                  # 640, root:<your-group>
+  conductor.d/                 # 750, root:<your-group>
+    qsale.yaml                 # 600 — holds Plane API key + webhook secret
+    aist.yaml                  # 600 — second workspace
+/var/log/plane-conductor/      # per-run agent logs + .active/ sentinels (slug-prefixed)
 /etc/systemd/system/plane-conductor.service
 /etc/logrotate.d/plane-conductor   # daily, 14 days, gzip
 ```
@@ -138,6 +155,10 @@ sudo bash setup/install.sh                      # idempotent — re-syncs source
 sudo systemctl restart plane-conductor
 ```
 
+To add a new workspace later: drop another file into
+`/etc/plane-conductor/conductor.d/<new-slug>.yaml`, restart the service,
+point Plane at `https://<host>/<new-slug>/webhook`. No code changes.
+
 ---
 
 ## Production: Docker
@@ -146,8 +167,9 @@ sudo systemctl restart plane-conductor
 git clone https://github.com/volodchenkov/plane-conductor.git
 cd plane-conductor
 
-cp .env.example .env             # fill in
-cp examples/sdlc-conductor.yaml conductor.yaml
+cp examples/runtime.env.example runtime.env       # fill in
+mkdir -p conductor.d
+cp examples/conductor.d/sdlc.yaml conductor.d/myws.yaml   # rename to your slug, edit
 
 # Build + run via the example compose file:
 docker compose -f examples/docker-compose.yml up -d
@@ -164,7 +186,8 @@ on a server you don't develop on.
 
 ## Exposing the webhook
 
-Plane needs to reach `https://your-host/webhook`. Three common ways:
+Plane needs to reach `https://your-host/<workspace-slug>/webhook`. Three
+common ways:
 
 ### (a) Cloudflare Tunnel — recommended for laptop / home setup
 
@@ -182,11 +205,12 @@ cloudflared tunnel route dns plane-conductor pc.your-domain.dev
 #       service: http://localhost:8000
 #     - service: http_status:404
 
-# Install as a systemd service (or use the cloudflared install command):
+# Install as a systemd service:
 sudo cloudflared service install
 ```
 
-After that `https://pc.your-domain.dev/webhook` is your stable URL.
+After that `https://pc.your-domain.dev/<slug>/webhook` is your stable URL
+for each workspace.
 
 ### (b) Reverse proxy on a real server
 
@@ -201,21 +225,21 @@ cloudflared tunnel --url http://localhost:8000
 # Prints a temporary trycloudflare.com URL. Dies when the process stops.
 ```
 
-Useful for "just let me see if my mention works once" — not for ongoing
-use.
-
 ---
 
 ## Configure Plane to send the webhook
 
-In Plane → **Workspace settings → Webhooks → Add webhook**:
+For each workspace you've added to `conductor.d/`, in Plane → **Workspace
+settings → Webhooks → Add webhook**:
 
-- **URL**: `https://your-host/webhook`
-- **Secret**: copy the value from `WEBHOOK_SECRET` in your `.env`
+- **URL**: `https://your-host/<workspace_slug>/webhook` (the slug must
+  match the workspace's `workspace_slug` in `conductor.d/<slug>.yaml`)
+- **Secret**: copy the value of `webhook_secret` from that workspace's YAML
 - **Events**: at minimum `Issue Comment`
 
-Save. Plane will sign each webhook body with your secret using
-HMAC-SHA256, and Plane Conductor verifies it before doing anything.
+Save. Plane signs each webhook body with that secret using HMAC-SHA256;
+Plane Conductor verifies it before doing anything. Each workspace has
+its own secret — leaks are isolated.
 
 ---
 
@@ -235,19 +259,20 @@ used. Cloud Plane users invite real teammates the normal way.
 ## Verifying everything works
 
 ```bash
-# 1. Service is alive.
+# 1. Service is alive (and lists every loaded workspace).
 curl https://your-host/health
-# → {"status":"ok","version":"0.1.0"}
+# → {"status":"ok","version":"...","workspaces":["qsale","aist"]}
 
 # 2. Mention a configured agent in any Plane issue comment.
 # 3. Watch the journal:
 journalctl -u plane-conductor -f
-# → "POST /webhook 200"
-# → "agent_spawned nickname=<nick> issue=<uuid>"
+# → "POST /qsale/webhook 200"
+# → "agent_spawned workspace=qsale nickname=<nick> issue=<uuid>"
 # → … (agent works) …
-# → "agent_exited exit_code=0 duration_s=N"
+# → "agent_exited workspace=qsale exit_code=0 duration_s=N"
 ```
 
 If you don't see the POST coming in: check the Plane webhook delivery
-log in the UI (it'll show 4xx/5xx if the secret is wrong or the URL
-is unreachable), and check that your tunnel/proxy is up.
+log in the UI (it'll show 4xx/5xx if the secret is wrong, the URL is
+wrong, or the workspace slug doesn't match a file in `conductor.d/`),
+and check that your tunnel/proxy is up.

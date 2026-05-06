@@ -8,8 +8,9 @@ from plane_conductor.plane_client import PlaneClient
 
 
 async def test_workspace_reachable(plane: PlaneClient, plane_workspace_slug: str) -> None:
-    ws = await plane.ping()
-    assert ws.get("slug", plane_workspace_slug) == plane_workspace_slug
+    projects = await plane.ping()
+    # ping() returns the project list; just verify it didn't error.
+    assert isinstance(projects, list)
 
 
 async def test_workspace_members_listable(plane: PlaneClient) -> None:

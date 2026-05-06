@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from plane_conductor.conductor_config import ConductorConfig
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
 from plane_conductor.plane_client import PlaneClient
 from plane_conductor.setup.plane.create_labels import create_labels
@@ -24,9 +24,9 @@ def client() -> PlaneClient:
 
 @respx.mock
 async def test_invite_roster_skips_existing_and_invites_rest(
-    client: PlaneClient, conductor_config: ConductorConfig
+    client: PlaneClient, workspace_config: WorkspaceConfig
 ) -> None:
-    # conductor_config has 3 agents: sark, rinzler, gem
+    # workspace_config has 3 agents: sark, rinzler, gem
     existing = [
         {"email": "sark@example.io"},
         {"member": {"email": "rinzler@example.io"}},
@@ -38,7 +38,7 @@ async def test_invite_roster_skips_existing_and_invites_rest(
         return_value=httpx.Response(201, json={})
     )
 
-    statuses = await invite_roster(client, conductor_config, "example.io")
+    statuses = await invite_roster(client, workspace_config)
     assert statuses["sark"] == "exists"
     assert statuses["rinzler"] == "exists"
     assert statuses["gem"] == "invited"
@@ -48,7 +48,7 @@ async def test_invite_roster_skips_existing_and_invites_rest(
 
 @respx.mock
 async def test_invite_roster_dry_run_does_not_call(
-    client: PlaneClient, conductor_config: ConductorConfig
+    client: PlaneClient, workspace_config: WorkspaceConfig
 ) -> None:
     respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/members/").mock(
         return_value=httpx.Response(200, json=[])
@@ -56,7 +56,7 @@ async def test_invite_roster_dry_run_does_not_call(
     invite_route = respx.post(f"{BASE}/api/v1/workspaces/{SLUG}/invitations/").mock(
         return_value=httpx.Response(201, json={})
     )
-    statuses = await invite_roster(client, conductor_config, "example.io", dry_run=True)
+    statuses = await invite_roster(client, workspace_config, dry_run=True)
     assert all(v == "invited" for v in statuses.values())
     assert invite_route.call_count == 0
     await client.aclose()
@@ -64,7 +64,7 @@ async def test_invite_roster_dry_run_does_not_call(
 
 @respx.mock
 async def test_invite_roster_treats_409_as_exists(
-    client: PlaneClient, conductor_config: ConductorConfig
+    client: PlaneClient, workspace_config: WorkspaceConfig
 ) -> None:
     respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/members/").mock(
         return_value=httpx.Response(200, json=[])
@@ -72,21 +72,20 @@ async def test_invite_roster_treats_409_as_exists(
     respx.post(f"{BASE}/api/v1/workspaces/{SLUG}/invitations/").mock(
         return_value=httpx.Response(409, json={"detail": "already invited"})
     )
-    statuses = await invite_roster(client, conductor_config, "example.io")
+    statuses = await invite_roster(client, workspace_config)
     assert all(v == "exists" for v in statuses.values())
     await client.aclose()
 
 
 @respx.mock
 async def test_create_labels_idempotent(
-    client: PlaneClient, conductor_config: ConductorConfig
+    client: PlaneClient, workspace_config: WorkspaceConfig
 ) -> None:
-    # conductor_config has 3 labels: artifact:spec, artifact:backend, role:system-analyst
     base = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/labels/"
     respx.get(base).mock(return_value=httpx.Response(200, json=[{"name": "artifact:spec"}]))
     create_route = respx.post(base).mock(return_value=httpx.Response(201, json={}))
 
-    statuses = await create_labels(client, PROJECT, conductor_config)
+    statuses = await create_labels(client, PROJECT, workspace_config)
     assert len(statuses) == 3
     assert statuses["artifact:spec"] == "exists"
     assert statuses["artifact:backend"] == "created"
@@ -97,7 +96,7 @@ async def test_create_labels_idempotent(
 
 @respx.mock
 async def test_create_labels_handles_failure(
-    client: PlaneClient, conductor_config: ConductorConfig
+    client: PlaneClient, workspace_config: WorkspaceConfig
 ) -> None:
     base = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/labels/"
     respx.get(base).mock(return_value=httpx.Response(200, json=[]))
@@ -110,32 +109,18 @@ async def test_create_labels_handles_failure(
 
     respx.post(base).mock(side_effect=respond)
 
-    statuses = await create_labels(client, PROJECT, conductor_config)
+    statuses = await create_labels(client, PROJECT, workspace_config)
     assert statuses["artifact:spec"] == "failed"
     assert statuses["artifact:backend"] == "created"
     assert statuses["role:system-analyst"] == "created"
     await client.aclose()
 
 
-def test_settings_validators_reject_bad_log_format(settings: Settings) -> None:
+def test_settings_validators_reject_bad_log_format() -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
         Settings(
-            plane_base_url="https://x",
-            plane_api_key="k",
-            plane_workspace_slug="ws",
-            plane_project_id=settings.plane_project_id,
-            webhook_secret="s",
-            email_domain="x.io",
-            prompts_dir=settings.prompts_dir,
-            initiator_uuid=settings.initiator_uuid,
             log_format="xml",  # invalid
             _env_file=None,  # type: ignore[call-arg]
         )
-
-
-def test_allowlist_parsing(settings: Settings) -> None:
-    settings.allowed_nicknames = "sark, rinzler ,, gem"
-    s = settings.allowed_nicknames_set
-    assert s == frozenset({"sark", "rinzler", "gem"})

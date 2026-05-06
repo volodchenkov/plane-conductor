@@ -1,136 +1,169 @@
 # Configuration
 
-Plane Conductor has **two** configuration sources. Keep them straight:
+Plane Conductor has **two** configuration sources, on purpose:
 
 | Where | What goes there | Loaded by |
 |---|---|---|
-| `.env` (or shell env) | Runtime concerns: secrets, ports, file paths, capacity, log level. | `Settings` (pydantic-settings) |
-| `conductor.yaml` | Workflow concerns: agents, labels, states, behaviour flags. | `ConductorConfig` (pydantic) |
+| `runtime.env` (or shell env) | Host-wide runtime: bind host/port, log dir, capacity caps, timeouts, claude binary. | `Settings` (pydantic-settings) |
+| `conductor.d/<slug>.yaml` (one file per workspace) | Per-workspace: Plane creds, project, prompts dir, agents, labels, states, behaviour, secrets. | `WorkspaceConfig` (pydantic) |
 
-The split is on purpose: rotating an API key shouldn't touch your
-agent roster, and renaming an agent shouldn't touch your secrets.
+The split keeps host knobs separate from workspace shape. Adding an AIST
+workspace alongside qsale is just a new file in `conductor.d/`; it does not
+touch the runtime env. Rotating an API key changes one file. Renaming an
+agent changes one file.
 
 ---
 
-## `.env` — runtime settings
+## `runtime.env` — host-wide settings
 
 Loaded from (in order, last wins):
 
-1. `/etc/plane-conductor/.env` (system-wide, written by `install.sh`)
-2. `./.env` next to where `plane-conductor` is invoked (overrides)
-3. Process environment variables (overrides everything)
+1. `/etc/plane-conductor/runtime.env` (system-wide, written by `install.sh`)
+2. `/etc/plane-conductor/.env` (legacy filename — still honoured, optional)
+3. `./runtime.env` next to the cwd `plane-conductor` is invoked from
+4. `./.env` (cwd, last-resort fallback)
+5. Process environment variables (override everything)
 
-Full template lives at [`.env.example`](../.env.example). Required
-fields:
+Full template lives at [`examples/runtime.env.example`](../examples/runtime.env.example).
 
-### Plane connection
-
-| Var | Purpose |
-|---|---|
-| `PLANE_BASE_URL` | Base URL of your Plane instance (cloud `https://app.plane.so` or self-hosted). |
-| `PLANE_API_KEY` | API token from Plane → Profile → Workspace settings → API tokens. |
-| `PLANE_WORKSPACE_SLUG` | Workspace slug (lowercase, the segment in the Plane URL). |
-| `PLANE_PROJECT_ID` | Project UUID. Copy from the Plane URL `/projects/<this>/`. |
-
-### Webhook
+### Webhook server
 
 | Var | Default | Purpose |
 |---|---|---|
-| `WEBHOOK_SECRET` | — | Shared HMAC-SHA256 secret. Must match the secret in Plane → Webhooks. Generate with `openssl rand -hex 32`. |
 | `WEBHOOK_HOST` | `0.0.0.0` | Bind address. |
 | `WEBHOOK_PORT` | `8000` | Bind port. |
-| `WEBHOOK_SIGNATURE_HEADER` | `X-Plane-Signature` | Header Plane uses to send the signature. Adjust if your Plane build uses a different header name. |
 
-### Workflow config pointer
+### Workspace configs location
 
 | Var | Default | Purpose |
 |---|---|---|
-| `CONDUCTOR_CONFIG` | `/etc/plane-conductor/conductor.yaml` | Path to the YAML described below. |
+| `CONDUCTOR_DIR` | `/etc/plane-conductor/conductor.d` | Directory of per-workspace YAML configs. One file per workspace, named `<slug>.yaml`. |
 
 ### Agent invocation
 
 | Var | Default | Purpose |
 |---|---|---|
-| `EMAIL_DOMAIN` | — | Domain for bot emails. `setup` invites `<nickname>@<EMAIL_DOMAIN>`. |
-| `PROMPTS_DIR` | — | Absolute path to your Claude Code agent prompt files (`<role>.md`). |
-| `AGENT_WORKING_DIR` | cwd of the service | Working directory passed to spawned `claude`. Usually your project root. |
-| `INITIATOR_UUID` | — | Your own Plane member UUID. Mentions of this UUID are silently ignored — we don't trigger the human as an agent. |
-| `CLAUDE_BINARY` | `claude` | Path to the `claude` CLI binary. Use absolute path if it's not on the service user's `PATH`. |
+| `CLAUDE_BINARY` | `claude` | Path to the `claude` CLI binary. Use absolute path if it isn't on the service user's `PATH`. Each workspace's `prompts_dir` and `agent_working_dir` come from its own YAML. |
 
 ### Operations
 
 | Var | Default | Purpose |
 |---|---|---|
-| `LOG_DIR` | `./logs` | Where per-run agent log files (and `.active/` sentinels) live. |
+| `LOG_DIR` | `./logs` | Where per-run agent log files (and `.active/` sentinels) live. Shared across workspaces; filenames carry the workspace slug. |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. |
-| `LOG_FORMAT` | `pretty` | `pretty` (console renderer with colours) or `json` (one JSON object per line — for log shipping). |
-| `MAX_CONCURRENT_SESSIONS` | `5` | Hard cap on simultaneously-running agents. N+1th spawn is rejected with `CapacityFullError`. |
+| `LOG_FORMAT` | `pretty` | `pretty` (console renderer with colours) or `json` (one JSON object per line). |
+| `MAX_CONCURRENT_SESSIONS` | `5` | **Host-wide** cap on simultaneously-running agents (across ALL workspaces). N+1th spawn is rejected with `CapacityFullError`. |
 | `SESSION_TIMEOUT_SECONDS` | `3600` | Per-agent timeout. After that the supervisor kills the whole process group (SIGTERM, then SIGKILL after 5s). |
 | `SHUTDOWN_GRACE_SECONDS` | `30` | On `systemctl stop`, how long to wait for in-flight agents to finish before SIGKILL. Keep below systemd's `TimeoutStopSec` (default 90s). |
-| `ALLOWED_NICKNAMES` | empty | Comma-separated allow-list of nicknames the orchestrator will spawn. Empty = allow all configured agents. Use to gate access during testing or to disable an agent without removing it from `conductor.yaml`. |
 
 ---
 
-## `conductor.yaml` — workflow config
+## `conductor.d/<slug>.yaml` — per-workspace config
 
-The shape is enforced by pydantic with `extra="forbid"` — typos fail
-loudly. See [`examples/sdlc-conductor.yaml`](../examples/sdlc-conductor.yaml)
-(10 SDLC roles) or
-[`examples/minimal-conductor.yaml`](../examples/minimal-conductor.yaml)
-(single dev) for ready-to-edit starters.
+One self-contained YAML per workspace. The filename stem **must equal**
+`workspace_slug` (the loader rejects mismatches).
+
+The shape is enforced by pydantic with `extra="forbid"` — typos fail loudly.
+
+Ready-to-edit starters:
+- [`examples/conductor.d/sdlc.yaml`](../examples/conductor.d/sdlc.yaml) —
+  full SDLC pipeline (10 roles)
+- [`examples/conductor.d/minimal.yaml`](../examples/conductor.d/minimal.yaml) —
+  single dev agent
+- [`examples/conductor.d/content.yaml`](../examples/conductor.d/content.yaml) —
+  editorial pipeline (briefer → researcher → drafter → editor → SEO → fact-checker → publisher)
+
+> **Important:** these files hold secrets (API key, webhook secret). Treat
+> them like `.env`: chmod 600, do **not** commit your edited copies. The
+> versions in `examples/` are templates with placeholder credentials.
 
 ```yaml
-agents:                       # required, at least one
-  - nickname: castor          # required — email local-part = mention name
-    prompt_role: business-analyst   # required — filename stem in PROMPTS_DIR
-    display_name: Castor — BA       # optional, used by `setup` for Plane display
+# --- identity / Plane connection (required) ---
+workspace_slug: qsale            # MUST match the filename stem
+plane_base_url: https://plane.example.io
+plane_api_key: plane_api_xxxxxxxxxxxxxxxxxxxxxxxx
+project_id: 00000000-0000-0000-0000-000000000000
+initiator_uuid: 00000000-0000-0000-0000-000000000099
 
-labels:                       # optional
-  artifacts: []               # list of {name, color?, description?}
-  roles: []                   # list of {name, color?, description?}
+# --- webhook (required) ---
+webhook_secret: replace-me-with-openssl-rand-hex-32
+webhook_signature_header: X-Plane-Signature   # optional, default shown
 
-states: []                    # optional, list of {name, group, color?}
-                              # group ∈ backlog | unstarted | started | completed | cancelled
+# --- agent invocation (required) ---
+email_domain: example.io
+prompts_dir: /home/you/Projects/yourproject/.claude/agents
+agent_working_dir: /home/you/Projects/yourproject   # optional, defaults to cwd
 
-announce_spawn: true          # default true
+# --- workflow (agents required, labels/states optional) ---
+agents:
+  - nickname: castor
+    prompt_role: business-analyst
+    display_name: Castor — BA
+
+labels:
+  artifacts: []
+  roles: []
+
+states: []
+
+# --- behaviour (optional) ---
+announce_spawn: true
+allowed_nicknames: []      # empty = allow all configured agents
 ```
+
+### Top-level fields
+
+| Field | Required | Notes |
+|---|---|---|
+| `workspace_slug` | yes | Lowercase. Filename stem must equal this. Path segment of the webhook URL: `POST /<workspace_slug>/webhook`. |
+| `plane_base_url` | yes | Plane base URL (cloud or self-hosted). Trailing slash stripped. |
+| `plane_api_key` | yes | Plane API token from Profile → Workspace settings → API tokens. |
+| `project_id` | yes | Project UUID inside the workspace. |
+| `initiator_uuid` | yes | Your Plane member UUID. Mentions of this UUID are silently ignored — we don't trigger you as an agent. |
+| `webhook_secret` | yes | Per-workspace HMAC secret. Generate with `openssl rand -hex 32`. Must match the secret in Plane → Webhooks for this workspace. |
+| `webhook_signature_header` | no | Default `X-Plane-Signature`. Adjust if your Plane build uses a different header. |
+| `email_domain` | yes | Bot email domain. `setup` invites `<nickname>@<email_domain>`. |
+| `prompts_dir` | yes | Absolute path to your Claude Code agent prompt files (`<role>.md`). |
+| `agent_working_dir` | no | Working dir passed to spawned `claude`. Defaults to the orchestrator's cwd. Usually your project root. |
+| `agents` | yes | At least one entry. See below. |
+| `labels` | no | `{artifacts: [...], roles: [...]}`. Each label is `{name, color?, description?}`. |
+| `states` | no | List of `{name, group, color?}`. `group` ∈ `backlog`/`unstarted`/`started`/`completed`/`cancelled`. |
+| `announce_spawn` | no | Default `true`. Posts a 'Picking up @nick…' comment on spawn and edits it on exit. |
+| `allowed_nicknames` | no | Allow-list of nicknames. Empty = allow all configured agents. Use to gate access during testing. |
 
 ### `agents`
 
-Each entry maps a nickname (the email local-part you'll mention with
-`@`) to a prompt file in `PROMPTS_DIR`. When a Plane mention resolves
-to email `castor@your-domain.io` and there's an `agents` entry with
-`nickname: castor`, the orchestrator runs:
+Each entry:
 
+```yaml
+agents:
+  - nickname: castor             # email local-part = mention name (lowercased)
+    prompt_role: business-analyst # filename stem in PROMPTS_DIR (→ business-analyst.md)
+    display_name: Castor — BA    # optional, used by `setup` for the bot's Plane display
 ```
+
+When a Plane mention resolves to email `castor@<email_domain>` and there's an
+`agents` entry with `nickname: castor`, the orchestrator runs:
+
+```bash
 claude --agent castor --print
 ```
 
-…with the prompt fed via stdin and `<prompt_role>.md` (here:
-`business-analyst.md`) being read by Claude Code from `PROMPTS_DIR`.
+…with the trigger prompt fed via stdin and `<prompt_role>.md` (here:
+`business-analyst.md`) being read by Claude Code from `prompts_dir`.
 
-`display_name` is only used by `plane-conductor setup` so the bot
-account in Plane shows up as something readable in the UI. It has no
-runtime effect.
-
-Constraints:
-
-- Nicknames must be unique within the file (case-insensitive — they're
-  lowercased on load).
-- Unknown YAML keys are rejected (`extra="forbid"`). Catches typos like
-  `prompt-role:` instead of `prompt_role:`.
+Nicknames must be unique within the file (case-insensitive — lowercased on
+load). Unknown YAML keys are rejected.
 
 ### `labels`
 
 Two conventional groups, both optional:
 
 - **`artifacts:`** — one label per agent output type. Use them to mark
-  sub-issues by what they contain (a SPEC, a backend plan, a UX test
-  report, etc.), so agents can find each other's work.
+  sub-issues by what they contain (a SPEC, a backend plan, a UX test report,
+  etc.), so agents can find each other's work.
 - **`roles:`** — reserve. Useful when one agent comments inside another
   agent's sub-issue and wants to mark *whose voice* it is.
-
-Each label is `{name, color?, description?}`:
 
 ```yaml
 labels:
@@ -139,25 +172,20 @@ labels:
     - { name: "artifact:backend", color: "#10b981", description: "Backend plan + CHANGES" }
 ```
 
-`plane-conductor setup` creates whichever ones don't exist yet. Already-existing
+`plane-conductor setup` creates whichever labels don't exist yet. Already-existing
 labels are skipped silently (idempotent).
 
 ### `states`
 
-Optional decorative project states (only created when you pass
-`--states` to `setup`). Plane's stock states (Backlog, Todo, In
-Progress, Done, Cancelled) are always present — this is for adding
-extras like Review or Blocked that match your workflow vocabulary.
+Optional decorative project states (only created when you pass `--states` to
+`setup`). Plane's stock states (Backlog, Todo, In Progress, Done, Cancelled)
+are always present — this is for adding extras like Review or Blocked.
 
 ```yaml
 states:
   - { name: Review, group: started, color: "#f59e0b" }
   - { name: Blocked, group: unstarted, color: "#ef4444" }
 ```
-
-`group` is one of Plane's five built-in groups: `backlog`, `unstarted`,
-`started`, `completed`, `cancelled`. The state inherits behaviour from
-its group (e.g. issues in a `completed`-group state count as done).
 
 ### `announce_spawn`
 
@@ -174,63 +202,106 @@ Why you want it on:
   itself is slow / has a bug / never speaks, the human still sees
   *something happened*.
 - **One comment per run, not three** — the announce comment doubles as
-  the failure note (it gets edited to the error summary). No separate
-  `agent failed` post when announce is on.
+  the failure note (it gets edited to the error summary).
 
 Set to `false` only if you specifically want the issue thread to look
 "silent until the agent itself speaks".
 
 ---
 
-## Two-config example
+## Two-workspace example
 
-Minimal `.env`:
+Directory layout on the host:
+
+```text
+/etc/plane-conductor/
+  runtime.env                       # 640, root:<your-group>
+  conductor.d/
+    qsale.yaml                      # 600 — holds qsale Plane API key + secret
+    aist.yaml                       # 600 — holds aist Plane API key + secret
+```
+
+`runtime.env`:
 
 ```bash
-PLANE_BASE_URL=https://plane.example.io
-PLANE_API_KEY=plane_api_xxxxxxxxxxxxxxxxxxxxxxxx
-PLANE_WORKSPACE_SLUG=acme
-PLANE_PROJECT_ID=00000000-0000-0000-0000-000000000000
-WEBHOOK_SECRET=replace-me-with-openssl-rand-hex-32
-CONDUCTOR_CONFIG=/etc/plane-conductor/conductor.yaml
-EMAIL_DOMAIN=acme.io
-PROMPTS_DIR=/home/you/Projects/acme/.claude/agents
-AGENT_WORKING_DIR=/home/you/Projects/acme
-INITIATOR_UUID=00000000-0000-0000-0000-000000000000
+WEBHOOK_HOST=0.0.0.0
+WEBHOOK_PORT=8000
+CONDUCTOR_DIR=/etc/plane-conductor/conductor.d
+LOG_DIR=/var/log/plane-conductor
+MAX_CONCURRENT_SESSIONS=5
 ```
 
-Minimal `conductor.yaml`:
+`conductor.d/qsale.yaml` (excerpted):
 
 ```yaml
+workspace_slug: qsale
+plane_base_url: https://plane.example.io
+plane_api_key: plane_api_qsale_xxx
+project_id: 11111111-...
+initiator_uuid: 99999999-...
+webhook_secret: <hex-32-bytes>
+email_domain: example.io
+prompts_dir: /home/you/Projects/qsale/.claude/agents
 agents:
-  - nickname: dev
-    prompt_role: developer
-    display_name: Dev
-
-labels:
-  artifacts: []
-  roles: []
-
-states: []
-announce_spawn: true
+  - { nickname: castor, prompt_role: business-analyst }
+  - { nickname: rinzler, prompt_role: python-developer }
+  # ...
 ```
 
-That's enough to mention `@dev` in any Plane issue and have
-`claude --agent dev --print` spawn locally.
+`conductor.d/aist.yaml` (excerpted):
+
+```yaml
+workspace_slug: aist
+plane_base_url: https://plane.example.io
+plane_api_key: plane_api_aist_xxx     # different API key
+project_id: 22222222-...                # different project
+initiator_uuid: 99999999-...
+webhook_secret: <hex-32-bytes>          # different secret
+email_domain: example.io
+prompts_dir: /home/you/Projects/aist/.claude/agents
+agents:
+  - { nickname: brief, prompt_role: content-briefer }
+  - { nickname: scribe, prompt_role: drafter }
+```
+
+In Plane, configure two webhooks:
+
+- qsale workspace → `https://your-host/qsale/webhook` (secret = qsale's webhook_secret)
+- aist workspace → `https://your-host/aist/webhook` (secret = aist's webhook_secret)
+
+One process serves both. `MAX_CONCURRENT_SESSIONS` is the host-wide cap.
 
 ---
 
 ## Where the orchestrator looks at startup
 
-```
-/etc/plane-conductor/.env       ← system .env (loaded first)
-./.env                          ← cwd .env (overrides)
-process env                     ← overrides everything
+```text
+/etc/plane-conductor/runtime.env  ← system runtime config (loaded first)
+/etc/plane-conductor/.env         ← legacy filename, still honoured
+./runtime.env                     ← cwd runtime config (overrides)
+./.env                            ← cwd fallback
+process env                       ← overrides everything
 
-$CONDUCTOR_CONFIG               ← resolved from settings; default is
-                                  /etc/plane-conductor/conductor.yaml
+$CONDUCTOR_DIR                    ← every *.yaml / *.yml inside is loaded as a workspace
 ```
 
-If anything required is missing or invalid, `plane-conductor serve`
-fails fast at startup with a pydantic ValidationError naming exactly
-what's wrong.
+On startup the loader validates:
+
+- the directory exists and contains at least one workspace file
+- every file's filename stem matches its `workspace_slug` (catches typos)
+- slugs are unique across files
+
+If anything required is missing or invalid, `plane-conductor serve` fails
+fast at startup. Possible exceptions:
+
+- `pydantic.ValidationError` — schema mismatch in a workspace YAML or in
+  `runtime.env` / process env (typos, missing fields, weak secret,
+  invalid slug pattern, etc.)
+- `FileNotFoundError` — `conductor_dir` path doesn't exist or contains
+  no `*.yaml`/`*.yml` files
+- `NotADirectoryError` — `conductor_dir` is a file, not a directory
+- `ValueError` — a file's `workspace_slug` doesn't match its filename
+  stem, or two files declare the same slug
+
+The error message names the offending file / field so you can fix and
+restart.

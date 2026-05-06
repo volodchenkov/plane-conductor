@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from plane_conductor.conductor_config import ConductorConfig
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
@@ -29,25 +29,20 @@ def _existing_emails(members: list[dict[str, Any]]) -> set[str]:
 
 async def invite_roster(
     plane: PlaneClient,
-    config: ConductorConfig,
-    email_domain: str,
+    workspace: WorkspaceConfig,
     *,
     dry_run: bool = False,
 ) -> dict[str, str]:
-    """Invite every agent listed in `config.agents`. Returns {nickname: status}.
+    """Invite every agent listed in `workspace.agents`. Returns {nickname: status}.
 
     Status values: 'invited', 'exists', 'failed'.
-
-    Plane's invitation flow only creates a *pending invite* — the bot user must
-    accept it. For fully automated bot onboarding (signup → invite → accept)
-    see `examples/bootstrap-bots.sh`.
     """
     members = await plane.list_workspace_members()
     existing = _existing_emails(members)
 
     statuses: dict[str, str] = {}
-    for agent in config.agents:
-        email = f"{agent.nickname}@{email_domain}".lower()
+    for agent in workspace.agents:
+        email = f"{agent.nickname}@{workspace.email_domain}".lower()
         if email in existing:
             log.info("user_exists", nickname=agent.nickname, email=email)
             statuses[agent.nickname] = "exists"

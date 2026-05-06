@@ -19,7 +19,7 @@ flowchart LR
     Claude["claude --agent dev<br/>--print<br/><i>(local subprocess)</i>"]
 
     Human --> Plane
-    Plane -->|webhook<br/>HMAC-signed| Conductor
+    Plane -->|webhook /<slug>/webhook<br/>HMAC-signed| Conductor
     Conductor -->|spawn| Claude
     Claude -.->|writes results<br/>back into the issue| Plane
     Conductor -->|"comment:<br/>@dev picking up.<br/>…done. 3m12s."| Plane
@@ -29,10 +29,10 @@ What it looks like once a mention lands:
 
 ```text
 $ journalctl -u plane-conductor -f
-… POST /webhook 200
-… agent_spawned   nickname=dev issue=6f042494 pid=500013
+… POST /qsale/webhook 200
+… agent_spawned   workspace=qsale nickname=dev issue=6f042494 pid=500013
 … (3m12s later)
-… agent_exited    nickname=dev exit_code=0 duration_s=192.4
+… agent_exited    workspace=qsale nickname=dev exit_code=0 duration_s=192.4
 ```
 
 Plane shows one comment that was posted at spawn and then *edited* on
@@ -48,19 +48,26 @@ exit:
 
 ## What it does
 
-You configure a roster of agents in `conductor.yaml` (each entry maps a
-`<nickname>` to a `<prompt-role>.md` file in your local prompts dir).
-Each becomes a bot
-account in Plane. Mention `@<nickname>` in any issue comment — Plane
-sends a webhook, Plane Conductor verifies the signature, resolves the
-mention, and spawns `claude --agent <nickname> --print` on the host
-that runs the service. The agent's prompt file (`<role>.md` in your
-local `PROMPTS_DIR`) is what defines its behaviour; the orchestrator
-just runs the subprocess and reports the outcome back into Plane.
+You drop a YAML per workspace into `conductor.d/`. Each file is
+self-contained: Plane creds, project, secrets, plus the agent roster
+for that workspace's workflow. Each agent maps a `<nickname>` to a
+`<prompt-role>.md` file in that workspace's prompts dir, and becomes a
+bot account in Plane.
 
-The roster is yours: 10 SDLC roles, 5 content roles, 3 research roles
-— whatever stages your team has. The orchestrator itself is workflow-
-agnostic.
+Mention `@<nickname>` in any issue comment — Plane sends a webhook to
+`https://<host>/<workspace_slug>/webhook`. Plane Conductor verifies the
+signature with that workspace's secret, resolves the mention, and
+spawns `claude --agent <nickname> --print` on the host. The agent's
+prompt file is what defines its behaviour; the orchestrator just runs
+the subprocess and reports the outcome back into Plane.
+
+The roster is yours and the workflow is yours: 10 SDLC roles, 5
+content roles, 3 research roles — whatever stages your team has. The
+orchestrator itself is workflow-agnostic.
+
+**Multi-workspace, single process** — one host serves N workspaces
+(nginx-vhost style, one YAML per workspace). Run an SDLC team and a
+content team on the same box without spinning up two services.
 
 ---
 
@@ -72,21 +79,31 @@ cd plane-conductor
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 
-cp .env.example .env
-# fill PLANE_*, WEBHOOK_SECRET (openssl rand -hex 32), EMAIL_DOMAIN,
-# PROMPTS_DIR, INITIATOR_UUID, CONDUCTOR_CONFIG.
+# 1. Host-wide runtime knobs (port, log dir, capacity).
+cp examples/runtime.env.example runtime.env
 
-cp examples/sdlc-conductor.yaml conductor.yaml
-# Or examples/minimal-conductor.yaml for a single-agent setup.
+# 2. One self-contained YAML per workspace. Filename stem MUST match
+#    the workspace_slug field inside.
+mkdir -p conductor.d
+cp examples/conductor.d/minimal.yaml conductor.d/myws.yaml
+# Edit conductor.d/myws.yaml — fill plane_base_url, plane_api_key,
+# project_id, initiator_uuid, webhook_secret (openssl rand -hex 32),
+# email_domain, prompts_dir. chmod 600 (it has secrets).
 
-plane-conductor verify       # smoke check Plane connectivity
-plane-conductor setup        # invite configured bots + create labels
+export CONDUCTOR_DIR=$(pwd)/conductor.d
+
+plane-conductor verify       # smoke check (all workspaces)
+plane-conductor setup        # invite bots + create labels (all workspaces)
 plane-conductor serve        # listens on :8000 by default
 ```
 
-Then point a Plane webhook at `https://<your host>/webhook` (use
-[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
-or any reverse proxy if you're behind NAT) and mention an agent.
+In Plane, configure the workspace's webhook to
+`https://<your-host>/<workspace_slug>/webhook` with the same
+`webhook_secret`. Mention an agent and the orchestrator picks it up.
+
+Adding a second workspace? Drop another file into `conductor.d/`,
+restart, point Plane's webhook for it at
+`/<other-workspace-slug>/webhook`. No code changes.
 
 For the full systemd-installer / Docker / tunnel walkthrough, see
 [**docs/install.md**](docs/install.md). For every config knob, see
@@ -99,19 +116,24 @@ For the full systemd-installer / Docker / tunnel walkthrough, see
 - **Webhook-driven, single-binary orchestrator.** No DB, no Redis, no
   queue. State is in-memory while running, sentinel files on disk for
   restart recovery, everything else lives in Plane.
-- **Two-file config** — `.env` for runtime concerns, `conductor.yaml`
-  for the workflow (agents, labels, states, behaviour).
+- **Multi-workspace** — one process serves N workspaces (nginx-vhost
+  style). One YAML per workspace in `conductor.d/`, one webhook URL
+  per workspace, isolated HMAC secrets. Add a workspace by dropping a
+  file; remove one by deleting it.
+- **Two-tier config** — `runtime.env` for host-wide knobs (port, log
+  dir, capacity); `conductor.d/<slug>.yaml` for each workspace's Plane
+  creds + agents + labels + secrets.
 - **Idempotent setup tooling** — `plane-conductor setup` invites every
-  configured bot account and creates every configured label / state in
-  one command. Re-runs are safe.
+  configured bot account and creates every configured label / state.
+  Use `--workspace <slug>` to scope, omit to run for all. Re-runs are safe.
 - **Production-grade subprocess handling** — process groups, SIGTERM →
-  SIGKILL escalation on timeout, capacity caps, dedup of same-issue
-  same-agent races, restart recovery with comment-back-to-Plane,
-  graceful shutdown for systemd.
+  SIGKILL escalation on timeout, host-wide capacity cap, dedup of
+  same-issue same-agent races (workspace-aware), restart recovery with
+  comment-back-to-the-right-Plane, graceful shutdown for systemd.
 - **Instant feedback in Plane** — `announce_spawn=true` posts a
   "picking up…" comment the moment the subprocess starts, and *edits*
   it on exit with duration + outcome. One comment per run.
-- **Type-checked, tested, lint-clean** — mypy strict, ruff, ~90 unit +
+- **Type-checked, tested, lint-clean** — mypy strict, ruff, ~100 unit +
   integration tests, e2e gated by `PLANE_E2E=1`. CI runs the matrix
   on Python 3.11 / 3.12 / 3.13.
 

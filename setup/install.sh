@@ -16,15 +16,16 @@
 # Steps (idempotent):
 #   1. Pick service user (your user or system 'conductor' on --system-user)
 #   2. Sync source + venv to <prefix>
-#   3. Drop /etc/plane-conductor/.env skeleton if absent
+#   3. Drop /etc/plane-conductor/runtime.env skeleton if absent
 #   4. Set up /var/log/plane-conductor with logrotate
 #   5. Install the systemd unit
-#   6. Print next steps (does NOT auto-start until you edit .env)
+#   6. Print next steps (does NOT auto-start until you edit runtime.env)
 
 set -euo pipefail
 
 PREFIX="/opt/plane-conductor"
 CONFIG_DIR="/etc/plane-conductor"
+WORKSPACES_DIR="/etc/plane-conductor/conductor.d"
 LOG_DIR="/var/log/plane-conductor"
 SYSTEMD_UNIT="/etc/systemd/system/plane-conductor.service"
 LOGROTATE_CONF="/etc/logrotate.d/plane-conductor"
@@ -142,33 +143,40 @@ log "installing plane-conductor (editable)"
 "${PREFIX}/.venv/bin/pip" install --quiet -e "${PREFIX}"
 
 # ---------------------------------------------------------------------------
-# 3. Config dir + .env skeleton
+# 3. Config dir + runtime.env + conductor.d skeletons
 # ---------------------------------------------------------------------------
 mkdir -p "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
 chown "root:${SERVICE_GROUP}" "$CONFIG_DIR"
 
-if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
-    log "writing .env skeleton → ${CONFIG_DIR}/.env"
-    cp "${PREFIX}/.env.example" "${CONFIG_DIR}/.env"
-    chmod 640 "${CONFIG_DIR}/.env"
-    chown "root:${SERVICE_GROUP}" "${CONFIG_DIR}/.env"
+if [[ ! -f "${CONFIG_DIR}/runtime.env" ]]; then
+    log "writing runtime.env skeleton → ${CONFIG_DIR}/runtime.env"
+    cp "${PREFIX}/examples/runtime.env.example" "${CONFIG_DIR}/runtime.env"
+    chmod 640 "${CONFIG_DIR}/runtime.env"
+    chown "root:${SERVICE_GROUP}" "${CONFIG_DIR}/runtime.env"
     EDIT_NEEDED=1
 else
-    log "${CONFIG_DIR}/.env already exists — leaving as-is"
+    log "${CONFIG_DIR}/runtime.env already exists — leaving as-is"
     EDIT_NEEDED=0
 fi
 
-if [[ ! -f "${CONFIG_DIR}/conductor.yaml" ]]; then
-    # Bootstrap with the SDLC example as a starting point. User edits to taste,
-    # or replaces with their own.
-    log "writing workflow config skeleton → ${CONFIG_DIR}/conductor.yaml"
-    cp "${PREFIX}/examples/sdlc-conductor.yaml" "${CONFIG_DIR}/conductor.yaml"
-    chmod 640 "${CONFIG_DIR}/conductor.yaml"
-    chown "root:${SERVICE_GROUP}" "${CONFIG_DIR}/conductor.yaml"
+mkdir -p "$WORKSPACES_DIR"
+chmod 750 "$WORKSPACES_DIR"
+chown "root:${SERVICE_GROUP}" "$WORKSPACES_DIR"
+
+# Drop a starter SDLC workspace if the directory is empty. User renames the
+# file to match their actual workspace_slug, edits secrets/creds, chmod 600.
+shopt -s nullglob
+_existing_ws=("$WORKSPACES_DIR"/*.yaml "$WORKSPACES_DIR"/*.yml)
+shopt -u nullglob
+if [[ ${#_existing_ws[@]} -eq 0 ]]; then
+    log "writing workspace skeleton → ${WORKSPACES_DIR}/sdlc.yaml (rename to match your workspace slug)"
+    cp "${PREFIX}/examples/conductor.d/sdlc.yaml" "${WORKSPACES_DIR}/sdlc.yaml"
+    chmod 600 "${WORKSPACES_DIR}/sdlc.yaml"
+    chown "root:${SERVICE_GROUP}" "${WORKSPACES_DIR}/sdlc.yaml"
     EDIT_NEEDED=1
 else
-    log "${CONFIG_DIR}/conductor.yaml already exists — leaving as-is"
+    log "${WORKSPACES_DIR}/ already has workspace configs — leaving as-is"
 fi
 
 # ---------------------------------------------------------------------------
@@ -228,7 +236,8 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${PREFIX}
-EnvironmentFile=${CONFIG_DIR}/.env
+EnvironmentFile=${CONFIG_DIR}/runtime.env
+EnvironmentFile=-${CONFIG_DIR}/.env
 ExecStart=${PREFIX}/.venv/bin/plane-conductor serve
 Restart=on-failure
 RestartSec=5s
@@ -255,7 +264,7 @@ systemctl daemon-reload
 # ---------------------------------------------------------------------------
 if ! sudo -u "$SERVICE_USER" -- bash -lc 'command -v claude' >/dev/null 2>&1; then
     warn "the 'claude' CLI is not on the PATH for user '$SERVICE_USER'."
-    warn "install Claude Code or set CLAUDE_BINARY=/full/path in ${CONFIG_DIR}/.env"
+    warn "install Claude Code or set CLAUDE_BINARY=/full/path in ${CONFIG_DIR}/runtime.env"
 fi
 
 if [[ -n "${SERVICE_HOME}" ]] && [[ ! -f "${SERVICE_HOME}/.claude.json" ]]; then
@@ -271,19 +280,24 @@ echo
 if [[ $EDIT_NEEDED -eq 1 ]]; then
     cat <<EOF
 Next steps:
-  1. Edit ${CONFIG_DIR}/.env  — fill PLANE_*, WEBHOOK_SECRET (openssl rand -hex 32),
-     EMAIL_DOMAIN, PROMPTS_DIR, INITIATOR_UUID. Pick a free WEBHOOK_PORT.
-       sudoedit ${CONFIG_DIR}/.env
-  2. Edit ${CONFIG_DIR}/conductor.yaml — agents, labels, states for your workflow.
-     Defaults shipped from examples/sdlc-conductor.yaml.
-       sudoedit ${CONFIG_DIR}/conductor.yaml
-  3. (Once) run setup against your Plane workspace:
+  1. Edit host-wide runtime config (port, log dir, capacity):
+       sudoedit ${CONFIG_DIR}/runtime.env
+  2. Configure your workspace(s). One YAML per workspace, named <slug>.yaml.
+     Each file holds Plane creds + agents + secrets for ONE workspace.
+     Rename the seeded sdlc.yaml to match your real workspace slug, then edit:
+       sudo mv ${WORKSPACES_DIR}/sdlc.yaml ${WORKSPACES_DIR}/<your-slug>.yaml
+       sudoedit ${WORKSPACES_DIR}/<your-slug>.yaml
+     Add more workspaces by dropping more files into ${WORKSPACES_DIR}/.
+  3. (Once per workspace) run setup against Plane:
        sudo -u ${SERVICE_USER} ${PREFIX}/.venv/bin/plane-conductor verify
        sudo -u ${SERVICE_USER} ${PREFIX}/.venv/bin/plane-conductor setup
+     (use --workspace <slug> to scope to one)
   4. Start the service:
        sudo systemctl enable --now plane-conductor
   5. Tail the logs:
        journalctl -u plane-conductor -f
+  6. Point Plane webhooks at https://<your-host>/<workspace-slug>/webhook
+     (one webhook per workspace in Plane's settings)
 EOF
 else
     cat <<EOF

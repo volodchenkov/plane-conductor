@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from plane_conductor.conductor_config import ConductorConfig
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
@@ -20,18 +20,18 @@ def _existing_label_names(labels: list[dict[str, Any]]) -> set[str]:
 async def create_labels(
     plane: PlaneClient,
     project_id: UUID,
-    config: ConductorConfig,
+    workspace: WorkspaceConfig,
     *,
     dry_run: bool = False,
 ) -> dict[str, str]:
-    """Create every label declared in `config.labels`. Returns {name: status}.
+    """Create every label declared in `workspace.labels`. Returns {name: status}.
 
     Status values: 'created', 'exists', 'failed'.
     """
     existing = _existing_label_names(await plane.list_labels(project_id))
 
     statuses: dict[str, str] = {}
-    for lbl in config.all_labels():
+    for lbl in workspace.all_labels():
         if lbl.name.lower() in existing:
             log.info("label_exists", name=lbl.name)
             statuses[lbl.name] = "exists"

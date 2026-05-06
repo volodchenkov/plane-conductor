@@ -159,7 +159,7 @@ async def test_request_returns_none_for_204(client: PlaneClient) -> None:
         return_value=httpx.Response(204)
     )
     out = await client.create_issue_comment(PROJECT, issue, "<p>x</p>")
-    assert out is None  # type: ignore[comparison-overlap]
+    assert out is None
     await client.aclose()
 
 

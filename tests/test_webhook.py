@@ -1,3 +1,4 @@
+# mypy: disable-error-code="arg-type, dict-item"
 from __future__ import annotations
 
 import hmac
@@ -10,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from plane_conductor.conductor_config import ConductorConfig
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
 from plane_conductor.webhook import build_router, extract_mention_uuids, verify_signature
 
@@ -30,6 +31,9 @@ class StubPlane:
             raise PlaneAPIError(404, f"missing {member_id}")
         return self.members[key]
 
+    async def aclose(self) -> None:
+        pass
+
 
 class StubRunner:
     def __init__(self) -> None:
@@ -43,17 +47,32 @@ def _sign(secret: str, body: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), body, sha256).hexdigest()
 
 
-def _app(settings: Settings, config: ConductorConfig, plane: Any, runner: Any) -> FastAPI:
+def _app(
+    settings: Settings,
+    workspace: WorkspaceConfig,
+    plane: Any,
+    runner: Any,
+) -> FastAPI:
     app = FastAPI()
-    app.include_router(build_router(settings, config, plane, runner))
+    app.include_router(
+        build_router(
+            settings,
+            {workspace.workspace_slug: (workspace, plane)},
+            runner,
+        )
+    )
     return app
 
 
-def _send(client: TestClient, settings: Settings, body: bytes) -> Any:
+def _url(workspace: WorkspaceConfig) -> str:
+    return f"/{workspace.workspace_slug}/webhook"
+
+
+def _send(client: TestClient, settings: Settings, workspace: WorkspaceConfig, body: bytes) -> Any:
     return client.post(
-        "/webhook",
+        _url(workspace),
         content=body,
-        headers={settings.webhook_signature_header: _sign(settings.webhook_secret, body)},
+        headers={workspace.webhook_signature_header: _sign(workspace.webhook_secret, body)},
     )
 
 
@@ -71,22 +90,30 @@ def test_verify_signature(webhook_secret: str) -> None:
 
 
 def test_webhook_rejects_bad_signature(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
     resp = client.post(
-        "/webhook",
+        _url(workspace_config),
         content=b"{}",
-        headers={settings.webhook_signature_header: "deadbeef"},
+        headers={workspace_config.webhook_signature_header: "deadbeef"},
     )
     assert resp.status_code == 401
 
 
-def test_webhook_rejects_invalid_json(
-    settings: Settings, conductor_config: ConductorConfig
+def test_webhook_unknown_workspace_slug_404(
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
-    resp = _send(client, settings, b"not-json")
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
+    resp = client.post("/no-such/webhook", content=b"{}")
+    assert resp.status_code == 404
+
+
+def test_webhook_rejects_invalid_json(
+    settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
+    resp = _send(client, settings, workspace_config, b"not-json")
     assert resp.status_code == 400
 
 
@@ -94,21 +121,22 @@ def test_webhook_rejects_invalid_json(
 
 
 def test_webhook_ignores_non_comment_event(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
     body = json.dumps({"event": "issue", "action": "created", "data": {}}).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     assert resp.json()["ignored"] == "issue"
+    assert resp.json()["workspace"] == workspace_config.workspace_slug
 
 
 def test_webhook_spawns_for_known_mention(
-    settings: Settings, conductor_config: ConductorConfig, project_uuid: UUID, initiator_uuid: UUID
+    settings: Settings, workspace_config: WorkspaceConfig, project_uuid: UUID, initiator_uuid: UUID
 ) -> None:
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
     runner = StubRunner()
-    client = TestClient(_app(settings, conductor_config, plane, runner))
+    client = TestClient(_app(settings, workspace_config, plane, runner))
 
     body = json.dumps(
         {
@@ -125,19 +153,22 @@ def test_webhook_spawns_for_known_mention(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     assert resp.json()["spawned"] == ["sark"]
     assert len(runner.calls) == 1
     assert runner.calls[0]["nickname"] == "sark"
     assert runner.calls[0]["triggered_by_email"] == "sark@example.io"
+    # Runner.spawn receives the workspace + plane client too:
+    assert runner.calls[0]["workspace"] is workspace_config
+    assert runner.calls[0]["plane"] is plane
 
 
 def test_webhook_skips_initiator(
-    settings: Settings, conductor_config: ConductorConfig, project_uuid: UUID, initiator_uuid: UUID
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
 ) -> None:
     runner = StubRunner()
-    client = TestClient(_app(settings, conductor_config, StubPlane(), runner))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), runner))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -151,14 +182,14 @@ def test_webhook_skips_initiator(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     assert resp.json()["spawned"] == []
     assert runner.calls == []
 
 
 def test_webhook_handles_multiple_mentions_with_unknowns(
-    settings: Settings, conductor_config: ConductorConfig, initiator_uuid: UUID
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
 ) -> None:
     rando = "99999999-9999-9999-9999-999999999999"
     plane = StubPlane(
@@ -169,7 +200,7 @@ def test_webhook_handles_multiple_mentions_with_unknowns(
         }
     )
     runner = StubRunner()
-    client = TestClient(_app(settings, conductor_config, plane, runner))
+    client = TestClient(_app(settings, workspace_config, plane, runner))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -189,18 +220,15 @@ def test_webhook_handles_multiple_mentions_with_unknowns(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     body_json = resp.json()
     assert sorted(body_json["spawned"]) == ["rinzler", "sark"]
-    # `rando` is skipped because their nickname isn't in the roster.
     assert any(s.get("reason") == "not allowed" for s in body_json["skipped"])
 
 
-def test_webhook_respects_allowlist(
-    settings: Settings, conductor_config: ConductorConfig, project_uuid: UUID, initiator_uuid: UUID
-) -> None:
-    settings.allowed_nicknames = "sark"
+def test_webhook_respects_allowlist(settings: Settings, workspace_config: WorkspaceConfig) -> None:
+    ws = workspace_config.model_copy(update={"allowed_nicknames": ["sark"]})
     plane = StubPlane(
         {
             SARK: {"email": "sark@example.io"},
@@ -208,7 +236,7 @@ def test_webhook_respects_allowlist(
         }
     )
     runner = StubRunner()
-    client = TestClient(_app(settings, conductor_config, plane, runner))
+    client = TestClient(_app(settings, ws, plane, runner))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -222,16 +250,20 @@ def test_webhook_respects_allowlist(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = client.post(
+        _url(ws),
+        content=body,
+        headers={ws.webhook_signature_header: _sign(ws.webhook_secret, body)},
+    )
     assert resp.json()["spawned"] == ["sark"]
 
 
 @pytest.mark.parametrize("event_kind", ["issue_comment", "comment"])
 def test_webhook_accepts_alias_event_names(
-    settings: Settings, conductor_config: ConductorConfig, project_uuid: UUID, event_kind: str
+    settings: Settings, workspace_config: WorkspaceConfig, event_kind: str
 ) -> None:
     runner = StubRunner()
-    client = TestClient(_app(settings, conductor_config, StubPlane(), runner))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), runner))
     body = json.dumps(
         {
             "event": event_kind,
@@ -242,8 +274,50 @@ def test_webhook_accepts_alias_event_names(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
+
+
+# --- per-workspace HMAC isolation -------------------------------------------
+
+
+def test_each_workspace_has_its_own_secret(
+    settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    """Two workspaces, two secrets. A signature good for one is bad for the other."""
+    ws_a = workspace_config.model_copy(
+        update={"workspace_slug": "alpha", "webhook_secret": "secret-alpha"}
+    )
+    ws_b = workspace_config.model_copy(
+        update={"workspace_slug": "beta", "webhook_secret": "secret-beta"}
+    )
+    app = FastAPI()
+    plane = StubPlane()
+    runner = StubRunner()
+    app.include_router(
+        build_router(
+            settings,
+            {
+                ws_a.workspace_slug: (ws_a, plane),
+                ws_b.workspace_slug: (ws_b, plane),
+            },
+            runner,
+        )
+    )
+    client = TestClient(app)
+    body = b'{"event":"x"}'
+    sig_a = _sign(ws_a.webhook_secret, body)
+    sig_b = _sign(ws_b.webhook_secret, body)
+
+    # Right secret → 200 (event is ignored, but route accepted).
+    r = client.post("/alpha/webhook", content=body, headers={ws_a.webhook_signature_header: sig_a})
+    assert r.status_code == 200
+    # Wrong secret (alpha's sig on beta's URL) → 401.
+    r = client.post("/beta/webhook", content=body, headers={ws_b.webhook_signature_header: sig_a})
+    assert r.status_code == 401
+    # Right secret on beta → 200.
+    r = client.post("/beta/webhook", content=body, headers={ws_b.webhook_signature_header: sig_b})
+    assert r.status_code == 200
 
 
 # --- mention extraction ------------------------------------------------------
@@ -275,21 +349,21 @@ def test_extract_mention_uuids_robust(html: str) -> None:
 
 
 def test_webhook_ignores_missing_issue_id(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
     body = json.dumps(
         {"event": "issue_comment", "action": "created", "data": {"comment_html": ""}}
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     assert resp.json()["ignored"] == "no issue id"
 
 
 def test_webhook_ignores_bad_issue_uuid(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -297,15 +371,15 @@ def test_webhook_ignores_bad_issue_uuid(
             "data": {"issue": "not-a-uuid", "comment_html": ""},
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     assert resp.json()["ignored"] == "bad issue uuid"
 
 
 def test_webhook_returns_empty_when_no_mentions(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -316,16 +390,15 @@ def test_webhook_returns_empty_when_no_mentions(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     assert resp.json()["spawned"] == []
 
 
 def test_webhook_skipped_when_member_lookup_fails(
-    settings: Settings, conductor_config: ConductorConfig, project_uuid: UUID
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    # Empty StubPlane → every lookup raises 404.
-    client = TestClient(_app(settings, conductor_config, StubPlane(), StubRunner()))
+    client = TestClient(_app(settings, workspace_config, StubPlane(), StubRunner()))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -338,7 +411,7 @@ def test_webhook_skipped_when_member_lookup_fails(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     body_json = resp.json()
     assert body_json["spawned"] == []
@@ -346,10 +419,10 @@ def test_webhook_skipped_when_member_lookup_fails(
 
 
 def test_webhook_skipped_when_member_has_no_email(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    plane = StubPlane({SARK: {"display_name": "Sark"}})  # no email
-    client = TestClient(_app(settings, conductor_config, plane, StubRunner()))
+    plane = StubPlane({SARK: {"display_name": "Sark"}})
+    client = TestClient(_app(settings, workspace_config, plane, StubRunner()))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -362,14 +435,13 @@ def test_webhook_skipped_when_member_has_no_email(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.json()["skipped"][0]["reason"] == "no email"
 
 
 def test_webhook_handles_spawn_failure(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """When runner raises AgentSpawnError, webhook records skip but returns 200."""
     from plane_conductor.exceptions import AgentSpawnError
 
     class CrashingRunner:
@@ -377,7 +449,7 @@ def test_webhook_handles_spawn_failure(
             raise AgentSpawnError("boom")
 
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
-    client = TestClient(_app(settings, conductor_config, plane, CrashingRunner()))
+    client = TestClient(_app(settings, workspace_config, plane, CrashingRunner()))
     body = json.dumps(
         {
             "event": "issue_comment",
@@ -390,7 +462,7 @@ def test_webhook_handles_spawn_failure(
             },
         }
     ).encode()
-    resp = _send(client, settings, body)
+    resp = _send(client, settings, workspace_config, body)
     assert resp.status_code == 200
     body_json = resp.json()
     assert body_json["spawned"] == []
@@ -412,7 +484,7 @@ def _comment_body(mention_uuid: str) -> bytes:
     ).encode()
 
 
-def test_webhook_skipped_on_dedup(settings: Settings, conductor_config: ConductorConfig) -> None:
+def test_webhook_skipped_on_dedup(settings: Settings, workspace_config: WorkspaceConfig) -> None:
     from plane_conductor.exceptions import SessionAlreadyRunningError
 
     class DupRunner:
@@ -420,13 +492,13 @@ def test_webhook_skipped_on_dedup(settings: Settings, conductor_config: Conducto
             raise SessionAlreadyRunningError("already running")
 
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
-    client = TestClient(_app(settings, conductor_config, plane, DupRunner()))
-    resp = _send(client, settings, _comment_body(SARK))
+    client = TestClient(_app(settings, workspace_config, plane, DupRunner()))
+    resp = _send(client, settings, workspace_config, _comment_body(SARK))
     assert resp.status_code == 200
     assert resp.json()["skipped"] == [{"nickname": "sark", "reason": "already running"}]
 
 
-def test_webhook_skipped_on_capacity(settings: Settings, conductor_config: ConductorConfig) -> None:
+def test_webhook_skipped_on_capacity(settings: Settings, workspace_config: WorkspaceConfig) -> None:
     from plane_conductor.exceptions import CapacityFullError
 
     class FullRunner:
@@ -434,38 +506,42 @@ def test_webhook_skipped_on_capacity(settings: Settings, conductor_config: Condu
             raise CapacityFullError("full")
 
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
-    client = TestClient(_app(settings, conductor_config, plane, FullRunner()))
-    resp = _send(client, settings, _comment_body(SARK))
+    client = TestClient(_app(settings, workspace_config, plane, FullRunner()))
+    resp = _send(client, settings, workspace_config, _comment_body(SARK))
     assert resp.status_code == 200
     assert resp.json()["skipped"] == [{"nickname": "sark", "reason": "capacity full"}]
 
 
 def test_webhook_returns_503_on_transient_plane_error(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """5xx / transport errors during member lookup → 503 so Plane retries."""
     from plane_conductor.exceptions import PlaneAPIError
 
     class FlakyPlane:
         async def get_member(self, member_id: str) -> dict[str, Any]:
             raise PlaneAPIError(503, "service unavailable")
 
-    client = TestClient(_app(settings, conductor_config, FlakyPlane(), StubRunner()))
-    resp = _send(client, settings, _comment_body(SARK))
+        async def aclose(self) -> None:
+            pass
+
+    client = TestClient(_app(settings, workspace_config, FlakyPlane(), StubRunner()))
+    resp = _send(client, settings, workspace_config, _comment_body(SARK))
     assert resp.status_code == 503
 
 
 def test_webhook_skipped_on_4xx_plane_error(
-    settings: Settings, conductor_config: ConductorConfig
+    settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """4xx errors during member lookup are not transient — skip, return 200."""
     from plane_conductor.exceptions import PlaneAPIError
 
     class NotFoundPlane:
         async def get_member(self, member_id: str) -> dict[str, Any]:
             raise PlaneAPIError(404, "not found")
 
-    client = TestClient(_app(settings, conductor_config, NotFoundPlane(), StubRunner()))
-    resp = _send(client, settings, _comment_body(SARK))
+        async def aclose(self) -> None:
+            pass
+
+    client = TestClient(_app(settings, workspace_config, NotFoundPlane(), StubRunner()))
+    resp = _send(client, settings, workspace_config, _comment_body(SARK))
     assert resp.status_code == 200
     assert resp.json()["skipped"][0]["reason"] == "lookup failed"

@@ -1,24 +1,24 @@
-"""Subprocess spawner — defends against the realistic failure modes:
+"""Subprocess spawner — multi-workspace, defends against realistic failure modes.
 
-- **Dedup**: the same `(nickname, issue_uuid)` cannot be spawned twice in this
-  orchestrator. Plane delivers webhooks at-least-once and the human can
-  double-mention; without this, two agents race to create the same artifact.
-- **Capacity cap**: `MAX_CONCURRENT_SESSIONS` rejects spawns once that many are
-  in flight. Stops a flood of mentions from melting the box / Anthropic quota.
+- **Dedup**: the same `(workspace_slug, nickname, issue_uuid)` cannot be spawned
+  twice in this orchestrator. Plane delivers webhooks at-least-once and the
+  human can double-mention; without this, two agents race to create the same
+  artifact. The slug is included so two workspaces can share nicknames safely.
+- **Capacity cap**: `MAX_CONCURRENT_SESSIONS` is host-wide — it counts active
+  agents across all workspaces. Stops a flood of mentions from melting the box.
 - **Process group**: every subprocess is spawned in its own session
   (`start_new_session=True`). On timeout we `killpg(SIGTERM)` then SIGKILL the
   whole group, so descendants of `claude` (MCP servers, helper procs) die too.
-- **Sentinel files**: before spawn we touch `logs/.active/<id>.json` and remove
-  it on exit. On startup the server scans those — anything left over means
-  conductor restarted while an agent was running, and we post a recovery
-  comment to Plane so the human notices.
-- **Announce-spawn (optional)**: when `announce_spawn=True` we post a comment
-  to the issue the moment we spawn the subprocess, then update that same
-  comment when the agent exits. Gives the human instant feedback in Plane,
-  even before the agent itself produces any output.
+- **Sentinel files**: before spawn we touch `logs/.active/<slug>-<nick>-<issue>.json`
+  and remove it on exit. On startup the server scans those — anything left
+  over means conductor restarted while an agent was running, and we post a
+  recovery comment to the right Plane workspace.
+- **Announce-spawn (optional, per-workspace)**: when the workspace's
+  `announce_spawn=True` we post a comment to the issue the moment we spawn the
+  subprocess, then update that same comment when the agent exits.
 
 State kept in memory: `_tasks` (supervisor task pins), `_active`
-(in-flight `(nick, issue)` keys), `_procs` (process handles for shutdown).
+(in-flight `(slug, nick, issue)` keys), `_procs` (process handles for shutdown).
 All three are derivable from "what's running right now"; nothing is persisted.
 """
 
@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import IO
 from uuid import UUID
 
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
 from plane_conductor.exceptions import (
     AgentSpawnError,
@@ -71,10 +72,10 @@ def build_prompt(
     return "\n".join(lines)
 
 
-def log_path_for(log_dir: Path, nickname: str, issue_uuid: UUID) -> Path:
+def log_path_for(log_dir: Path, workspace_slug: str, nickname: str, issue_uuid: UUID) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return log_dir / f"{ts}-{nickname}-{str(issue_uuid)[:8]}.log"
+    return log_dir / f"{ts}-{workspace_slug}-{nickname}-{str(issue_uuid)[:8]}.log"
 
 
 def _sentinel_dir(log_dir: Path) -> Path:
@@ -83,8 +84,8 @@ def _sentinel_dir(log_dir: Path) -> Path:
     return p
 
 
-def _sentinel_path(log_dir: Path, nickname: str, issue_uuid: UUID) -> Path:
-    return _sentinel_dir(log_dir) / f"{nickname}-{issue_uuid}.json"
+def _sentinel_path(log_dir: Path, workspace_slug: str, nickname: str, issue_uuid: UUID) -> Path:
+    return _sentinel_dir(log_dir) / f"{workspace_slug}-{nickname}-{issue_uuid}.json"
 
 
 def _format_duration(seconds: float) -> str:
@@ -99,20 +100,17 @@ def _format_duration(seconds: float) -> str:
 
 
 class Runner:
-    """Spawns claude subprocesses with dedup, capacity, and process-group control."""
+    """Spawns claude subprocesses with dedup, capacity, and process-group control.
 
-    def __init__(
-        self,
-        settings: Settings,
-        plane: PlaneClient,
-        *,
-        announce_spawn: bool = True,
-    ) -> None:
+    Multi-workspace: the runner itself doesn't know which workspaces exist; it
+    receives one `WorkspaceConfig` (and its matching `PlaneClient`) per spawn.
+    The host-wide capacity cap is enforced across all workspaces.
+    """
+
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.plane = plane
-        self.announce_spawn = announce_spawn
         self._tasks: set[asyncio.Task[None]] = set()
-        self._active: set[tuple[str, UUID]] = set()
+        self._active: set[tuple[str, str, UUID]] = set()
         # pid → Process. pid is also the pgid since we use start_new_session=True.
         self._procs: dict[int, asyncio.subprocess.Process] = {}
 
@@ -123,39 +121,46 @@ class Runner:
     async def spawn(
         self,
         *,
+        workspace: WorkspaceConfig,
+        plane: PlaneClient,
         nickname: str,
         issue_uuid: UUID,
         triggered_by_email: str | None = None,
     ) -> Path:
-        """Spawn `claude --agent <nickname>` for `issue_uuid`. Returns the log path.
+        """Spawn `claude --agent <nickname>` for `(workspace, issue_uuid)`.
 
         Raises:
-            SessionAlreadyRunningError: an agent for this (nick, issue) is in flight.
-            CapacityFullError: MAX_CONCURRENT_SESSIONS reached.
+            SessionAlreadyRunningError: an agent for this triple is in flight.
+            CapacityFullError: MAX_CONCURRENT_SESSIONS reached (host-wide).
             AgentSpawnError: claude binary missing.
         """
-        key = (nickname, issue_uuid)
+        slug = workspace.workspace_slug
+        key = (slug, nickname, issue_uuid)
         if key in self._active:
-            raise SessionAlreadyRunningError(f"@{nickname} already running on {issue_uuid}")
+            raise SessionAlreadyRunningError(
+                f"@{nickname} already running on {issue_uuid} in {slug}"
+            )
         if len(self._active) >= self.settings.max_concurrent_sessions:
             raise CapacityFullError(
                 f"max_concurrent_sessions={self.settings.max_concurrent_sessions} reached"
             )
 
-        log_path = log_path_for(self.settings.log_dir, nickname, issue_uuid)
+        log_path = log_path_for(self.settings.log_dir, slug, nickname, issue_uuid)
         prompt = build_prompt(
             nickname=nickname,
             issue_uuid=issue_uuid,
-            plane_base_url=self.settings.plane_base_url,
-            workspace_slug=self.settings.plane_workspace_slug,
-            project_id=self.settings.plane_project_id,
+            plane_base_url=workspace.plane_base_url,
+            workspace_slug=slug,
+            project_id=workspace.project_id,
             triggered_by_email=triggered_by_email,
         )
         argv = [self.settings.claude_binary, "--agent", nickname, "--print"]
-        cwd = self.settings.agent_working_dir or Path.cwd()
+        cwd = workspace.agent_working_dir or Path.cwd()
 
         log_fp = log_path.open("ab", buffering=0)
-        log_fp.write(f"# {datetime.now(UTC).isoformat()} spawn argv={argv!r} cwd={cwd}\n".encode())
+        log_fp.write(
+            f"# {datetime.now(UTC).isoformat()} spawn workspace={slug} argv={argv!r} cwd={cwd}\n".encode()
+        )
         log_fp.write(f"# prompt:\n{prompt}\n# --- stdout/stderr ---\n".encode())
 
         try:
@@ -174,13 +179,13 @@ class Runner:
                 f"claude binary not found at {self.settings.claude_binary!r}"
             ) from exc
 
-        # Reserve the slot only after the subprocess actually started.
         self._active.add(key)
         self._procs[proc.pid] = proc
-        self._write_sentinel(nickname, issue_uuid, log_path)
+        self._write_sentinel(slug, nickname, issue_uuid, log_path)
 
         log.info(
             "agent_spawned",
+            workspace=slug,
             nickname=nickname,
             issue=str(issue_uuid),
             pid=proc.pid,
@@ -199,18 +204,20 @@ class Runner:
                 with contextlib.suppress(Exception):
                     proc.stdin.close()
 
-        # Optional instant-feedback comment in Plane. We capture comment_id so the
-        # supervisor can update the same comment on exit instead of posting a
-        # separate failure note.
         announce_comment_id: str | None = None
-        if self.announce_spawn:
-            announce_comment_id = await self._post_announce(nickname, issue_uuid)
+        if workspace.announce_spawn:
+            announce_comment_id = await self._post_announce(
+                plane, workspace.project_id, nickname, issue_uuid
+            )
 
         started_at = time.monotonic()
         task = asyncio.create_task(
             self._supervise(
                 proc=proc,
                 log_fp=log_fp,
+                plane=plane,
+                project_id=workspace.project_id,
+                workspace_slug=slug,
                 nickname=nickname,
                 issue_uuid=issue_uuid,
                 announce_comment_id=announce_comment_id,
@@ -227,6 +234,9 @@ class Runner:
         *,
         proc: asyncio.subprocess.Process,
         log_fp: IO[bytes],
+        plane: PlaneClient,
+        project_id: UUID,
+        workspace_slug: str,
         nickname: str,
         issue_uuid: UUID,
         announce_comment_id: str | None,
@@ -248,13 +258,14 @@ class Runner:
             if transport is not None:
                 with contextlib.suppress(Exception):
                     transport.close()
-            self._active.discard((nickname, issue_uuid))
+            self._active.discard((workspace_slug, nickname, issue_uuid))
             self._procs.pop(proc.pid, None)
-            self._clear_sentinel(nickname, issue_uuid)
+            self._clear_sentinel(workspace_slug, nickname, issue_uuid)
 
         duration = time.monotonic() - started_at
         log.info(
             "agent_exited",
+            workspace=workspace_slug,
             nickname=nickname,
             issue=str(issue_uuid),
             exit_code=exit_code,
@@ -263,14 +274,21 @@ class Runner:
             active=len(self._active),
         )
 
-        # Update the announce-comment to reflect the final outcome (if we have
-        # one), otherwise post a fresh failure comment for non-zero exits.
         if announce_comment_id is not None:
             await self._update_announce(
-                nickname, issue_uuid, announce_comment_id, exit_code, timed_out, duration
+                plane,
+                project_id,
+                nickname,
+                issue_uuid,
+                announce_comment_id,
+                exit_code,
+                timed_out,
+                duration,
             )
         elif exit_code != 0 or timed_out:
-            await self._notify_failure(nickname, issue_uuid, exit_code, timed_out)
+            await self._notify_failure(
+                plane, project_id, nickname, issue_uuid, exit_code, timed_out
+            )
 
     async def _kill_group(self, proc: asyncio.subprocess.Process) -> int:
         """SIGTERM the process group; SIGKILL after 5s if it didn't exit."""
@@ -285,16 +303,19 @@ class Runner:
 
     # -- Plane comment helpers ------------------------------------------------
 
-    async def _post_announce(self, nickname: str, issue_uuid: UUID) -> str | None:
-        """Post the initial 'picking up' comment. Returns its id, or None on error."""
+    @staticmethod
+    async def _post_announce(
+        plane: PlaneClient,
+        project_id: UUID,
+        nickname: str,
+        issue_uuid: UUID,
+    ) -> str | None:
         body = (
             f"<p><strong><code>@{nickname}</code> picking up.</strong> "
             f"Working on it — this comment will be updated when the agent finishes.</p>"
         )
         try:
-            resp = await self.plane.create_issue_comment(
-                self.settings.plane_project_id, issue_uuid, body
-            )
+            resp = await plane.create_issue_comment(project_id, issue_uuid, body)
         except PlaneAPIError as exc:
             log.warning(
                 "announce_comment_failed",
@@ -307,8 +328,10 @@ class Runner:
         comment_id = resp.get("id") if isinstance(resp, dict) else None
         return str(comment_id) if comment_id else None
 
+    @staticmethod
     async def _update_announce(
-        self,
+        plane: PlaneClient,
+        project_id: UUID,
         nickname: str,
         issue_uuid: UUID,
         comment_id: str,
@@ -318,21 +341,16 @@ class Runner:
     ) -> None:
         if timed_out:
             verdict = "timed out"
-            severity = "strong"
         elif exit_code == 0:
             verdict = "done"
-            severity = "strong"
         else:
             verdict = f"exited {exit_code}"
-            severity = "strong"
         body = (
-            f"<p><{severity}><code>@{nickname}</code> {verdict}.</{severity}> "
+            f"<p><strong><code>@{nickname}</code> {verdict}.</strong> "
             f"Duration: {_format_duration(duration)}.</p>"
         )
         try:
-            await self.plane.update_issue_comment(
-                self.settings.plane_project_id, issue_uuid, comment_id, body
-            )
+            await plane.update_issue_comment(project_id, issue_uuid, comment_id, body)
         except PlaneAPIError as exc:
             log.error(
                 "announce_update_failed",
@@ -342,13 +360,19 @@ class Runner:
                 error=exc.message,
             )
 
+    @staticmethod
     async def _notify_failure(
-        self, nickname: str, issue_uuid: UUID, exit_code: int, timed_out: bool
+        plane: PlaneClient,
+        project_id: UUID,
+        nickname: str,
+        issue_uuid: UUID,
+        exit_code: int,
+        timed_out: bool,
     ) -> None:
         kind = "timed out" if timed_out else f"exited {exit_code}"
         body = f"<p><strong><code>@{nickname}</code> {kind}.</strong> See orchestrator logs.</p>"
         try:
-            await self.plane.create_issue_comment(self.settings.plane_project_id, issue_uuid, body)
+            await plane.create_issue_comment(project_id, issue_uuid, body)
         except PlaneAPIError as exc:
             log.error(
                 "failure_comment_post_failed",
@@ -360,9 +384,16 @@ class Runner:
 
     # -- sentinel file helpers ------------------------------------------------
 
-    def _write_sentinel(self, nickname: str, issue_uuid: UUID, log_path: Path) -> None:
-        path = _sentinel_path(self.settings.log_dir, nickname, issue_uuid)
+    def _write_sentinel(
+        self,
+        workspace_slug: str,
+        nickname: str,
+        issue_uuid: UUID,
+        log_path: Path,
+    ) -> None:
+        path = _sentinel_path(self.settings.log_dir, workspace_slug, nickname, issue_uuid)
         payload = {
+            "workspace_slug": workspace_slug,
             "nickname": nickname,
             "issue_uuid": str(issue_uuid),
             "log_path": str(log_path),
@@ -371,8 +402,8 @@ class Runner:
         with contextlib.suppress(OSError):
             path.write_text(json.dumps(payload), encoding="utf-8")
 
-    def _clear_sentinel(self, nickname: str, issue_uuid: UUID) -> None:
-        path = _sentinel_path(self.settings.log_dir, nickname, issue_uuid)
+    def _clear_sentinel(self, workspace_slug: str, nickname: str, issue_uuid: UUID) -> None:
+        path = _sentinel_path(self.settings.log_dir, workspace_slug, nickname, issue_uuid)
         with contextlib.suppress(FileNotFoundError, OSError):
             path.unlink()
 
@@ -404,8 +435,16 @@ class Runner:
 # ---------------------------------------------------------------------------
 
 
-async def recover_orphaned_sessions(settings: Settings, plane: PlaneClient) -> int:
-    """Post a recovery comment for each leftover sentinel; remove them."""
+async def recover_orphaned_sessions(
+    settings: Settings,
+    workspaces: dict[str, tuple[WorkspaceConfig, PlaneClient]],
+) -> int:
+    """Post a recovery comment for each leftover sentinel; remove them.
+
+    `workspaces` is a slug-keyed dict mapping to `(WorkspaceConfig, PlaneClient)`.
+    A sentinel for an unknown workspace (config removed since restart) is
+    logged and the file deleted — we can't post anywhere meaningful.
+    """
     sentinel_dir = settings.log_dir / ".active"
     if not sentinel_dir.exists():
         return 0
@@ -417,6 +456,7 @@ async def recover_orphaned_sessions(settings: Settings, plane: PlaneClient) -> i
             data = json.loads(path.read_text(encoding="utf-8"))
             issue_uuid = UUID(data["issue_uuid"])
             nickname = data["nickname"]
+            slug = data.get("workspace_slug")
             log_path = data.get("log_path", "(unknown)")
             started_at = data.get("started_at", "(unknown)")
         except (OSError, ValueError, KeyError) as exc:
@@ -425,6 +465,18 @@ async def recover_orphaned_sessions(settings: Settings, plane: PlaneClient) -> i
                 path.unlink()
             continue
 
+        if not slug or slug not in workspaces:
+            log.warning(
+                "sentinel_orphan_workspace_unknown",
+                path=str(path),
+                workspace_slug=slug,
+                nickname=nickname,
+            )
+            with contextlib.suppress(OSError):
+                path.unlink()
+            continue
+
+        workspace, plane = workspaces[slug]
         body = (
             f"<p><strong><code>@{nickname}</code> was running when "
             f"the orchestrator restarted.</strong><br>"
@@ -432,10 +484,11 @@ async def recover_orphaned_sessions(settings: Settings, plane: PlaneClient) -> i
             f"Mention me again to continue from where I left off.</p>"
         )
         try:
-            await plane.create_issue_comment(settings.plane_project_id, issue_uuid, body)
+            await plane.create_issue_comment(workspace.project_id, issue_uuid, body)
         except PlaneAPIError as exc:
             log.error(
                 "recovery_comment_failed",
+                workspace=slug,
                 nickname=nickname,
                 issue=str(issue_uuid),
                 status_code=exc.status_code,
