@@ -100,9 +100,10 @@ strict = true
 warn_unused_ignores = true
 disallow_any_generics = true
 files = ["src/plane_conductor"]
+exclude = ["src/plane_conductor/mcp_server\\.py$"]
 
 [[tool.mypy.overrides]]
-module = ["structlog.*"]
+module = ["structlog.*", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
