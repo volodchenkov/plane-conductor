@@ -8,8 +8,8 @@ from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.plane_client import PlaneClient
 from plane_conductor.setup.plane.add_project_members import (
-    _email_to_member_id,
-    _existing_member_ids,
+    email_to_member_id,
+    existing_member_ids,
 )
 from plane_conductor.setup.plane.create_users import _existing_emails
 
@@ -40,7 +40,7 @@ async def run_verify(workspace: WorkspaceConfig) -> int:
             _print(f"FAIL members: {exc}")
             return 1
         emails = _existing_emails(members)
-        email_to_id = _email_to_member_id(members)
+        email_to_id = email_to_member_id(members)
 
         for agent in workspace.agents:
             email = f"{agent.nickname}@{workspace.email_domain}".lower()
@@ -55,7 +55,7 @@ async def run_verify(workspace: WorkspaceConfig) -> int:
         except PlaneAPIError as exc:
             _print(f"FAIL project members: {exc}")
             return 1
-        in_project = _existing_member_ids(project_members)
+        in_project = existing_member_ids(project_members)
 
         for agent in workspace.agents:
             email = f"{agent.nickname}@{workspace.email_domain}".lower()

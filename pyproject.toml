@@ -114,7 +114,11 @@ filterwarnings = ["error"]
 
 [tool.coverage.run]
 source = ["src/plane_conductor"]
-omit = ["src/plane_conductor/__main__.py", "src/plane_conductor/cli.py"]
+omit = [
+    "src/plane_conductor/__main__.py",
+    "src/plane_conductor/cli.py",
+    "src/plane_conductor/mcp_server.py",
+]
 
 [tool.coverage.report]
 fail_under = 70

@@ -158,8 +158,10 @@ class Runner:
         agent_name = agent_cfg.prompt_role if agent_cfg else nickname
         argv = [
             self.settings.claude_binary,
-            "--agent", agent_name,
-            "--permission-mode", "acceptEdits",
+            "--agent",
+            agent_name,
+            "--permission-mode",
+            "acceptEdits",
             "--print",
         ]
         cwd = workspace.agent_working_dir or Path.cwd()

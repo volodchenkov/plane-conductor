@@ -19,7 +19,7 @@ from plane_conductor.plane_client import PlaneClient
 log = get_logger(__name__)
 
 
-def _email_to_member_id(members: list[dict[str, Any]]) -> dict[str, str]:
+def email_to_member_id(members: list[dict[str, Any]]) -> dict[str, str]:
     out: dict[str, str] = {}
     for m in members:
         email = m.get("email")
@@ -36,7 +36,7 @@ def _email_to_member_id(members: list[dict[str, Any]]) -> dict[str, str]:
     return out
 
 
-def _existing_member_ids(project_members: list[dict[str, Any]]) -> set[str]:
+def existing_member_ids(project_members: list[dict[str, Any]]) -> set[str]:
     out: set[str] = set()
     for m in project_members:
         mid = m.get("id")
@@ -65,10 +65,10 @@ async def add_roster_to_project(
     accepts.
     """
     workspace_members = await plane.list_workspace_members()
-    email_to_id = _email_to_member_id(workspace_members)
+    email_to_id = email_to_member_id(workspace_members)
 
     project_members = await plane.list_project_members(workspace.project_id)
-    already_in_project = _existing_member_ids(project_members)
+    already_in_project = existing_member_ids(project_members)
 
     statuses: dict[str, str] = {}
     for agent in workspace.agents:
