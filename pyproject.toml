@@ -45,9 +45,13 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
 ]
+mcp = [
+    "mcp>=1.0",
+]
 
 [project.scripts]
 plane-conductor = "plane_conductor.cli:app"
+plane-conductor-mcp = "plane_conductor.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/volodchenkov/plane-conductor"
@@ -96,9 +100,10 @@ strict = true
 warn_unused_ignores = true
 disallow_any_generics = true
 files = ["src/plane_conductor"]
+exclude = ["src/plane_conductor/mcp_server\\.py$"]
 
 [[tool.mypy.overrides]]
-module = ["structlog.*"]
+module = ["structlog.*", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -110,7 +115,11 @@ filterwarnings = ["error"]
 
 [tool.coverage.run]
 source = ["src/plane_conductor"]
-omit = ["src/plane_conductor/__main__.py", "src/plane_conductor/cli.py"]
+omit = [
+    "src/plane_conductor/__main__.py",
+    "src/plane_conductor/cli.py",
+    "src/plane_conductor/mcp_server.py",
+]
 
 [tool.coverage.report]
 fail_under = 70
