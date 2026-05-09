@@ -71,11 +71,31 @@ class StateDef(BaseModel):
     color: str = "#cccccc"
 
 
+def _default_pipeline_labels() -> list[LabelDef]:
+    """Pipeline-routing labels created in every new workspace by default.
+
+    `pipeline:doc-only` triggers the short doc pipeline (see
+    claude-sdlc-agents `plane-api.md` §6.13b): initiator triggers a coder
+    directly, no SPEC / ARCH_REVIEW / tests / final REVIEW.
+    """
+    return [
+        LabelDef(
+            name="pipeline:doc-only",
+            color="#7c8db5",
+            description=(
+                "Short pipeline: documentation-only. Initiator triggers a "
+                "coder directly; no SPEC/ARCH_REVIEW/tests/REVIEW."
+            ),
+        ),
+    ]
+
+
 class LabelsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     artifacts: list[LabelDef] = Field(default_factory=list)
     roles: list[LabelDef] = Field(default_factory=list)
+    pipelines: list[LabelDef] = Field(default_factory=_default_pipeline_labels)
 
 
 class WorkspaceConfig(BaseModel):
@@ -197,7 +217,7 @@ class WorkspaceConfig(BaseModel):
         return {a.nickname: a for a in self.agents}
 
     def all_labels(self) -> list[LabelDef]:
-        return [*self.labels.artifacts, *self.labels.roles]
+        return [*self.labels.artifacts, *self.labels.roles, *self.labels.pipelines]
 
     def all_label_names(self) -> list[str]:
         return [lbl.name for lbl in self.all_labels()]

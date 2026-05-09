@@ -85,14 +85,21 @@ def test_agents_by_nickname_lookup() -> None:
     assert by["sark"].prompt_role == "system-analyst"
 
 
-def test_all_labels_concatenates_artifacts_and_roles() -> None:
+def test_all_labels_concatenates_artifacts_roles_and_pipelines() -> None:
     cfg = _ws(
         labels=LabelsConfig(
             artifacts=[LabelDef(name="artifact:spec")],
             roles=[LabelDef(name="role:dev")],
+            pipelines=[],  # opt out of the default pipeline:doc-only
         ),
     )
     assert cfg.all_label_names() == ["artifact:spec", "role:dev"]
+
+
+def test_pipeline_labels_default_includes_doc_only() -> None:
+    """A workspace that doesn't override `pipelines` gets pipeline:doc-only."""
+    cfg = _ws(labels=LabelsConfig(artifacts=[LabelDef(name="artifact:spec")]))
+    assert "pipeline:doc-only" in cfg.all_label_names()
 
 
 def test_allowed_nicknames_normalised() -> None:

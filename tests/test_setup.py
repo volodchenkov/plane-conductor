@@ -87,11 +87,12 @@ async def test_create_labels_idempotent(
     create_route = respx.post(base).mock(return_value=httpx.Response(201, json={}))
 
     statuses = await create_labels(client, PROJECT, workspace_config)
-    assert len(statuses) == 3
+    assert len(statuses) == 4  # spec, backend, role:sa, pipeline:doc-only (default)
     assert statuses["artifact:spec"] == "exists"
     assert statuses["artifact:backend"] == "created"
     assert statuses["role:system-analyst"] == "created"
-    assert create_route.call_count == 2
+    assert statuses["pipeline:doc-only"] == "created"
+    assert create_route.call_count == 3
     await client.aclose()
 
 
