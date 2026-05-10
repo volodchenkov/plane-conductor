@@ -226,7 +226,9 @@ async def build_registry(conductor_dir: Path | str) -> TowerRegistry:
     """Load every conductor.d/*.yaml and snapshot all Plane constants."""
     workspaces = load_workspaces(Path(conductor_dir))
     registry = TowerRegistry()
-    contexts = await asyncio.gather(*(_hydrate_workspace(ws) for ws in workspaces))
+    contexts = await asyncio.gather(
+        *(_hydrate_workspace(ws) for ws in workspaces.values())
+    )
     for ctx in contexts:
         registry.by_slug[ctx.config.workspace_slug] = ctx
         registry.by_project_id[str(ctx.config.project_id)] = ctx
