@@ -320,12 +320,18 @@ def _role_mention(ctx: WorkspaceContext, role: str) -> str:
     the workspace's `agents` list, with any optional `<namespace>:` prefix
     stripped (so `sdlc-agents:reviewer` and `reviewer` both work).
 
+    The special role `'initiator'` resolves to `ctx.config.initiator_uuid` —
+    used by startup comments / blocking-question / final-summary handoffs
+    where the agent wants to ping the human, not another bot.
+
     Raises RoleNotFoundError if no agent in this workspace has that role,
     or if the resolved nickname has no member UUID in the cache.
     """
     target = role.strip().rsplit(":", 1)[-1].lower()
     if not target:
         raise RoleNotFoundError("target_role is empty")
+    if target == "initiator":
+        return _initiator_mention(ctx)
     for agent in ctx.config.agents:
         bare = agent.prompt_role.rsplit(":", 1)[-1].lower()
         if bare == target:

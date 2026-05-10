@@ -1161,6 +1161,33 @@ async def test_request_handoff_unknown_role_raises(
         )
 
 
+@respx.mock
+async def test_request_handoff_initiator_special_case(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """target_role='initiator' resolves to ctx.config.initiator_uuid — used
+    by startup comments / blocking-question / summary handoffs where the
+    agent pings the human, not another bot."""
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    captured: dict[str, Any] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode()
+        return httpx.Response(201, json={"id": "c-startup"})
+
+    respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/comments/").mock(side_effect=_capture)
+
+    result = await request_handoff(
+        sub_uuid=BACKEND_SUB_UUID,
+        target_role="initiator",
+        message_html="picked up. reading SPEC.",
+        workspace=ctx.config.workspace_slug,
+    )
+    assert result["target_role"] == "initiator"
+    assert result["target_uuid"] == str(ctx.config.initiator_uuid)
+    assert str(ctx.config.initiator_uuid) in captured["body"]
+
+
 async def test_request_handoff_refuses_mention_in_message(
     registry: TowerRegistry, ctx_with_all_members: WorkspaceContext
 ) -> None:
