@@ -10,6 +10,7 @@ already hydrated and inspect the tower's calls.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -465,6 +466,72 @@ async def test_create_sub_issue_unknown_role_raises(
             root_uuid=ROOT_UUID,
             workspace=ctx.config.workspace_slug,
         )
+
+
+@respx.mock
+async def test_create_sub_issue_concurrent_calls_serialize(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Two concurrent create_sub_issue calls for the same (root, role) must
+    NOT both create. The per-(workspace, root, role) lock serializes the
+    list+create span so the second caller sees the first one's sub-issue and
+    raises DuplicateSubIssueError instead of producing a second sub.
+    """
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+
+    # State machine that mirrors real Plane: list reflects whatever has been
+    # POSTed so far. Without a serializing lock, two concurrent calls would
+    # both list (see empty) and both POST → a real duplicate.
+    state: dict[str, list[dict[str, Any]]] = {"created": []}
+    create_calls = {"n": 0}
+
+    def _list(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": list(state["created"])})
+
+    def _create(_: httpx.Request) -> httpx.Response:
+        create_calls["n"] += 1
+        state["created"].append({"id": SPEC_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_SPEC]})
+        return httpx.Response(
+            201,
+            json={"id": SPEC_SUB_UUID, "name": "SPEC: …", "labels": [LABEL_SPEC]},
+        )
+
+    respx.get(f"{base}/issues/").mock(side_effect=_list)
+    respx.get(f"{base}/issues/{ROOT_UUID}/").mock(
+        return_value=httpx.Response(
+            200, json={"id": ROOT_UUID, "name": "Add user dashboard", "sequence_id": 42}
+        )
+    )
+
+    respx.post(f"{base}/issues/").mock(side_effect=_create)
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": SPEC_SUB_UUID,
+                "labels": [LABEL_SPEC],
+                "parent": ROOT_UUID,
+                "sequence_id": 43,
+            },
+        )
+    )
+
+    async def _attempt() -> dict[str, Any] | TowerError:
+        try:
+            return await create_sub_issue(
+                role="spec",
+                root_uuid=ROOT_UUID,
+                workspace=ctx.config.workspace_slug,
+            )
+        except TowerError as exc:
+            return exc
+
+    results = await asyncio.gather(_attempt(), _attempt())
+    successes = [r for r in results if isinstance(r, dict)]
+    failures = [r for r in results if isinstance(r, DuplicateSubIssueError)]
+    assert len(successes) == 1, f"expected exactly one create, got {results}"
+    assert len(failures) == 1
+    assert create_calls["n"] == 1, f"lock failed: POST /issues/ called {create_calls['n']} times"
 
 
 # ---------------------------------------------------------------------------

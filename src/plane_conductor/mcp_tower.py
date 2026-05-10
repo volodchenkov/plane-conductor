@@ -451,6 +451,27 @@ def _summarize_issue(item: dict[str, Any]) -> dict[str, Any]:
 # ----- create_sub_issue ----------------------------------------------------
 
 
+# Per-(workspace, root, role) locks to serialize the list+create span within
+# one tower process. Plane has no server-side unique constraint on
+# (parent, label), so two concurrent `create_sub_issue` calls for the same
+# (root, role) would otherwise both pass the duplicate-check and both create
+# a sub-issue. The lock closes the TOCTOU window for the deployment shape we
+# actually run (one tower process per host); cross-process safety would
+# require server-side enforcement, which is outside our control.
+_create_sub_issue_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+
+
+def _create_lock_for(workspace_slug: str, root_uuid: str, role: str) -> asyncio.Lock:
+    key = (workspace_slug, root_uuid, role)
+    lock = _create_sub_issue_locks.get(key)
+    if lock is None:
+        # asyncio.Lock() construction is sync and dict.setdefault is atomic
+        # under the GIL → safe without an outer guard. The first concurrent
+        # creator wins; losers reuse its lock.
+        lock = _create_sub_issue_locks.setdefault(key, asyncio.Lock())
+    return lock
+
+
 @mcp.tool()
 async def create_sub_issue(
     role: str,
@@ -465,7 +486,9 @@ async def create_sub_issue(
     Enforces:
       - one-sub-per-role: refuses if a sub-issue with the same artifact label
         already exists under this root (use `find_artifact_by_label` /
-        re-entry update path instead).
+        re-entry update path instead). Serialized within this process by a
+        per-(workspace, root, role) asyncio lock so two concurrent calls
+        cannot both pass the duplicate-check and both create.
       - label-non-empty: resolves the artifact label UUID at call time;
         refuses if the workspace has no such label.
       - post-create assert: re-reads the freshly-created sub-issue and fails
@@ -479,7 +502,8 @@ async def create_sub_issue(
     label_uuid = ctx.artifact_label_uuid(role)
     root_uuid = _ensure_uuid(root_uuid, "root_uuid")
 
-    async with await _client_for(ctx) as plane:
+    lock = _create_lock_for(ctx.config.workspace_slug, root_uuid, role)
+    async with lock, await _client_for(ctx) as plane:
         # Pre-condition: no duplicate
         items = await plane.list_issues(ctx.config.project_id)
         existing = [
