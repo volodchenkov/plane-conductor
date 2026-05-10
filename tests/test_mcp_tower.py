@@ -291,6 +291,59 @@ async def test_find_artifact_raises_on_duplicate(
         )
 
 
+@respx.mock
+async def test_find_artifact_handles_pagination_duplicates(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """If a project has > one page of issues, both pages must be scanned for
+    duplicate-detection. Regression for the silent-no-op risk of paginated
+    responses against a real Plane project."""
+    list_url = _list_issues_url(ctx, project_id)
+
+    def _route(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        if cursor is None:
+            return httpx.Response(
+                200,
+                json={
+                    "next_cursor": "page2",
+                    "results": [
+                        {
+                            "id": SPEC_SUB_UUID,
+                            "parent": ROOT_UUID,
+                            "labels": [LABEL_SPEC],
+                            "name": "SPEC v1",
+                            "sequence_id": 38,
+                        },
+                    ],
+                },
+            )
+        if cursor == "page2":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": "55555555-5555-5555-5555-555555555555",
+                            "parent": ROOT_UUID,
+                            "labels": [LABEL_SPEC],
+                            "name": "SPEC v2 (dupe on page 2)",
+                            "sequence_id": 48,
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    respx.get(list_url).mock(side_effect=_route)
+    with pytest.raises(DuplicateSubIssueError, match="2 sub-issues"):
+        await find_artifact_by_label(
+            role="spec",
+            root_uuid=ROOT_UUID,
+            workspace=ctx.config.workspace_slug,
+        )
+
+
 # ---------------------------------------------------------------------------
 # create_sub_issue — the central protected operation
 # ---------------------------------------------------------------------------
@@ -691,7 +744,82 @@ async def test_mark_spec_approved_refuses_when_changes_required(
             200,
             json={
                 "results": [
-                    {"id": "c1", "comment_html": "<p>ARCH_REVIEW (iter 2) — CHANGES_REQUIRED</p>"},
+                    {
+                        "id": "c1",
+                        "comment_html": "<p>ARCH_REVIEW (iter 2) — CHANGES_REQUIRED</p>",
+                        "created_at": "2026-05-09T10:00:00Z",
+                    },
+                ]
+            },
+        )
+    )
+    with pytest.raises(TowerError, match="not APPROVED"):
+        await mark_spec_approved(
+            spec_sub_uuid=SPEC_SUB_UUID,
+            summary_html="<p>scope</p>",
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+@respx.mock
+async def test_mark_spec_approved_happy_path(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Latest ARCH_REVIEW marker says APPROVED → SPEC_APPROVED comment posts."""
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "c-old",
+                        "comment_html": "<p>ARCH_REVIEW (iter 1) — CHANGES_REQUIRED</p>",
+                        "created_at": "2026-05-08T10:00:00Z",
+                    },
+                    {
+                        "id": "c-new",
+                        "comment_html": "<p>ARCH_REVIEW (iter 2) — APPROVED.</p>",
+                        "created_at": "2026-05-09T10:00:00Z",
+                    },
+                ]
+            },
+        )
+    )
+    respx.post(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(201, json={"id": "c-spec-approved"})
+    )
+    result = await mark_spec_approved(
+        spec_sub_uuid=SPEC_SUB_UUID,
+        summary_html="<p>scope: backend only</p>",
+        workspace=ctx.config.workspace_slug,
+    )
+    assert result == {"comment_id": "c-spec-approved"}
+
+
+@respx.mock
+async def test_mark_spec_approved_rejects_approved_substring_in_changes_body(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Regression: a CHANGES_REQUIRED comment whose BODY quotes the word
+    'APPROVED' (e.g. citing a previous review) must NOT be misread as a pass.
+    Locks the structured-marker detection that replaced the old substring scan.
+    """
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "c-trick",
+                        "comment_html": (
+                            "<p><strong>ARCH_REVIEW (iter 3) — CHANGES_REQUIRED.</strong></p>"
+                            "<p>Iter 2 was previously APPROVED, but new findings require "
+                            "another pass.</p>"
+                        ),
+                        "created_at": "2026-05-10T09:00:00Z",
+                    },
                 ]
             },
         )

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -29,6 +31,18 @@ from plane_conductor.conductor_config import (
 )
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.plane_client import PlaneClient
+
+logger = logging.getLogger(__name__)
+
+
+def _esc(value: Any) -> str:
+    """HTML-escape a fragment of caller-controlled text before interpolating
+    it into a Plane comment template. Use for paths, names, summaries, error
+    messages — anything that came from the agent and is not itself a
+    documented HTML field (body_html, description_html, comment_html,
+    summary_html stay verbatim)."""
+    return html.escape(str(value), quote=True)
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -178,17 +192,11 @@ async def _hydrate_workspace(config: WorkspaceConfig) -> WorkspaceContext:
         config.plane_api_key,
         config.workspace_slug,
     ) as plane:
-        # Fetch in parallel.
-        project_task = plane._request(
-            "GET",
-            f"/api/v1/workspaces/{config.workspace_slug}/projects/{config.project_id}/",
-        )
-        labels_task = plane.list_labels(config.project_id)
-        states_task = plane.list_states(config.project_id)
-        members_task = plane.list_project_members(config.project_id)
-
         project, labels, states, members = await asyncio.gather(
-            project_task, labels_task, states_task, members_task
+            plane.get_project(config.project_id),
+            plane.list_labels(config.project_id),
+            plane.list_states(config.project_id),
+            plane.list_project_members(config.project_id),
         )
 
     ctx = WorkspaceContext(
@@ -223,17 +231,46 @@ async def _hydrate_workspace(config: WorkspaceConfig) -> WorkspaceContext:
 
 
 async def build_registry(conductor_dir: Path | str) -> TowerRegistry:
-    """Load every conductor.d/*.yaml and snapshot all Plane constants."""
+    """Load every conductor.d/*.yaml and snapshot all Plane constants.
+
+    Hydration runs per-workspace in parallel with `return_exceptions=True`:
+    one bad workspace (unreachable Plane, revoked key, transient 5xx) is
+    logged and skipped, not allowed to take down the whole tower for every
+    other tenant. Raises only if EVERY workspace failed to hydrate.
+    """
     workspaces = load_workspaces(Path(conductor_dir))
     registry = TowerRegistry()
-    contexts = await asyncio.gather(
-        *(_hydrate_workspace(ws) for ws in workspaces.values())
+    ws_list = list(workspaces.values())
+    if not ws_list:
+        return registry
+    results = await asyncio.gather(
+        *(_hydrate_workspace(ws) for ws in ws_list),
+        return_exceptions=True,
     )
-    for ctx in contexts:
+    failures: list[tuple[str, BaseException]] = []
+    for ws, result in zip(ws_list, results, strict=True):
+        if isinstance(result, BaseException):
+            failures.append((ws.workspace_slug, result))
+            logger.error(
+                "plane-tower: failed to hydrate workspace %r: %s",
+                ws.workspace_slug,
+                result,
+            )
+            continue
+        ctx = result
         registry.by_slug[ctx.config.workspace_slug] = ctx
         registry.by_project_id[str(ctx.config.project_id)] = ctx
         if ctx.project_identifier:
             registry.by_project_identifier[ctx.project_identifier] = ctx
+    if not registry.by_slug and failures:
+        # Every workspace failed — propagate the first error so the operator
+        # sees a real traceback instead of an empty registry that 500s every
+        # subsequent tool call.
+        slug, exc = failures[0]
+        raise TowerError(
+            f"plane-tower: every workspace failed to hydrate "
+            f"({len(failures)} total); first failure was {slug!r}: {exc}"
+        ) from exc
     return registry
 
 
@@ -243,7 +280,14 @@ async def build_registry(conductor_dir: Path | str) -> TowerRegistry:
 
 
 _REVIEW_MARKER_RE = re.compile(
-    r"(?P<kind>REVIEW|ARCH_REVIEW)\s*\(iter\s+(?P<iter>\d+)\)",
+    # Matches the canonical post_review template:
+    #   `<strong>{marker} (iter {N}) — {VERDICT}.</strong>`
+    # Verdict group is optional so the regex still matches legacy comments
+    # without a verdict suffix; it captures from a controlled enum, so
+    # substring noise like "previously APPROVED" inside body_html cannot
+    # produce a false positive.
+    r"(?P<kind>REVIEW|ARCH_REVIEW)\s*\(iter\s+(?P<iter>\d+)\)"
+    r"(?:\s*[—-]\s*(?P<verdict>APPROVED|CHANGES_REQUIRED|BLOCKED))?",
     re.IGNORECASE,
 )
 _INITIATOR_MENTION_TEMPLATE = (
@@ -562,7 +606,7 @@ async def update_sub_issue_description(
         updated = await plane.update_issue(
             ctx.config.project_id,
             sub_uuid,
-            description_html=description_html,
+            {"description_html": description_html},
         )
     return _summarize_issue(updated)
 
@@ -679,17 +723,32 @@ async def mark_spec_approved(
     spec_sub_uuid = _ensure_uuid(spec_sub_uuid, "spec_sub_uuid")
     async with await _client_for(ctx) as plane:
         comments = await plane.list_issue_comments(ctx.config.project_id, spec_sub_uuid)
-        last_arch = None
+        # Find the most recent ARCH_REVIEW marker by created_at, then read its
+        # verdict from the canonical regex group. Substring scans of the whole
+        # comment_html are unsafe — a CHANGES_REQUIRED comment's body can
+        # legitimately quote the word "APPROVED" (e.g. "previously APPROVED,
+        # now needs changes") and pass a naive `"APPROVED" in html` check.
+        latest_match: re.Match[str] | None = None
+        latest_at: str = ""
         for c in comments:
-            html = c.get("comment_html") or ""
-            if "ARCH_REVIEW" in html:
-                last_arch = html
-        if not last_arch:
+            body = c.get("comment_html") or ""
+            m = _REVIEW_MARKER_RE.search(body)
+            if not m or m.group("kind").upper() != "ARCH_REVIEW":
+                continue
+            created_at = str(c.get("created_at") or "")
+            if created_at >= latest_at:  # ISO-8601 strings sort lexicographically
+                latest_at = created_at
+                latest_match = m
+        if latest_match is None:
             raise TowerError(
                 "no prior ARCH_REVIEW comment on this SPEC sub-issue; post APPROVED review first"
             )
-        if "APPROVED" not in last_arch or "CHANGES_REQUIRED" in last_arch:
-            raise TowerError("latest ARCH_REVIEW is not APPROVED; cannot mark SPEC_APPROVED")
+        verdict = (latest_match.group("verdict") or "").upper()
+        if verdict != "APPROVED":
+            raise TowerError(
+                f"latest ARCH_REVIEW is not APPROVED (got {verdict or 'no verdict'!r}); "
+                f"cannot mark SPEC_APPROVED"
+            )
         comment_html = (
             f"<p><strong>SPEC_APPROVED</strong></p>{summary_html}<p>{_initiator_mention(ctx)}</p>"
         )
@@ -776,35 +835,40 @@ async def post_changes(
                             "project's OpenAPI verifier before claiming ready_for_review."
                         )
 
-        # Render
+        # Render. All caller-controlled fragments are HTML-escaped (paths,
+        # summaries, command output, etc.). Plane's rich-text renderer trusts
+        # comment_html, so an unescaped angle-bracket in a path could break
+        # the comment shape or smuggle markup.
         files_html = "".join(
-            f"<li><code>{path}</code> — {summary_line}</li>" for path, summary_line in (files or [])
+            f"<li><code>{_esc(path)}</code> — {_esc(summary_line)}</li>"
+            for path, summary_line in (files or [])
         )
         verification_html = "".join(
-            f"<li><code>{cmd}</code> — {result}</li>" for cmd, result in (verification or [])
+            f"<li><code>{_esc(cmd)}</code> — {_esc(result)}</li>"
+            for cmd, result in (verification or [])
         )
         migrations_html = ""
         if migrations:
             migrations_rows = "".join(
-                f"<li><code>{name}</code> — {descr}</li>" for name, descr in migrations
+                f"<li><code>{_esc(name)}</code> — {_esc(descr)}</li>" for name, descr in migrations
             )
             migrations_html = f"<h2>Migrations</h2><ul>{migrations_rows}</ul>"
         perf_html = ""
         if perf:
-            perf_html = "<h2>Performance</h2><pre>" + str(perf) + "</pre>"
+            perf_html = "<h2>Performance</h2><pre>" + _esc(perf) + "</pre>"
         dev_html = ""
         if deviations_from_plan:
-            rows = "".join(f"<li>{d}</li>" for d in deviations_from_plan)
+            rows = "".join(f"<li>{_esc(d)}</li>" for d in deviations_from_plan)
             dev_html = f"<h2>Deviations from PLAN</h2><ul>{rows}</ul>"
         ni_html = ""
         if not_implemented:
-            rows = "".join(f"<li>{d}</li>" for d in not_implemented)
+            rows = "".join(f"<li>{_esc(d)}</li>" for d in not_implemented)
             ni_html = f"<h2>Not implemented (deferred)</h2><ul>{rows}</ul>"
         ready_html = "READY FOR REVIEW: yes" if ready_for_review else "READY FOR REVIEW: no"
 
         comment_html = (
-            f"<h1>{_role_display(target)} CHANGES</h1>"
-            f"<p>{summary}</p>"
+            f"<h1>{_esc(_role_display(target))} CHANGES</h1>"
+            f"<p>{_esc(summary)}</p>"
             f"<h2>Files modified</h2><ul>{files_html}</ul>"
             f"{migrations_html}"
             f"<h2>Verification</h2><ul>{verification_html}</ul>"
@@ -880,27 +944,30 @@ async def post_bug_report(
         )
         # affected_sub may be None — still post the bug, just no back-link.
 
-        steps_html = "".join(f"<li>{s}</li>" for s in repro_steps)
+        steps_html = "".join(f"<li>{_esc(s)}</li>" for s in repro_steps)
         env_html = ""
         if environment:
-            rows = "".join(f"<li><strong>{k}:</strong> {v}</li>" for k, v in environment.items())
+            rows = "".join(
+                f"<li><strong>{_esc(k)}:</strong> {_esc(v)}</li>" for k, v in environment.items()
+            )
             env_html = f"<h2>Environment</h2><ul>{rows}</ul>"
         screenshots_html = ""
         if screenshots:
-            shots = "".join(f'<li><a href="{u}">{u}</a></li>' for u in screenshots)
+            shots = "".join(f'<li><a href="{_esc(u)}">{_esc(u)}</a></li>' for u in screenshots)
             screenshots_html = f"<h2>Attachments</h2><ul>{shots}</ul>"
-        fix_html = f"<p><em>Fix hint:</em> {fix_hint}</p>" if fix_hint else ""
+        fix_html = f"<p><em>Fix hint:</em> {_esc(fix_hint)}</p>" if fix_hint else ""
 
+        affected_id_disp = str(affected_sub.get("id")) if affected_sub else "?"
         comment_html = (
-            f"<h1>Bug ({severity}): {title}</h1>"
-            f"<p><strong>Severity:</strong> {severity}<br>"
+            f"<h1>Bug ({_esc(severity)}): {_esc(title)}</h1>"
+            f"<p><strong>Severity:</strong> {_esc(severity)}<br>"
             f"<strong>Priority:</strong> TBD by initiator<br>"
-            f"<strong>Failing TC:</strong> {failing_tc or 'n/a'}</p>"
+            f"<strong>Failing TC:</strong> {_esc(failing_tc or 'n/a')}</p>"
             f"<h2>Steps to reproduce</h2><ol>{steps_html}</ol>"
-            f"<h2>Actual</h2><p>{actual}</p>"
-            f"<h2>Expected</h2><p>{expected}</p>"
+            f"<h2>Actual</h2><p>{_esc(actual)}</p>"
+            f"<h2>Expected</h2><p>{_esc(expected)}</p>"
             f"{env_html}{screenshots_html}{fix_html}"
-            f"<p>Affected sub-issue: <code>{affected_sub.get('id') if affected_sub else '?'}</code></p>"
+            f"<p>Affected sub-issue: <code>{_esc(affected_id_disp)}</code></p>"
             f"<p>{_initiator_mention(ctx)}</p>"
         )
         comment = await plane.create_issue_comment(
@@ -908,7 +975,6 @@ async def post_bug_report(
         )
 
         # Back-link: a work-item link from the affected sub to the bug comment.
-        # Plane MCP exposes link creation; via REST it's POST .../links/.
         if affected_sub:
             try:
                 link_url = (
@@ -916,11 +982,11 @@ async def post_bug_report(
                     f"projects/{ctx.config.project_id}/issues/"
                     f"{test_sub.get('id')}/#comment-{comment.get('id')}"
                 )
-                await plane._request(
-                    "POST",
-                    f"/api/v1/workspaces/{ctx.config.workspace_slug}/projects/"
-                    f"{ctx.config.project_id}/issues/{affected_sub.get('id')}/links/",
-                    json={"url": link_url, "title": f"[{severity}] {title}"},
+                await plane.create_issue_link(
+                    ctx.config.project_id,
+                    str(affected_sub.get("id")),
+                    url=link_url,
+                    title=f"[{severity}] {title}",
                 )
             except PlaneAPIError:
                 # Best-effort — the bug comment is the source of truth.
@@ -955,9 +1021,9 @@ async def escalate_upstream_gap(
     my_sub_uuid = _ensure_uuid(my_sub_uuid, "my_sub_uuid")
     comment_html = (
         "<p><strong>BLOCKED — upstream gap.</strong></p>"
-        f"<p>Affected: <code>{affected}</code></p>"
-        f"<p>Issue: {issue}</p>"
-        f"<p>Proposed resolution: {proposed_resolution}</p>"
+        f"<p>Affected: <code>{_esc(affected)}</code></p>"
+        f"<p>Issue: {_esc(issue)}</p>"
+        f"<p>Proposed resolution: {_esc(proposed_resolution)}</p>"
         f"<p>{_initiator_mention(ctx)}</p>"
     )
     async with await _client_for(ctx) as plane:
@@ -996,7 +1062,7 @@ async def mark_phase_complete(
             raise TowerError(f"no `[ ] Phase {phase}` checkbox found in description")
         new_desc = pattern.sub(r"[x]\1", desc, count=1)
         updated = await plane.update_issue(
-            ctx.config.project_id, my_sub_uuid, description_html=new_desc
+            ctx.config.project_id, my_sub_uuid, {"description_html": new_desc}
         )
     return {"id": updated.get("id"), "phase": phase, "status": "closed"}
 

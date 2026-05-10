@@ -49,8 +49,11 @@ dev = [
 mcp = [
     "mcp>=1.0",
 ]
+# `tower` is the public, intent-named extra; aliased to `mcp` so the two
+# can't drift on the next bump. `pip install plane-conductor[tower]` and
+# `[mcp]` resolve to the same set of deps.
 tower = [
-    "mcp>=1.0",
+    "plane-conductor[mcp]",
 ]
 
 [project.scripts]

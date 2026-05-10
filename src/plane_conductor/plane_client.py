@@ -265,15 +265,57 @@ class PlaneClient:
         *,
         per_page: int = 100,
     ) -> list[dict[str, Any]]:
-        """List all work items in a project. Plane MCP has no `parent` filter,
-        callers post-filter by `parent == <root_uuid>` themselves.
+        """List ALL work items in a project, following pagination cursors.
+
+        Plane MCP has no `parent` filter, callers post-filter by
+        `parent == <root_uuid>` themselves. The duplicate-detection invariants
+        in the tower depend on seeing the full set, so we walk every page.
         """
-        payload = await self._request(
-            "GET",
-            f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/",
-            params={"per_page": per_page},
+        path = f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/"
+        params: dict[str, Any] = {"per_page": per_page}
+        out: list[dict[str, Any]] = []
+        seen_cursors: set[str] = set()
+        while True:
+            payload = await self._request("GET", path, params=params)
+            out.extend(self._results(payload))
+            if not isinstance(payload, dict):
+                break
+            cursor = payload.get("next_cursor") or payload.get("next")
+            if not cursor or not isinstance(cursor, str) or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            params = {"per_page": per_page, "cursor": cursor}
+        return out
+
+    async def get_project(self, project_id: str | UUID) -> dict[str, Any]:
+        """Fetch a single project (identifier, name, ...). Wrap the GET so the
+        tower doesn't reach into `_request` directly."""
+        return cast(
+            "dict[str, Any]",
+            await self._request(
+                "GET",
+                f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/",
+            ),
         )
-        return self._results(payload)
+
+    async def create_issue_link(
+        self,
+        project_id: str | UUID,
+        issue_id: str | UUID,
+        *,
+        url: str,
+        title: str = "",
+    ) -> dict[str, Any] | None:
+        """Attach an external URL to an issue (POST .../issues/<id>/links/).
+        Used by the tower to back-link bug reports to coder sub-issues."""
+        return cast(
+            "dict[str, Any] | None",
+            await self._request(
+                "POST",
+                f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/{issue_id}/links/",
+                json={"url": url, "title": title},
+            ),
+        )
 
     async def create_issue(
         self,
@@ -307,9 +349,12 @@ class PlaneClient:
         self,
         project_id: str | UUID,
         issue_id: str | UUID,
-        **fields: Any,
+        fields: dict[str, Any],
     ) -> dict[str, Any]:
-        # Caller passes already-serialised fields (UUIDs as str, etc.).
+        """PATCH an issue. Pass an explicit `fields` dict (caller serialises
+        UUIDs to str). Explicit dict (not `**fields`) so caller-side typos like
+        `description_htm=` raise at the call site instead of silently no-op'ing.
+        """
         return cast(
             "dict[str, Any]",
             await self._request(
