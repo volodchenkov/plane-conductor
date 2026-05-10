@@ -448,6 +448,81 @@ def _summarize_issue(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ----- create_root_issue ---------------------------------------------------
+
+
+@mcp.tool()
+async def create_root_issue(
+    name: str,
+    *,
+    description_html: str = "",
+    labels: list[str] | None = None,
+    assignee_nicknames: list[str] | None = None,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Create a top-level (parent-less) issue in the workspace's project.
+
+    Counterpart to `create_sub_issue` — for filing brand-new work that the
+    SDLC pipeline will then sub-issue into. Used by the project-manager
+    (Tron) DELEGATE route to file new tasks without leaving the chat.
+
+    Args:
+      name: issue title.
+      description_html: optional initial description (HTML allowed).
+      labels: list of symbolic label names to apply (e.g.
+        `["pipeline:doc-only"]`). Resolved against the workspace label
+        cache; raises `LabelNotFoundError` if any name is unknown.
+      assignee_nicknames: list of member nicknames (or emails). Resolved
+        against the workspace member cache; raises `TowerError` if any is
+        unknown.
+      workspace: explicit workspace slug; otherwise resolved from the
+        usual signals (env / project_identifier).
+
+    Post-condition: re-reads the created issue and fails loudly if Plane
+    silently dropped the labels list (same defense as create_sub_issue).
+
+    Returns `{id, sequence_id, identifier, name, labels, ...}` where
+    `identifier` is the canonical `<PROJECT_IDENTIFIER>-<N>` form.
+    """
+    ctx = _registry().resolve(workspace=workspace)
+    label_uuids = [ctx.label_uuid(lbl) for lbl in (labels or [])]
+    assignee_uuids = [ctx.member_uuid(n) for n in (assignee_nicknames or [])]
+
+    async with await _client_for(ctx) as plane:
+        created = await plane.create_issue(
+            ctx.config.project_id,
+            name=name,
+            description_html=description_html or None,
+            labels=label_uuids or None,
+            assignees=assignee_uuids or None,
+        )
+        new_id = str(created.get("id") or "")
+        if not new_id:
+            raise TowerError("Plane returned no id for the created root issue")
+        # Post-condition: re-read and verify labels stuck (same defense
+        # as create_sub_issue — Plane has been observed silently dropping
+        # labels arrays on bad UUIDs).
+        verified = await plane.get_issue(ctx.config.project_id, new_id)
+        if label_uuids:
+            got = verified.get("labels") or []
+            missing = [u for u in label_uuids if u not in got]
+            if missing:
+                raise UnlabelledSubIssueError(
+                    f"created root issue {new_id} has labels={got} after "
+                    f"create — expected {label_uuids}. Plane silently "
+                    f"dropped one or more labels (likely a UUID typo). "
+                    f"Manual intervention required."
+                )
+
+    seq = verified.get("sequence_id")
+    identifier = f"{ctx.project_identifier}-{seq}" if ctx.project_identifier and seq else None
+    return {
+        **_summarize_issue(verified),
+        "identifier": identifier,
+        "workspace_slug": ctx.config.workspace_slug,
+    }
+
+
 # ----- create_sub_issue ----------------------------------------------------
 
 
