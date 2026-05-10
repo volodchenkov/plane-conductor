@@ -259,20 +259,40 @@ class PlaneClient:
             ),
         )
 
+    #: Default field whitelist for `list_issues`. Plane v1's project-issues
+    #: endpoint returns `description_html` on every record by default, which
+    #: turns a 51-issue project with one bloated SPEC into a ~700 KB JSON
+    #: response — well past Claude Code's MCP tool-result token cap, which
+    #: causes every agent that calls `find_artifact_by_label` (i.e. ALL of
+    #: them, on entry) to hang silently in `--print` mode. Tower callers
+    #: only ever filter by `parent`/`labels` and project these metadata
+    #: fields onward, so the listing payload can be trimmed at the API
+    #: boundary. `?fields=` is honoured by Plane; `?parent=` is silently
+    #: ignored (verified against plane.suze.io).
+    LIST_ISSUES_DEFAULT_FIELDS = "id,name,sequence_id,parent,labels,state,created_at,updated_at"
+
     async def list_issues(
         self,
         project_id: str | UUID,
         *,
         per_page: int = 100,
+        fields: str | None = LIST_ISSUES_DEFAULT_FIELDS,
     ) -> list[dict[str, Any]]:
         """List ALL work items in a project, following pagination cursors.
 
         Plane MCP has no `parent` filter, callers post-filter by
         `parent == <root_uuid>` themselves. The duplicate-detection invariants
         in the tower depend on seeing the full set, so we walk every page.
+
+        By default a thin field whitelist is sent so `description_html` is
+        not pulled per row (see `LIST_ISSUES_DEFAULT_FIELDS`). Pass
+        `fields=None` to request the full record — required only when a
+        caller genuinely needs the body, which tower paths don't.
         """
         path = f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/"
         params: dict[str, Any] = {"per_page": per_page}
+        if fields:
+            params["fields"] = fields
         out: list[dict[str, Any]] = []
         seen_cursors: set[str] = set()
         while True:
@@ -285,6 +305,8 @@ class PlaneClient:
                 break
             seen_cursors.add(cursor)
             params = {"per_page": per_page, "cursor": cursor}
+            if fields:
+                params["fields"] = fields
         return out
 
     async def get_project(self, project_id: str | UUID) -> dict[str, Any]:

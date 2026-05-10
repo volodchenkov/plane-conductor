@@ -164,6 +164,54 @@ async def test_request_returns_none_for_204(client: PlaneClient) -> None:
 
 
 @respx.mock
+async def test_list_issues_sends_thin_fields_by_default(client: PlaneClient) -> None:
+    """Default thin field whitelist must reach the wire — Plane returns
+    `description_html` per row otherwise, which blows the MCP tool-result
+    cap on projects with bloated SPECs (see PlaneClient.LIST_ISSUES_DEFAULT_FIELDS).
+    """
+    url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/"
+    route = respx.get(url).mock(return_value=httpx.Response(200, json={"results": []}))
+    await client.list_issues(PROJECT)
+    assert route.called
+    sent_fields = route.calls.last.request.url.params.get("fields")
+    assert sent_fields == PlaneClient.LIST_ISSUES_DEFAULT_FIELDS
+    assert "description_html" not in (sent_fields or "")
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_issues_fields_none_omits_param(client: PlaneClient) -> None:
+    """`fields=None` opts back into the full record — escape hatch for any
+    future caller that genuinely needs the body."""
+    url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/"
+    route = respx.get(url).mock(return_value=httpx.Response(200, json={"results": []}))
+    await client.list_issues(PROJECT, fields=None)
+    assert route.called
+    assert "fields" not in route.calls.last.request.url.params
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_issues_forwards_fields_on_pagination(client: PlaneClient) -> None:
+    """The `fields` whitelist must be re-sent on every cursor page, otherwise
+    page 2+ silently regress to fat responses."""
+    url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/"
+    responses = iter(
+        [
+            httpx.Response(200, json={"results": [{"id": "a"}], "next_cursor": "tok"}),
+            httpx.Response(200, json={"results": [{"id": "b"}], "next_cursor": None}),
+        ]
+    )
+    route = respx.get(url).mock(side_effect=lambda req: next(responses))
+    items = await client.list_issues(PROJECT, fields="id,name")
+    assert [i["id"] for i in items] == ["a", "b"]
+    assert route.call_count == 2
+    for call in route.calls:
+        assert call.request.url.params.get("fields") == "id,name"
+    await client.aclose()
+
+
+@respx.mock
 async def test_create_state_and_get_issue(client: PlaneClient) -> None:
     state_url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/states/"
     respx.post(state_url).mock(
