@@ -259,6 +259,94 @@ class PlaneClient:
             ),
         )
 
+    async def list_issues(
+        self,
+        project_id: str | UUID,
+        *,
+        per_page: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List all work items in a project. Plane MCP has no `parent` filter,
+        callers post-filter by `parent == <root_uuid>` themselves.
+        """
+        payload = await self._request(
+            "GET",
+            f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/",
+            params={"per_page": per_page},
+        )
+        return self._results(payload)
+
+    async def create_issue(
+        self,
+        project_id: str | UUID,
+        *,
+        name: str,
+        parent: str | UUID | None = None,
+        description_html: str | None = None,
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"name": name}
+        if parent is not None:
+            body["parent"] = str(parent)
+        if description_html is not None:
+            body["description_html"] = description_html
+        if labels:
+            body["labels"] = [str(lbl) for lbl in labels]
+        if assignees:
+            body["assignees"] = [str(a) for a in assignees]
+        return cast(
+            "dict[str, Any]",
+            await self._request(
+                "POST",
+                f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/",
+                json=body,
+            ),
+        )
+
+    async def update_issue(
+        self,
+        project_id: str | UUID,
+        issue_id: str | UUID,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        # Caller passes already-serialised fields (UUIDs as str, etc.).
+        return cast(
+            "dict[str, Any]",
+            await self._request(
+                "PATCH",
+                f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/{issue_id}/",
+                json=fields,
+            ),
+        )
+
+    async def get_issue_by_sequence_id(
+        self,
+        project_id: str | UUID,
+        sequence_id: int,
+    ) -> dict[str, Any] | None:
+        """Resolve `<PROJECT_IDENTIFIER>-<N>` (e.g. COIN-37) by N. Plane's REST
+        API does not expose a by-identifier endpoint to API keys, so we list
+        the project's issues and filter by `sequence_id`. Returns None if no
+        match. Used by `pickup_issue` as the fallback path when the agent has
+        only the human identifier and not the UUID.
+        """
+        items = await self.list_issues(project_id)
+        for item in items:
+            if item.get("sequence_id") == sequence_id:
+                return item
+        return None
+
+    async def list_issue_comments(
+        self,
+        project_id: str | UUID,
+        issue_id: str | UUID,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request(
+            "GET",
+            f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/{issue_id}/comments/",
+        )
+        return self._results(payload)
+
     async def create_issue_comment(
         self,
         project_id: str | UUID,

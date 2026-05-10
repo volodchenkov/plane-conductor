@@ -48,10 +48,14 @@ dev = [
 mcp = [
     "mcp>=1.0",
 ]
+tower = [
+    "mcp>=1.0",
+]
 
 [project.scripts]
 plane-conductor = "plane_conductor.cli:app"
 plane-conductor-mcp = "plane_conductor.mcp_server:main"
+plane-conductor-tower = "plane_conductor.mcp_tower:main"
 
 [project.urls]
 Homepage = "https://github.com/volodchenkov/plane-conductor"
@@ -100,7 +104,7 @@ strict = true
 warn_unused_ignores = true
 disallow_any_generics = true
 files = ["src/plane_conductor"]
-exclude = ["src/plane_conductor/mcp_server\\.py$"]
+exclude = ["src/plane_conductor/mcp_server\\.py$", "src/plane_conductor/mcp_tower\\.py$"]
 
 [[tool.mypy.overrides]]
 module = ["structlog.*", "mcp.*"]
@@ -119,6 +123,7 @@ omit = [
     "src/plane_conductor/__main__.py",
     "src/plane_conductor/cli.py",
     "src/plane_conductor/mcp_server.py",
+    "src/plane_conductor/mcp_tower.py",
 ]
 
 [tool.coverage.report]
