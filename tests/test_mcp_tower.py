@@ -27,6 +27,7 @@ from plane_conductor.mcp_tower import (
     UnlabelledSubIssueError,
     WorkspaceContext,
     WorkspaceNotResolvedError,
+    create_root_issue,
     create_sub_issue,
     escalate_upstream_gap,
     find_artifact_by_label,
@@ -341,6 +342,113 @@ async def test_find_artifact_handles_pagination_duplicates(
         await find_artifact_by_label(
             role="spec",
             root_uuid=ROOT_UUID,
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+# ---------------------------------------------------------------------------
+# create_root_issue — file a new top-level task (Tron's DELEGATE route)
+# ---------------------------------------------------------------------------
+
+
+PIPELINE_DOC_ONLY_LABEL = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+
+@respx.mock
+async def test_create_root_issue_happy_path(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    ctx.label_by_name["pipeline:doc-only"] = PIPELINE_DOC_ONLY_LABEL
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    new_uuid = "99999999-9999-9999-9999-999999999999"
+
+    captured: dict[str, Any] = {}
+
+    def _on_create(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        captured["body"] = _json.loads(request.content.decode())
+        return httpx.Response(
+            201,
+            json={
+                "id": new_uuid,
+                "name": "Backend docs coverage ratchet",
+                "sequence_id": 99,
+                "labels": [PIPELINE_DOC_ONLY_LABEL],
+                "parent": None,
+            },
+        )
+
+    respx.post(f"{base}/issues/").mock(side_effect=_on_create)
+    respx.get(f"{base}/issues/{new_uuid}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": new_uuid,
+                "name": "Backend docs coverage ratchet",
+                "sequence_id": 99,
+                "labels": [PIPELINE_DOC_ONLY_LABEL],
+                "parent": None,
+            },
+        )
+    )
+
+    result = await create_root_issue(
+        name="Backend docs coverage ratchet",
+        description_html="<p>baseline 28.1% → 100% in 5%-per-iteration steps</p>",
+        labels=["pipeline:doc-only"],
+        workspace=ctx.config.workspace_slug,
+    )
+
+    assert result["id"] == new_uuid
+    assert result["sequence_id"] == 99
+    assert result["identifier"] == "TEST-99"
+    assert result["workspace_slug"] == ctx.config.workspace_slug
+    assert PIPELINE_DOC_ONLY_LABEL in result["labels"]
+
+    # Body sent to Plane: parent absent (root), labels resolved to UUID,
+    # description_html present.
+    assert "parent" not in captured["body"]
+    assert captured["body"]["labels"] == [PIPELINE_DOC_ONLY_LABEL]
+    assert "baseline 28.1%" in captured["body"]["description_html"]
+
+
+@respx.mock
+async def test_create_root_issue_unknown_label_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Symbolic label that the workspace doesn't have → fail before any POST."""
+    with pytest.raises(LabelNotFoundError, match="not in cache"):
+        await create_root_issue(
+            name="Backend docs coverage ratchet",
+            labels=["pipeline:nonexistent"],
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+@respx.mock
+async def test_create_root_issue_unlabelled_post_condition_fails(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Same defense as create_sub_issue: if Plane silently drops labels,
+    fail loudly so the issue isn't silently filed without its routing label."""
+    ctx.label_by_name["pipeline:doc-only"] = PIPELINE_DOC_ONLY_LABEL
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    new_uuid = "88888888-8888-8888-8888-888888888888"
+
+    respx.post(f"{base}/issues/").mock(
+        return_value=httpx.Response(201, json={"id": new_uuid, "labels": []})
+    )
+    respx.get(f"{base}/issues/{new_uuid}/").mock(
+        return_value=httpx.Response(
+            200, json={"id": new_uuid, "labels": [], "parent": None, "sequence_id": 100}
+        )
+    )
+
+    with pytest.raises(UnlabelledSubIssueError, match="silently dropped"):
+        await create_root_issue(
+            name="X",
+            labels=["pipeline:doc-only"],
             workspace=ctx.config.workspace_slug,
         )
 
