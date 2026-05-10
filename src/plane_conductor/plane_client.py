@@ -11,6 +11,8 @@ in `_BASE_PATH` style helpers below.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from types import TracebackType
 from typing import Any, cast
 from uuid import UUID
@@ -31,9 +33,15 @@ class PlaneClient:
         *,
         timeout: float = 30.0,
         client: httpx.AsyncClient | None = None,
+        max_retries: int = 3,
+        backoff_base: float = 1.0,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.workspace_slug = workspace_slug
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self._sleep: Callable[[float], Awaitable[None]] = sleep or asyncio.sleep
         self._owned_client = client is None
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,
@@ -72,10 +80,28 @@ class PlaneClient:
         json: Any | None = None,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        try:
-            resp = await self._client.request(method, path, json=json, params=params)
-        except httpx.HTTPError as exc:
-            raise PlaneAPIError(0, f"transport error: {exc}", url=path) from exc
+        """Issue one request, retrying on HTTP 429 up to `max_retries` times.
+
+        Retry-After is honoured when the server provides it (Plane sends a
+        whole number of seconds via DRF's `ApiKeyRateThrottle`). Without
+        Retry-After, falls back to exponential backoff `backoff_base * 2**attempt`.
+        Other 4xx/5xx pass through to the existing PlaneAPIError path.
+
+        Retries are safe because 429 is raised by the throttle layer **before**
+        the request handler runs — the side-effecting handler is never entered
+        on a throttled call, so retrying a POST does not duplicate work.
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = await self._client.request(method, path, json=json, params=params)
+            except httpx.HTTPError as exc:
+                raise PlaneAPIError(0, f"transport error: {exc}", url=path) from exc
+
+            if resp.status_code == 429 and attempt < self.max_retries:
+                delay = self._parse_retry_after(resp.headers.get("Retry-After"), attempt)
+                await self._sleep(delay)
+                continue
+            break
 
         if resp.status_code >= 400:
             text = resp.text
@@ -83,6 +109,19 @@ class PlaneClient:
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()
+
+    def _parse_retry_after(self, header: str | None, attempt: int) -> float:
+        """Parse a Retry-After response header. Returns seconds to sleep.
+
+        Spec (RFC 7231 §7.1.3) allows either an integer (delta-seconds) or
+        an HTTP-date. Plane sends integers, so we only handle that form
+        plus an exponential-backoff fallback for missing/malformed values.
+        """
+        if header is not None:
+            stripped = header.strip()
+            if stripped.isdigit():
+                return float(stripped)
+        return float(self.backoff_base * (2**attempt))
 
     @staticmethod
     def _results(payload: Any) -> list[dict[str, Any]]:
