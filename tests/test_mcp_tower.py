@@ -22,11 +22,15 @@ from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.mcp_tower import (
     DuplicateSubIssueError,
     LabelNotFoundError,
+    MentionInBodyError,
+    RoleNotFoundError,
     TowerError,
     TowerRegistry,
     UnlabelledSubIssueError,
     WorkspaceContext,
     WorkspaceNotResolvedError,
+    _assert_no_mentions,
+    _role_mention,
     create_root_issue,
     create_sub_issue,
     escalate_upstream_gap,
@@ -35,7 +39,9 @@ from plane_conductor.mcp_tower import (
     mark_spec_approved,
     pickup_issue,
     post_changes,
+    post_comment,
     post_review,
+    request_handoff,
 )
 
 # ---------------------------------------------------------------------------
@@ -1036,3 +1042,173 @@ async def test_escalate_upstream_gap_posts_comment(
     assert "BLOCKED — upstream gap" in captured["body"]
     assert "missing pagination" in captured["body"]
     assert str(ctx.config.initiator_uuid) in captured["body"]
+
+
+# ---------------------------------------------------------------------------
+# Mention routing — role resolver, body-scan defense, request_handoff
+# ---------------------------------------------------------------------------
+
+
+RINZLER_MEMBER = "55555555-5555-5555-5555-555555555555"
+GEM_MEMBER = "66666666-6666-6666-6666-666666666666"
+
+
+@pytest.fixture
+def ctx_with_all_members(ctx: WorkspaceContext) -> WorkspaceContext:
+    """Extend the default ctx with rinzler+gem so role resolution tests
+    cover all three agents in the workspace_config fixture roster."""
+    ctx.member_by_nickname["rinzler"] = RINZLER_MEMBER
+    ctx.member_by_nickname["gem"] = GEM_MEMBER
+    ctx.member_by_email["rinzler@example.io"] = RINZLER_MEMBER
+    ctx.member_by_email["gem@example.io"] = GEM_MEMBER
+    return ctx
+
+
+def test_role_mention_resolves_by_prompt_role(ctx_with_all_members: WorkspaceContext) -> None:
+    """system-analyst → sark in the test fixture roster → SARK_MEMBER UUID."""
+    html = _role_mention(ctx_with_all_members, "system-analyst")
+    assert SARK_MEMBER in html
+    assert "<mention-component" in html
+
+
+def test_role_mention_strips_namespace_prefix(ctx_with_all_members: WorkspaceContext) -> None:
+    """`sdlc-agents:python-developer` and `python-developer` should both resolve."""
+    bare = _role_mention(ctx_with_all_members, "python-developer")
+    namespaced = _role_mention(ctx_with_all_members, "sdlc-agents:python-developer")
+    assert RINZLER_MEMBER in bare
+    assert RINZLER_MEMBER in namespaced
+
+
+def test_role_mention_unknown_role_raises(ctx_with_all_members: WorkspaceContext) -> None:
+    """Role with no agent in the workspace roster fails fast."""
+    with pytest.raises(RoleNotFoundError, match="no agent registered"):
+        _role_mention(ctx_with_all_members, "architect")
+
+
+def test_role_mention_role_with_uncached_member_raises(ctx: WorkspaceContext) -> None:
+    """Role exists in roster but its nickname is not in the member cache."""
+    # ctx (without ctx_with_all_members extension) has no rinzler in member_by_nickname.
+    with pytest.raises(RoleNotFoundError, match="not in the project member cache"):
+        _role_mention(ctx, "python-developer")
+
+
+def test_assert_no_mentions_blocks_html() -> None:
+    with pytest.raises(MentionInBodyError, match="tower-managed"):
+        _assert_no_mentions(
+            '<p>I am done. <mention-component entity_identifier="abc" '
+            'entity_name="user_mention"/></p>'
+        )
+
+
+def test_assert_no_mentions_passes_clean_html() -> None:
+    _assert_no_mentions("<p>nothing to see here</p>")
+    _assert_no_mentions("")
+    _assert_no_mentions(None)
+
+
+@respx.mock
+async def test_post_comment_refuses_embedded_mention(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Defense-in-depth: free-form post_comment cannot smuggle a mention."""
+    with pytest.raises(MentionInBodyError):
+        await post_comment(
+            work_item_uuid=ROOT_UUID,
+            comment_html=(
+                '<p>review please <mention-component entity_identifier="x" '
+                'entity_name="user_mention"/></p>'
+            ),
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+@respx.mock
+async def test_request_handoff_happy_path(
+    registry: TowerRegistry, ctx_with_all_members: WorkspaceContext, project_id: str
+) -> None:
+    base = f"https://plane.test/api/v1/workspaces/{ctx_with_all_members.config.workspace_slug}/projects/{project_id}"
+    captured: dict[str, Any] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode()
+        return httpx.Response(201, json={"id": "c-handoff"})
+
+    respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/comments/").mock(side_effect=_capture)
+
+    result = await request_handoff(
+        sub_uuid=BACKEND_SUB_UUID,
+        target_role="system-analyst",
+        message_html="ready for SPEC review",
+        workspace=ctx_with_all_members.config.workspace_slug,
+    )
+    assert result["comment_id"] == "c-handoff"
+    assert result["target_role"] == "system-analyst"
+    assert result["target_uuid"] == SARK_MEMBER
+    assert SARK_MEMBER in captured["body"]
+    assert "ready for SPEC review" in captured["body"]
+
+
+@respx.mock
+async def test_request_handoff_unknown_role_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    """Unknown target_role refuses BEFORE any POST."""
+    with pytest.raises(RoleNotFoundError, match="no agent registered"):
+        await request_handoff(
+            sub_uuid=BACKEND_SUB_UUID,
+            target_role="reviewer",  # not in the test workspace roster
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+async def test_request_handoff_refuses_mention_in_message(
+    registry: TowerRegistry, ctx_with_all_members: WorkspaceContext
+) -> None:
+    """Even the structured tool refuses a hand-typed mention in message_html."""
+    with pytest.raises(MentionInBodyError):
+        await request_handoff(
+            sub_uuid=BACKEND_SUB_UUID,
+            target_role="system-analyst",
+            message_html=(
+                'thanks <mention-component entity_identifier="x" entity_name="user_mention"/>'
+            ),
+            workspace=ctx_with_all_members.config.workspace_slug,
+        )
+
+
+@respx.mock
+async def test_post_changes_with_next_role_stamps_mention(
+    registry: TowerRegistry, ctx_with_all_members: WorkspaceContext, project_id: str
+) -> None:
+    """post_changes(next_role=...) injects the next-role mention alongside initiator."""
+    base = f"https://plane.test/api/v1/workspaces/{ctx_with_all_members.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_BACKEND]},
+                ]
+            },
+        )
+    )
+    captured: dict[str, Any] = {}
+
+    def _on_post(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode()
+        return httpx.Response(201, json={"id": "c-changes"})
+
+    respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/comments/").mock(side_effect=_on_post)
+
+    await post_changes(
+        target="backend",
+        root_uuid=ROOT_UUID,
+        summary="all done",
+        files=[["src/foo.py", "added bar"]],
+        verification=[["pytest", "passed"]],
+        ready_for_review=True,
+        next_role="ui-tester",
+        workspace=ctx_with_all_members.config.workspace_slug,
+    )
+    assert GEM_MEMBER in captured["body"]
+    assert str(ctx_with_all_members.config.initiator_uuid) in captured["body"]

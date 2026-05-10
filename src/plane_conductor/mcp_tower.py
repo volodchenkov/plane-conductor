@@ -69,6 +69,20 @@ class UnlabelledSubIssueError(TowerError):
     """Plane silently dropped the labels list during create — fail loudly."""
 
 
+class RoleNotFoundError(TowerError):
+    """A symbolic role (e.g. 'reviewer') has no member registered in this workspace."""
+
+
+class MentionInBodyError(TowerError):
+    """Free-form HTML contained a <mention-component> tag.
+
+    Mentions are tower-managed to prevent self-mention bugs (the Beck/Sark
+    incident class). Use `request_handoff(target_role=...)` for explicit
+    handoffs, or pass `next_role=…` to post_changes / post_review /
+    mark_phase_complete / mark_spec_approved.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Workspace registry — load conductor.d/*.yaml + Plane constants at boot
 # ---------------------------------------------------------------------------
@@ -290,13 +304,63 @@ _REVIEW_MARKER_RE = re.compile(
     r"(?:\s*[—-]\s*(?P<verdict>APPROVED|CHANGES_REQUIRED|BLOCKED))?",
     re.IGNORECASE,
 )
-_INITIATOR_MENTION_TEMPLATE = (
+_MENTION_TEMPLATE = (
     '<mention-component entity_identifier="{uuid}" entity_name="user_mention"></mention-component>'
 )
+_MENTION_RE = re.compile(r"<mention-component\b[^>]*>", re.IGNORECASE)
 
 
 def _initiator_mention(ctx: WorkspaceContext) -> str:
-    return _INITIATOR_MENTION_TEMPLATE.format(uuid=str(ctx.config.initiator_uuid))
+    return _MENTION_TEMPLATE.format(uuid=str(ctx.config.initiator_uuid))
+
+
+def _role_mention(ctx: WorkspaceContext, role: str) -> str:
+    """Resolve a pipeline role (e.g. 'reviewer', 'architect') to its member
+    mention component for this workspace. Match is against `prompt_role` of
+    the workspace's `agents` list, with any optional `<namespace>:` prefix
+    stripped (so `sdlc-agents:reviewer` and `reviewer` both work).
+
+    Raises RoleNotFoundError if no agent in this workspace has that role,
+    or if the resolved nickname has no member UUID in the cache.
+    """
+    target = role.strip().rsplit(":", 1)[-1].lower()
+    if not target:
+        raise RoleNotFoundError("target_role is empty")
+    for agent in ctx.config.agents:
+        bare = agent.prompt_role.rsplit(":", 1)[-1].lower()
+        if bare == target:
+            try:
+                uuid = ctx.member_uuid(agent.nickname)
+            except TowerError as exc:
+                raise RoleNotFoundError(
+                    f"workspace {ctx.config.workspace_slug!r}: role {role!r} maps "
+                    f"to nickname {agent.nickname!r}, but that member is not in "
+                    f"the project member cache. Re-run hydration or add the bot "
+                    f"to the project."
+                ) from exc
+            return _MENTION_TEMPLATE.format(uuid=uuid)
+    known = sorted({a.prompt_role.rsplit(":", 1)[-1] for a in ctx.config.agents})
+    raise RoleNotFoundError(
+        f"workspace {ctx.config.workspace_slug!r}: no agent registered for "
+        f"role {role!r}. Known roles: {known}"
+    )
+
+
+def _assert_no_mentions(comment_html: str | None) -> None:
+    """Refuse if caller-supplied HTML contains any <mention-component> tag.
+
+    All mentions in tower-posted comments are constructed by the tower from
+    structured params (`next_role`, `target_role`) — agents must not embed
+    `<mention-component>` themselves, otherwise we lose the self-mention
+    defense.
+    """
+    if comment_html and _MENTION_RE.search(comment_html):
+        raise MentionInBodyError(
+            "comment_html contains <mention-component>. Mentions are "
+            "tower-managed: use `request_handoff(target_role=...)` for "
+            "explicit handoffs, or pass `next_role=...` to post_changes / "
+            "post_review / mark_phase_complete / mark_spec_approved."
+        )
 
 
 def _ensure_uuid(value: str | UUID, name: str) -> str:
@@ -720,6 +784,7 @@ async def post_review(
     body_html: str,
     *,
     root_uuid: str | None = None,
+    next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
     """Post a REVIEW comment on the artifact under review.
@@ -740,11 +805,19 @@ async def post_review(
     Pass `root_uuid` when target is a sub-issue role; the tower resolves the
     sub via find_artifact_by_label. For target='root', `root_uuid` is the
     target itself.
+
+    `next_role` (optional) — pipeline role to mention in addition to the
+    initiator (e.g. `business-analyst` after a CHANGES_REQUIRED on root).
+    Tower resolves the role to its member UUID and stamps the mention; the
+    agent never types a UUID. `body_html` must NOT contain
+    `<mention-component>` — those are tower-managed.
     """
+    _assert_no_mentions(body_html)
     verdict_clean = verdict.strip().upper()
     if verdict_clean not in {"APPROVED", "CHANGES_REQUIRED", "BLOCKED"}:
         raise TowerError(f"verdict must be APPROVED|CHANGES_REQUIRED|BLOCKED, got {verdict!r}")
     ctx = _registry().resolve(workspace=workspace)
+    next_mention = _role_mention(ctx, next_role) if next_role else ""
     if target == "root":
         if not root_uuid:
             raise TowerError("target='root' requires root_uuid")
@@ -793,7 +866,7 @@ async def post_review(
         comment_html = (
             f"<p><strong>{marker} (iter {iter_n}) — {verdict_clean}.</strong></p>"
             f"{body_html}"
-            f"<p>{_initiator_mention(ctx)}</p>"
+            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
         )
         comment = await plane.create_issue_comment(ctx.config.project_id, target_uuid, comment_html)
     return {
@@ -813,12 +886,19 @@ async def mark_spec_approved(
     spec_sub_uuid: str,
     summary_html: str,
     *,
+    next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
     """Post the SPEC_APPROVED marker comment after the architect's APPROVED
     review. Refuses if the most recent ARCH_REVIEW on this sub is not APPROVED.
+
+    `next_role` (optional) — pipeline role to mention alongside the
+    initiator (typically the next coder, e.g. `django-developer`).
+    `summary_html` must NOT contain `<mention-component>` — tower-managed.
     """
+    _assert_no_mentions(summary_html)
     ctx = _registry().resolve(workspace=workspace)
+    next_mention = _role_mention(ctx, next_role) if next_role else ""
     spec_sub_uuid = _ensure_uuid(spec_sub_uuid, "spec_sub_uuid")
     async with await _client_for(ctx) as plane:
         comments = await plane.list_issue_comments(ctx.config.project_id, spec_sub_uuid)
@@ -849,7 +929,8 @@ async def mark_spec_approved(
                 f"cannot mark SPEC_APPROVED"
             )
         comment_html = (
-            f"<p><strong>SPEC_APPROVED</strong></p>{summary_html}<p>{_initiator_mention(ctx)}</p>"
+            f"<p><strong>SPEC_APPROVED</strong></p>{summary_html}"
+            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
         )
         comment = await plane.create_issue_comment(
             ctx.config.project_id, spec_sub_uuid, comment_html
@@ -873,6 +954,7 @@ async def post_changes(
     deviations_from_plan: list[str] | None = None,
     not_implemented: list[str] | None = None,
     ready_for_review: bool = False,
+    next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
     """Post the canonical CHANGES comment on the role's sub-issue.
@@ -886,10 +968,17 @@ async def post_changes(
       `serializers.py` / `schemas.py` AND `verification` does not contain a
       passing line for `/verify-openapi` (i.e. a string mentioning
       `verify-openapi` or `spectacular`).
+
+    `next_role` (optional) — pipeline role to mention after the initiator
+    (typically `reviewer` once `ready_for_review=True`). Tower resolves the
+    role to its member UUID and stamps the mention; agent never types a
+    UUID. All scalar fields are HTML-escaped — agents cannot embed
+    `<mention-component>` themselves.
     """
     if target not in {"backend", "frontend"}:
         raise TowerError(f"post_changes target must be backend|frontend, got {target!r}")
     ctx = _registry().resolve(workspace=workspace)
+    next_mention = _role_mention(ctx, next_role) if next_role else ""
     label_uuid = ctx.artifact_label_uuid(target)
     root_uuid = _ensure_uuid(root_uuid, "root_uuid")
 
@@ -973,7 +1062,7 @@ async def post_changes(
             f"<h2>Verification</h2><ul>{verification_html}</ul>"
             f"{perf_html}{dev_html}{ni_html}"
             f"<p><strong>{ready_html}</strong></p>"
-            f"<p>{_initiator_mention(ctx)}</p>"
+            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
         )
         comment = await plane.create_issue_comment(ctx.config.project_id, sub_uuid, comment_html)
     return {
@@ -1001,11 +1090,16 @@ async def post_bug_report(
     environment: dict[str, Any] | None = None,
     fix_hint: str = "",
     screenshots: list[str] | None = None,
+    next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
     """Post an ISTQB bug report on the test sub-issue + back-link the
     affected coder's sub-issue. `target` ∈ {api-tests, ux-tests};
     `affected_role` ∈ {backend, frontend}.
+
+    `next_role` (optional) — pipeline role to mention alongside the
+    initiator (typically the coder responsible for `affected_role`, so
+    they re-enter and fix). Tower resolves the role to its member UUID.
     """
     if target not in {"api-tests", "ux-tests"}:
         raise TowerError("post_bug_report target must be api-tests|ux-tests")
@@ -1016,6 +1110,7 @@ async def post_bug_report(
         raise TowerError("severity must be blocker|major|minor|cosmetic")
 
     ctx = _registry().resolve(workspace=workspace)
+    next_mention = _role_mention(ctx, next_role) if next_role else ""
     test_label = ctx.artifact_label_uuid(target)
     affected_label = ctx.artifact_label_uuid(affected_role)
     root_uuid = _ensure_uuid(root_uuid, "root_uuid")
@@ -1067,7 +1162,7 @@ async def post_bug_report(
             f"<h2>Expected</h2><p>{_esc(expected)}</p>"
             f"{env_html}{screenshots_html}{fix_html}"
             f"<p>Affected sub-issue: <code>{_esc(affected_id_disp)}</code></p>"
-            f"<p>{_initiator_mention(ctx)}</p>"
+            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
         )
         comment = await plane.create_issue_comment(
             ctx.config.project_id, str(test_sub.get("id")), comment_html
@@ -1109,21 +1204,28 @@ async def escalate_upstream_gap(
     issue: str,
     proposed_resolution: str,
     *,
+    upstream_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
     """Post a `BLOCKED — upstream gap` comment in your own sub-issue. Used
     when a downstream agent (coder/tester/designer/reviewer) finds a defect
     that belongs upstream — missing FR, ambiguous AC, broken design contract.
     Do not patch locally; the upstream role updates its existing artifact.
+
+    `upstream_role` (optional) — the role that owns the gap (e.g.
+    `system-analyst` for a SPEC defect, `business-analyst` for a missing
+    FR). Tower mentions both initiator and upstream; agent never types a
+    UUID.
     """
     ctx = _registry().resolve(workspace=workspace)
+    upstream_mention = _role_mention(ctx, upstream_role) if upstream_role else ""
     my_sub_uuid = _ensure_uuid(my_sub_uuid, "my_sub_uuid")
     comment_html = (
         "<p><strong>BLOCKED — upstream gap.</strong></p>"
         f"<p>Affected: <code>{_esc(affected)}</code></p>"
         f"<p>Issue: {_esc(issue)}</p>"
         f"<p>Proposed resolution: {_esc(proposed_resolution)}</p>"
-        f"<p>{_initiator_mention(ctx)}</p>"
+        f"<p>{_initiator_mention(ctx)}{upstream_mention}</p>"
     )
     async with await _client_for(ctx) as plane:
         comment = await plane.create_issue_comment(ctx.config.project_id, my_sub_uuid, comment_html)
@@ -1166,7 +1268,55 @@ async def mark_phase_complete(
     return {"id": updated.get("id"), "phase": phase, "status": "closed"}
 
 
-# ----- post_artifact_comment / post_startup_comment / update_startup --------
+# ----- request_handoff (replaces hand-rolled mention HTML) -----------------
+
+
+@mcp.tool()
+async def request_handoff(
+    sub_uuid: str,
+    target_role: str,
+    *,
+    message_html: str = "",
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Post a handoff comment on `sub_uuid` mentioning the next pipeline role.
+
+    Use this when an agent has finished its artifact and wants the next role
+    to pick up — instead of constructing a free-form comment with a hand-typed
+    `<mention-component>` (the Beck/Sark self-mention failure mode).
+
+    `target_role` is matched against the workspace's `agents` roster by
+    `prompt_role` bare name (so `architect`, `business-analyst`, `reviewer`,
+    `django-developer`, `react-developer`, `system-analyst`, `designer`,
+    `api-tester`, `ui-tester`, etc. — whatever your conductor.d/*.yaml
+    declares). Tower resolves the nickname → member UUID and stamps the
+    mention itself. The agent never types a UUID.
+
+    `message_html` is optional context (e.g. one-line gist). It must NOT
+    contain `<mention-component>` tags — those are tower-managed.
+
+    Returns `{comment_id, target_role, target_uuid, sub_uuid}`.
+    """
+    _assert_no_mentions(message_html)
+    ctx = _registry().resolve(workspace=workspace)
+    sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
+    target_mention = _role_mention(ctx, target_role)
+    # _role_mention returns the full HTML; extract the UUID for the response.
+    m = re.search(r'entity_identifier="([^"]+)"', target_mention)
+    target_uuid = m.group(1) if m else ""
+    body = f"<p>{message_html}</p>" if message_html else ""
+    comment_html = f"{body}<p>{target_mention}</p>"
+    async with await _client_for(ctx) as plane:
+        comment = await plane.create_issue_comment(ctx.config.project_id, sub_uuid, comment_html)
+    return {
+        "comment_id": comment.get("id"),
+        "target_role": target_role,
+        "target_uuid": target_uuid,
+        "sub_uuid": sub_uuid,
+    }
+
+
+# ----- post_comment / update_comment (free-form, mention-blocked) ----------
 
 
 @mcp.tool()
@@ -1178,7 +1328,13 @@ async def post_comment(
 ) -> dict[str, Any]:
     """Generic comment on any work item (sub-issue or root). Lower-level than
     post_review / post_changes / post_bug_report — use those when they fit.
+
+    Refuses any `<mention-component>` in `comment_html`: mentions are
+    tower-managed (use `request_handoff` for handoffs, or `next_role=…` on
+    a structured tool). This blocks the self-mention failure mode at the
+    tool boundary.
     """
+    _assert_no_mentions(comment_html)
     ctx = _registry().resolve(workspace=workspace)
     work_item_uuid = _ensure_uuid(work_item_uuid, "work_item_uuid")
     async with await _client_for(ctx) as plane:
@@ -1198,7 +1354,10 @@ async def update_comment(
 ) -> dict[str, Any]:
     """Update an existing comment (used for promoting startup-comment to summary
     at end-of-run).
+
+    Same mention restriction as `post_comment` — refuses `<mention-component>`.
     """
+    _assert_no_mentions(comment_html)
     ctx = _registry().resolve(workspace=workspace)
     work_item_uuid = _ensure_uuid(work_item_uuid, "work_item_uuid")
     comment_id = _ensure_uuid(comment_id, "comment_id")
