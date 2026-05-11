@@ -141,7 +141,7 @@ async def test_runner_injects_workspace_slug_into_subprocess_env(
     `WORKSPACE_SLUG` is in env."""
     fake_claude = tmp_path / "fake_claude"
     # Dump env to the log so we can assert WORKSPACE_SLUG was injected.
-    fake_claude.write_text("#!/bin/sh\nenv\n")
+    fake_claude.write_text("#!/bin/sh\n/usr/bin/env\n")
     fake_claude.chmod(0o755)
 
     s = settings.model_copy(
