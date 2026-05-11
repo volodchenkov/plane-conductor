@@ -35,6 +35,7 @@ from plane_conductor.mcp_tower import (
     create_sub_issue,
     escalate_upstream_gap,
     find_artifact_by_label,
+    list_comments,
     mark_phase_complete,
     mark_spec_approved,
     pickup_issue,
@@ -1087,6 +1088,82 @@ async def test_post_changes_with_next_role_stamps_mention(
     )
     assert GEM_MEMBER in captured["body"]
     assert str(ctx_with_all_members.config.initiator_uuid) in captured["body"]
+
+
+# ---------------------------------------------------------------------------
+# list_comments — comments-only pagination (no description re-fetch)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_list_comments_returns_newest_first_with_pagination(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """list_comments: newest-first, sliced by limit/offset, no description GET."""
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    comments_route = respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": f"c{i}",
+                        "comment_html": f"<p>n{i}</p>",
+                        "created_at": f"2026-05-10T00:{i:02d}:00Z",
+                        "created_by": "u1",
+                    }
+                    for i in range(10)
+                ]
+            },
+        )
+    )
+
+    result = await list_comments(
+        sub_uuid=SPEC_SUB_UUID, limit=3, workspace=ctx.config.workspace_slug
+    )
+
+    assert result["total"] == 10
+    assert result["returned"] == 3
+    assert result["offset"] == 0
+    assert result["has_more"] is True
+    assert result["order"] == "desc"
+    # newest first: c9, c8, c7
+    assert [c["id"] for c in result["comments"]] == ["c9", "c8", "c7"]
+    # No GET on the issue itself — only the comments endpoint was hit.
+    assert comments_route.called
+
+
+@respx.mock
+async def test_list_comments_offset_walks_to_eof(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": f"c{i}", "comment_html": "", "created_at": f"2026-05-10T00:{i:02d}:00Z"}
+                    for i in range(5)
+                ]
+            },
+        )
+    )
+    result = await list_comments(
+        sub_uuid=SPEC_SUB_UUID, limit=10, offset=3, workspace=ctx.config.workspace_slug
+    )
+    assert result["total"] == 5
+    assert result["returned"] == 2  # 5 - 3
+    assert result["has_more"] is False
+
+
+async def test_list_comments_rejects_negative_pagination(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    with pytest.raises(TowerError, match="non-negative"):
+        await list_comments(
+            sub_uuid=SPEC_SUB_UUID, offset=-1, workspace=ctx.config.workspace_slug
+        )
 
 
 # ---------------------------------------------------------------------------

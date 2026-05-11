@@ -36,6 +36,7 @@ class PlaneClient:
         max_retries: int = 3,
         backoff_base: float = 1.0,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        shared: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.workspace_slug = workspace_slug
@@ -43,6 +44,12 @@ class PlaneClient:
         self.backoff_base = backoff_base
         self._sleep: Callable[[float], Awaitable[None]] = sleep or asyncio.sleep
         self._owned_client = client is None
+        # `shared=True` opts out of `async with`/`aclose()` closing the
+        # underlying httpx.AsyncClient. Used by tower's per-workspace
+        # singleton — see `_SHARED_CLIENTS` in mcp_tower.py — so the keep-alive
+        # pool survives across MCP tool calls. Existing per-call callsites
+        # (and tests) keep `shared=False` and close as before.
+        self._shared = shared
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
@@ -62,10 +69,11 @@ class PlaneClient:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        await self.aclose()
+        if not self._shared:
+            await self.aclose()
 
     async def aclose(self) -> None:
-        if self._owned_client:
+        if self._owned_client and not self._shared:
             await self._client.aclose()
 
     # ------------------------------------------------------------------
@@ -424,23 +432,6 @@ class PlaneClient:
                 json=fields,
             ),
         )
-
-    async def get_issue_by_sequence_id(
-        self,
-        project_id: str | UUID,
-        sequence_id: int,
-    ) -> dict[str, Any] | None:
-        """Resolve `<PROJECT_IDENTIFIER>-<N>` (e.g. COIN-37) by N. Plane's REST
-        API does not expose a by-identifier endpoint to API keys, so we list
-        the project's issues and filter by `sequence_id`. Returns None if no
-        match. Used by `pickup_issue` as the fallback path when the agent has
-        only the human identifier and not the UUID.
-        """
-        items = await self.list_issues(project_id)
-        for item in items:
-            if item.get("sequence_id") == sequence_id:
-                return item
-        return None
 
     async def list_issue_comments(
         self,

@@ -387,12 +387,26 @@ def _ensure_uuid(value: str | UUID, name: str) -> str:
         raise TowerError(f"{name} is not a valid UUID: {value!r}") from exc
 
 
+# One PlaneClient per workspace, keyed by slug, kept alive for the lifetime of
+# the tower process. Each MCP tool used to create + close a fresh client per
+# call → 30+ TCP/TLS handshakes per agent run to the same Plane endpoint.
+# Reusing one client per workspace reuses httpx's keep-alive pool. Tower is a
+# long-lived process (per agent spawn), so the client lifetime matches.
+_SHARED_CLIENTS: dict[str, PlaneClient] = {}
+
+
 async def _client_for(ctx: WorkspaceContext) -> PlaneClient:
-    return PlaneClient(
-        ctx.config.plane_base_url,
-        ctx.config.plane_api_key,
-        ctx.config.workspace_slug,
-    )
+    slug = ctx.config.workspace_slug
+    client = _SHARED_CLIENTS.get(slug)
+    if client is None:
+        client = PlaneClient(
+            ctx.config.plane_base_url,
+            ctx.config.plane_api_key,
+            slug,
+            shared=True,
+        )
+        _SHARED_CLIENTS[slug] = client
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -474,33 +488,18 @@ def _registry() -> TowerRegistry:
 
 @mcp.tool()
 async def pickup_issue(
-    issue_uuid: str | None = None,
+    issue_uuid: str,
     *,
-    project_identifier: str | None = None,
-    sequence_id: int | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve an issue by UUID (preferred) or by `<PROJECT_IDENTIFIER>-<N>`.
+    """Resolve an issue by UUID. Conductor always passes UUID in the spawn
+    prompt, so the lookup is a single GET.
 
-    Returns the full work item record plus the resolved workspace slug. Pass
-    `issue_uuid` when Plane Conductor's spawn prompt gave you the UUID
-    directly (the common case). Use `project_identifier` + `sequence_id`
-    when only a human identifier like `COIN-37` is at hand.
+    Returns the full work item record plus the resolved workspace slug.
     """
-    ctx = _registry().resolve(workspace=workspace, project_identifier=project_identifier)
+    ctx = _registry().resolve(workspace=workspace)
     async with await _client_for(ctx) as plane:
-        if issue_uuid:
-            issue = await plane.get_issue(ctx.config.project_id, issue_uuid)
-        elif sequence_id is not None:
-            found = await plane.get_issue_by_sequence_id(ctx.config.project_id, sequence_id)
-            if not found:
-                raise TowerError(
-                    f"no issue with sequence_id={sequence_id} in "
-                    f"workspace {ctx.config.workspace_slug!r}"
-                )
-            issue = found
-        else:
-            raise TowerError("pass issue_uuid or sequence_id (with project_identifier)")
+        issue = await plane.get_issue(ctx.config.project_id, issue_uuid)
     return {
         "id": issue.get("id"),
         "name": issue.get("name"),
@@ -616,8 +615,9 @@ async def create_root_issue(
       workspace: explicit workspace slug; otherwise resolved from the
         usual signals (env / project_identifier).
 
-    Post-condition: re-reads the created issue and fails loudly if Plane
-    silently dropped the labels list (same defense as create_sub_issue).
+    Trusts Plane's create-response: if `created["labels"]` is missing the
+    requested UUIDs, raises `UnlabelledSubIssueError` without a re-read.
+    Plane returns the full record on POST.
 
     Returns `{id, sequence_id, identifier, name, labels, ...}` where
     `identifier` is the canonical `<PROJECT_IDENTIFIER>-<N>` form.
@@ -634,28 +634,24 @@ async def create_root_issue(
             labels=label_uuids or None,
             assignees=assignee_uuids or None,
         )
-        new_id = str(created.get("id") or "")
-        if not new_id:
-            raise TowerError("Plane returned no id for the created root issue")
-        # Post-condition: re-read and verify labels stuck (same defense
-        # as create_sub_issue — Plane has been observed silently dropping
-        # labels arrays on bad UUIDs).
-        verified = await plane.get_issue(ctx.config.project_id, new_id)
-        if label_uuids:
-            got = verified.get("labels") or []
-            missing = [u for u in label_uuids if u not in got]
-            if missing:
-                raise UnlabelledSubIssueError(
-                    f"created root issue {new_id} has labels={got} after "
-                    f"create — expected {label_uuids}. Plane silently "
-                    f"dropped one or more labels (likely a UUID typo). "
-                    f"Manual intervention required."
-                )
+    new_id = str(created.get("id") or "")
+    if not new_id:
+        raise TowerError("Plane returned no id for the created root issue")
+    if label_uuids:
+        got = created.get("labels") or []
+        missing = [u for u in label_uuids if u not in got]
+        if missing:
+            raise UnlabelledSubIssueError(
+                f"created root issue {new_id} has labels={got} on POST "
+                f"response — expected {label_uuids}. Plane silently dropped "
+                f"one or more labels (likely a UUID typo). Manual intervention "
+                f"required."
+            )
 
-    seq = verified.get("sequence_id")
+    seq = created.get("sequence_id")
     identifier = f"{ctx.project_identifier}-{seq}" if ctx.project_identifier and seq else None
     return {
-        **_summarize_issue(verified),
+        **_summarize_issue(created),
         "identifier": identifier,
         "workspace_slug": ctx.config.workspace_slug,
     }
@@ -704,8 +700,8 @@ async def create_sub_issue(
         cannot both pass the duplicate-check and both create.
       - label-non-empty: resolves the artifact label UUID at call time;
         refuses if the workspace has no such label.
-      - post-create assert: re-reads the freshly-created sub-issue and fails
-        loudly if Plane silently dropped the labels list (UUID typo etc.).
+      - post-create assert: checks `created["labels"]` from the POST response
+        and fails loudly if Plane silently dropped the labels list (UUID typo).
       - title shape: `<Role>: <root_name> (<PROJECT_IDENTIFIER>-<N>)` per
         plane-api.md §6.5.
 
@@ -755,22 +751,21 @@ async def create_sub_issue(
             labels=[label_uuid],
             assignees=assignees,
         )
-        # Post-condition: re-read and verify the label stuck.
-        sub_id = str(created.get("id") or "")
-        if not sub_id:
-            raise TowerError("Plane returned no id for the created sub-issue")
-        verified = await plane.get_issue(ctx.config.project_id, sub_id)
-        labels = verified.get("labels") or []
-        if label_uuid not in labels:
-            raise UnlabelledSubIssueError(
-                f"created sub-issue {sub_id} has labels={labels} after create — "
-                f"expected {label_uuid}. Plane silently dropped the labels "
-                f"list (likely a UUID typo). The sub-issue exists but is "
-                f"unlabelled and will break find_artifact_by_label re-entry. "
-                f"Manual intervention required."
-            )
+    # Trust Plane's create-response: it returns the full record with labels.
+    sub_id = str(created.get("id") or "")
+    if not sub_id:
+        raise TowerError("Plane returned no id for the created sub-issue")
+    labels = created.get("labels") or []
+    if label_uuid not in labels:
+        raise UnlabelledSubIssueError(
+            f"created sub-issue {sub_id} has labels={labels} on POST "
+            f"response — expected {label_uuid}. Plane silently dropped the "
+            f"labels list (likely a UUID typo). The sub-issue exists but is "
+            f"unlabelled and will break find_artifact_by_label re-entry. "
+            f"Manual intervention required."
+        )
 
-    return _summarize_issue(verified)
+    return _summarize_issue(created)
 
 
 # Display name per role for sub-issue titles (mirrors plane-api.md §6.5).
@@ -974,6 +969,72 @@ async def read_artifact(
         "comments_returned": len(sliced),
         "total_comments": total,
         "has_more_comments": has_more,
+    }
+
+
+# ----- list_comments -------------------------------------------------------
+
+
+@mcp.tool()
+async def list_comments(
+    sub_uuid: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    description_format: str = "markdown",
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Return a sub-issue's comments without re-fetching its (possibly huge)
+    description.
+
+    Pagination shape mirrors `read_artifact`: newest-first
+    (`order='desc'`), sliced `[offset : offset + limit]`. Default
+    `limit=50` covers most iter_n-counting / re-entry-scan use cases in
+    one call; bump higher for full audits.
+
+    `description_format` controls whether comments come back as Markdown
+    (stripped via `html_to_markdown`, default) or raw HTML.
+
+    Use this when you've already called `read_artifact` once for the
+    description and now need older comments — re-calling `read_artifact`
+    with a larger `comments_limit` re-pulls the description (often 50 KB+).
+    """
+    if limit < 0 or offset < 0:
+        raise TowerError("limit and offset must be non-negative")
+    if description_format not in {"markdown", "html"}:
+        raise TowerError(
+            f"description_format must be 'markdown' or 'html', got {description_format!r}"
+        )
+    ctx = _registry().resolve(workspace=workspace)
+    sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
+    async with await _client_for(ctx) as plane:
+        comments = await plane.list_issue_comments(ctx.config.project_id, sub_uuid)
+
+    comments_sorted = sorted(comments, key=lambda c: c.get("created_at") or "", reverse=True)
+    total = len(comments_sorted)
+    sliced = comments_sorted[offset : offset + limit]
+    has_more = offset + len(sliced) < total
+
+    def _comment_text(c: dict[str, Any]) -> str:
+        raw = c.get("comment_html") or ""
+        return html_to_markdown(raw) if description_format == "markdown" else raw
+
+    return {
+        "comments": [
+            {
+                "id": c.get("id"),
+                "comment": _comment_text(c),
+                "actor": c.get("actor") or c.get("created_by"),
+                "created_at": c.get("created_at"),
+                "updated_at": c.get("updated_at"),
+            }
+            for c in sliced
+        ],
+        "order": "desc",
+        "offset": offset,
+        "returned": len(sliced),
+        "total": total,
+        "has_more": has_more,
     }
 
 
