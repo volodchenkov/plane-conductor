@@ -133,6 +133,35 @@ async def test_wait_idle_no_tasks(settings: Settings) -> None:
     await runner.wait_idle()
 
 
+async def test_runner_injects_workspace_slug_into_subprocess_env(
+    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+) -> None:
+    """The conductor knows the workspace at spawn time; agents should not
+    have to discover it from the URL. Tower auto-resolves workspace when
+    `WORKSPACE_SLUG` is in env."""
+    fake_claude = tmp_path / "fake_claude"
+    # Dump env to the log so we can assert WORKSPACE_SLUG was injected.
+    fake_claude.write_text("#!/bin/sh\n/usr/bin/env\n")
+    fake_claude.chmod(0o755)
+
+    s = settings.model_copy(
+        update={"claude_binary": str(fake_claude), "log_dir": tmp_path / "logs"}
+    )
+    plane = StubPlane()
+    runner = Runner(settings=s)
+
+    log_path = await runner.spawn(
+        workspace=workspace_config,
+        plane=plane,  # type: ignore[arg-type]
+        nickname="rinzler",
+        issue_uuid=ISSUE,
+    )
+    await runner.wait_idle()
+
+    body = log_path.read_text()
+    assert f"WORKSPACE_SLUG={workspace_config.workspace_slug}" in body
+
+
 async def test_runner_kills_subprocess_on_timeout(
     settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
 ) -> None:

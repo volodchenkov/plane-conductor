@@ -35,6 +35,7 @@ from plane_conductor.mcp_tower import (
     create_sub_issue,
     escalate_upstream_gap,
     find_artifact_by_label,
+    list_comments,
     mark_phase_complete,
     mark_spec_approved,
     pickup_issue,
@@ -654,33 +655,12 @@ async def test_create_sub_issue_concurrent_calls_serialize(
 
 
 @respx.mock
-async def test_post_review_increments_iter_from_existing(
+async def test_post_review_stamps_iter_n_passed_by_caller(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
+    """Caller passes iter_n (derived from comments they already read via
+    read_artifact) — tower does not walk all comments to auto-detect."""
     base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    # find_artifact_by_label call
-    respx.get(f"{base}/issues/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": SPEC_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_SPEC]},
-                ]
-            },
-        )
-    )
-    # list comments — has prior REVIEW iter 2
-    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": "c1", "comment_html": "<p>REVIEW (iter 1) — CHANGES_REQUIRED</p>"},
-                    {"id": "c2", "comment_html": "<p>REVIEW (iter 2) — CHANGES_REQUIRED</p>"},
-                ]
-            },
-        )
-    )
     posted: dict[str, Any] = {}
 
     def _capture(request: httpx.Request) -> httpx.Response:
@@ -690,43 +670,30 @@ async def test_post_review_increments_iter_from_existing(
     respx.post(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(side_effect=_capture)
 
     result = await post_review(
-        target="spec",
+        sub_uuid=SPEC_SUB_UUID,
         verdict="approved",
         body_html="<p>fixed</p>",
-        root_uuid=ROOT_UUID,
+        iter_n=3,
         workspace=ctx.config.workspace_slug,
     )
     assert result["iter"] == 3
     assert result["verdict"] == "APPROVED"
+    assert result["sub_uuid"] == SPEC_SUB_UUID
     assert "REVIEW (iter 3) — APPROVED" in posted["body"]
 
 
 @respx.mock
-async def test_post_review_first_iteration_when_no_prior(
+async def test_post_review_defaults_to_iter_1(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
     base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": SPEC_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_SPEC]},
-                ]
-            },
-        )
-    )
-    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(200, json={"results": []})
-    )
     respx.post(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
         return_value=httpx.Response(201, json={"id": "c-new"})
     )
     result = await post_review(
-        target="spec",
+        sub_uuid=SPEC_SUB_UUID,
         verdict="CHANGES_REQUIRED",
         body_html="<p>findings</p>",
-        root_uuid=ROOT_UUID,
         workspace=ctx.config.workspace_slug,
     )
     assert result["iter"] == 1
@@ -737,10 +704,22 @@ async def test_post_review_invalid_verdict_raises(
 ) -> None:
     with pytest.raises(TowerError, match="verdict must be"):
         await post_review(
-            target="root",
+            sub_uuid=SPEC_SUB_UUID,
             verdict="MAYBE",
             body_html="",
-            root_uuid=ROOT_UUID,
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+async def test_post_review_invalid_iter_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    with pytest.raises(TowerError, match="iter_n must be"):
+        await post_review(
+            sub_uuid=SPEC_SUB_UUID,
+            verdict="APPROVED",
+            body_html="",
+            iter_n=0,
             workspace=ctx.config.workspace_slug,
         )
 
@@ -750,25 +729,14 @@ async def test_post_review_invalid_verdict_raises(
 # ---------------------------------------------------------------------------
 
 
-@respx.mock
 async def test_post_changes_refuses_ready_without_openapi_when_views_touched(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
-    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_BACKEND]},
-                ]
-            },
-        )
-    )
+    """Defense fires BEFORE any HTTP — no Plane mock needed."""
     with pytest.raises(TowerError, match="API documentation defense"):
         await post_changes(
+            sub_uuid=BACKEND_SUB_UUID,
             target="backend",
-            root_uuid=ROOT_UUID,
             summary="add tracking endpoint",
             files=[["apps/orders/views.py", "add OrderTrackingView"]],
             verification=[["./make.sh lint", "0 errors"], ["pytest", "all green"]],
@@ -782,22 +750,12 @@ async def test_post_changes_accepts_when_openapi_in_verification(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
     base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_BACKEND]},
-                ]
-            },
-        )
-    )
     respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/comments/").mock(
         return_value=httpx.Response(201, json={"id": "c-new"})
     )
     result = await post_changes(
+        sub_uuid=BACKEND_SUB_UUID,
         target="backend",
-        root_uuid=ROOT_UUID,
         summary="add tracking endpoint",
         files=[["apps/orders/views.py", "add OrderTrackingView"]],
         verification=[
@@ -815,23 +773,13 @@ async def test_post_changes_skips_openapi_check_when_no_views_touched(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
     base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_BACKEND]},
-                ]
-            },
-        )
-    )
     respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/comments/").mock(
         return_value=httpx.Response(201, json={"id": "c-new"})
     )
     # No views/serializers touched → openapi check not required
     result = await post_changes(
+        sub_uuid=BACKEND_SUB_UUID,
         target="backend",
-        root_uuid=ROOT_UUID,
         summary="refactor models",
         files=[["apps/orders/models.py", "split Order into Order + OrderLine"]],
         verification=[["./make.sh lint", "0 errors"]],
@@ -895,122 +843,33 @@ async def test_mark_phase_complete_refuses_to_skip_phases(
 
 
 # ---------------------------------------------------------------------------
-# mark_spec_approved — refuses without prior APPROVED ARCH_REVIEW
+# mark_spec_approved — posts SPEC_APPROVED marker; caller attests the prior
+# REVIEW was APPROVED (tower no longer walks comments to verify — that was
+# a hang source). The architect is who calls this, right after they posted
+# the APPROVED review themselves.
 # ---------------------------------------------------------------------------
 
 
 @respx.mock
-async def test_mark_spec_approved_refuses_without_arch_review(
+async def test_mark_spec_approved_posts_marker(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
     base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(200, json={"results": []})
-    )
-    with pytest.raises(TowerError, match="no prior ARCH_REVIEW"):
-        await mark_spec_approved(
-            spec_sub_uuid=SPEC_SUB_UUID,
-            summary_html="<p>scope: backend only</p>",
-            workspace=ctx.config.workspace_slug,
-        )
+    captured: dict[str, Any] = {}
 
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode()
+        return httpx.Response(201, json={"id": "c-spec-approved"})
 
-@respx.mock
-async def test_mark_spec_approved_refuses_when_changes_required(
-    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
-) -> None:
-    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {
-                        "id": "c1",
-                        "comment_html": "<p>ARCH_REVIEW (iter 2) — CHANGES_REQUIRED</p>",
-                        "created_at": "2026-05-09T10:00:00Z",
-                    },
-                ]
-            },
-        )
-    )
-    with pytest.raises(TowerError, match="not APPROVED"):
-        await mark_spec_approved(
-            spec_sub_uuid=SPEC_SUB_UUID,
-            summary_html="<p>scope</p>",
-            workspace=ctx.config.workspace_slug,
-        )
+    respx.post(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(side_effect=_capture)
 
-
-@respx.mock
-async def test_mark_spec_approved_happy_path(
-    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
-) -> None:
-    """Latest ARCH_REVIEW marker says APPROVED → SPEC_APPROVED comment posts."""
-    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {
-                        "id": "c-old",
-                        "comment_html": "<p>ARCH_REVIEW (iter 1) — CHANGES_REQUIRED</p>",
-                        "created_at": "2026-05-08T10:00:00Z",
-                    },
-                    {
-                        "id": "c-new",
-                        "comment_html": "<p>ARCH_REVIEW (iter 2) — APPROVED.</p>",
-                        "created_at": "2026-05-09T10:00:00Z",
-                    },
-                ]
-            },
-        )
-    )
-    respx.post(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(201, json={"id": "c-spec-approved"})
-    )
     result = await mark_spec_approved(
         spec_sub_uuid=SPEC_SUB_UUID,
         summary_html="<p>scope: backend only</p>",
         workspace=ctx.config.workspace_slug,
     )
     assert result == {"comment_id": "c-spec-approved"}
-
-
-@respx.mock
-async def test_mark_spec_approved_rejects_approved_substring_in_changes_body(
-    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
-) -> None:
-    """Regression: a CHANGES_REQUIRED comment whose BODY quotes the word
-    'APPROVED' (e.g. citing a previous review) must NOT be misread as a pass.
-    Locks the structured-marker detection that replaced the old substring scan.
-    """
-    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {
-                        "id": "c-trick",
-                        "comment_html": (
-                            "<p><strong>ARCH_REVIEW (iter 3) — CHANGES_REQUIRED.</strong></p>"
-                            "<p>Iter 2 was previously APPROVED, but new findings require "
-                            "another pass.</p>"
-                        ),
-                        "created_at": "2026-05-10T09:00:00Z",
-                    },
-                ]
-            },
-        )
-    )
-    with pytest.raises(TowerError, match="not APPROVED"):
-        await mark_spec_approved(
-            spec_sub_uuid=SPEC_SUB_UUID,
-            summary_html="<p>scope</p>",
-            workspace=ctx.config.workspace_slug,
-        )
+    assert "SPEC_APPROVED" in captured["body"]
 
 
 # ---------------------------------------------------------------------------
@@ -1209,16 +1068,6 @@ async def test_post_changes_with_next_role_stamps_mention(
 ) -> None:
     """post_changes(next_role=...) injects the next-role mention alongside initiator."""
     base = f"https://plane.test/api/v1/workspaces/{ctx_with_all_members.config.workspace_slug}/projects/{project_id}"
-    respx.get(f"{base}/issues/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_BACKEND]},
-                ]
-            },
-        )
-    )
     captured: dict[str, Any] = {}
 
     def _on_post(request: httpx.Request) -> httpx.Response:
@@ -1228,8 +1077,8 @@ async def test_post_changes_with_next_role_stamps_mention(
     respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/comments/").mock(side_effect=_on_post)
 
     await post_changes(
+        sub_uuid=BACKEND_SUB_UUID,
         target="backend",
-        root_uuid=ROOT_UUID,
         summary="all done",
         files=[["src/foo.py", "added bar"]],
         verification=[["pytest", "passed"]],
@@ -1239,6 +1088,80 @@ async def test_post_changes_with_next_role_stamps_mention(
     )
     assert GEM_MEMBER in captured["body"]
     assert str(ctx_with_all_members.config.initiator_uuid) in captured["body"]
+
+
+# ---------------------------------------------------------------------------
+# list_comments — comments-only pagination (no description re-fetch)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_list_comments_returns_newest_first_with_pagination(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """list_comments: newest-first, sliced by limit/offset, no description GET."""
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    comments_route = respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": f"c{i}",
+                        "comment_html": f"<p>n{i}</p>",
+                        "created_at": f"2026-05-10T00:{i:02d}:00Z",
+                        "created_by": "u1",
+                    }
+                    for i in range(10)
+                ]
+            },
+        )
+    )
+
+    result = await list_comments(
+        sub_uuid=SPEC_SUB_UUID, limit=3, workspace=ctx.config.workspace_slug
+    )
+
+    assert result["total"] == 10
+    assert result["returned"] == 3
+    assert result["offset"] == 0
+    assert result["has_more"] is True
+    assert result["order"] == "desc"
+    # newest first: c9, c8, c7
+    assert [c["id"] for c in result["comments"]] == ["c9", "c8", "c7"]
+    # No GET on the issue itself — only the comments endpoint was hit.
+    assert comments_route.called
+
+
+@respx.mock
+async def test_list_comments_offset_walks_to_eof(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": f"c{i}", "comment_html": "", "created_at": f"2026-05-10T00:{i:02d}:00Z"}
+                    for i in range(5)
+                ]
+            },
+        )
+    )
+    result = await list_comments(
+        sub_uuid=SPEC_SUB_UUID, limit=10, offset=3, workspace=ctx.config.workspace_slug
+    )
+    assert result["total"] == 5
+    assert result["returned"] == 2  # 5 - 3
+    assert result["has_more"] is False
+
+
+async def test_list_comments_rejects_negative_pagination(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    with pytest.raises(TowerError, match="non-negative"):
+        await list_comments(sub_uuid=SPEC_SUB_UUID, offset=-1, workspace=ctx.config.workspace_slug)
 
 
 # ---------------------------------------------------------------------------

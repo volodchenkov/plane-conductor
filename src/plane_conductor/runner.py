@@ -179,7 +179,11 @@ class Runner:
                 stdout=log_fp,
                 stderr=log_fp,
                 cwd=str(cwd),
-                env=os.environ.copy(),
+                # Inject WORKSPACE_SLUG so tower's pickup_issue / find_artifact_by_label
+                # / etc. auto-resolve workspace without the agent having to pass
+                # `workspace=` on every call. Conductor already knows the slug at
+                # spawn time — agents shouldn't have to re-discover it from the URL.
+                env={**os.environ, "WORKSPACE_SLUG": slug},
                 start_new_session=True,
             )
         except FileNotFoundError as exc:

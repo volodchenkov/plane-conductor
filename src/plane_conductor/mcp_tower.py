@@ -387,12 +387,26 @@ def _ensure_uuid(value: str | UUID, name: str) -> str:
         raise TowerError(f"{name} is not a valid UUID: {value!r}") from exc
 
 
+# One PlaneClient per workspace, keyed by slug, kept alive for the lifetime of
+# the tower process. Each MCP tool used to create + close a fresh client per
+# call → 30+ TCP/TLS handshakes per agent run to the same Plane endpoint.
+# Reusing one client per workspace reuses httpx's keep-alive pool. Tower is a
+# long-lived process (per agent spawn), so the client lifetime matches.
+_SHARED_CLIENTS: dict[str, PlaneClient] = {}
+
+
 async def _client_for(ctx: WorkspaceContext) -> PlaneClient:
-    return PlaneClient(
-        ctx.config.plane_base_url,
-        ctx.config.plane_api_key,
-        ctx.config.workspace_slug,
-    )
+    slug = ctx.config.workspace_slug
+    client = _SHARED_CLIENTS.get(slug)
+    if client is None:
+        client = PlaneClient(
+            ctx.config.plane_base_url,
+            ctx.config.plane_api_key,
+            slug,
+            shared=True,
+        )
+        _SHARED_CLIENTS[slug] = client
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -411,8 +425,7 @@ _REGISTRY: TowerRegistry | None = None
 # call was in-flight at the time of a hang.
 if os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", "on"}:
     _log_path = (
-        Path(os.environ.get("LOG_DIR", "/var/log/plane-conductor"))
-        / f"tower-{os.getpid()}.jsonl"
+        Path(os.environ.get("LOG_DIR", "/var/log/plane-conductor")) / f"tower-{os.getpid()}.jsonl"
     )
     _log_path.parent.mkdir(parents=True, exist_ok=True)
     _log_fh = open(_log_path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115  (long-lived handle for process lifetime)
@@ -443,9 +456,7 @@ if os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", 
                     )
                     raise
                 size = (
-                    len(json.dumps(result, default=str))
-                    if isinstance(result, dict | list)
-                    else 0
+                    len(json.dumps(result, default=str)) if isinstance(result, dict | list) else 0
                 )
                 _emit(
                     event="end",
@@ -474,33 +485,18 @@ def _registry() -> TowerRegistry:
 
 @mcp.tool()
 async def pickup_issue(
-    issue_uuid: str | None = None,
+    issue_uuid: str,
     *,
-    project_identifier: str | None = None,
-    sequence_id: int | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve an issue by UUID (preferred) or by `<PROJECT_IDENTIFIER>-<N>`.
+    """Resolve an issue by UUID. Conductor always passes UUID in the spawn
+    prompt, so the lookup is a single GET.
 
-    Returns the full work item record plus the resolved workspace slug. Pass
-    `issue_uuid` when Plane Conductor's spawn prompt gave you the UUID
-    directly (the common case). Use `project_identifier` + `sequence_id`
-    when only a human identifier like `COIN-37` is at hand.
+    Returns the full work item record plus the resolved workspace slug.
     """
-    ctx = _registry().resolve(workspace=workspace, project_identifier=project_identifier)
+    ctx = _registry().resolve(workspace=workspace)
     async with await _client_for(ctx) as plane:
-        if issue_uuid:
-            issue = await plane.get_issue(ctx.config.project_id, issue_uuid)
-        elif sequence_id is not None:
-            found = await plane.get_issue_by_sequence_id(ctx.config.project_id, sequence_id)
-            if not found:
-                raise TowerError(
-                    f"no issue with sequence_id={sequence_id} in "
-                    f"workspace {ctx.config.workspace_slug!r}"
-                )
-            issue = found
-        else:
-            raise TowerError("pass issue_uuid or sequence_id (with project_identifier)")
+        issue = await plane.get_issue(ctx.config.project_id, issue_uuid)
     return {
         "id": issue.get("id"),
         "name": issue.get("name"),
@@ -616,8 +612,9 @@ async def create_root_issue(
       workspace: explicit workspace slug; otherwise resolved from the
         usual signals (env / project_identifier).
 
-    Post-condition: re-reads the created issue and fails loudly if Plane
-    silently dropped the labels list (same defense as create_sub_issue).
+    Trusts Plane's create-response: if `created["labels"]` is missing the
+    requested UUIDs, raises `UnlabelledSubIssueError` without a re-read.
+    Plane returns the full record on POST.
 
     Returns `{id, sequence_id, identifier, name, labels, ...}` where
     `identifier` is the canonical `<PROJECT_IDENTIFIER>-<N>` form.
@@ -634,28 +631,24 @@ async def create_root_issue(
             labels=label_uuids or None,
             assignees=assignee_uuids or None,
         )
-        new_id = str(created.get("id") or "")
-        if not new_id:
-            raise TowerError("Plane returned no id for the created root issue")
-        # Post-condition: re-read and verify labels stuck (same defense
-        # as create_sub_issue — Plane has been observed silently dropping
-        # labels arrays on bad UUIDs).
-        verified = await plane.get_issue(ctx.config.project_id, new_id)
-        if label_uuids:
-            got = verified.get("labels") or []
-            missing = [u for u in label_uuids if u not in got]
-            if missing:
-                raise UnlabelledSubIssueError(
-                    f"created root issue {new_id} has labels={got} after "
-                    f"create — expected {label_uuids}. Plane silently "
-                    f"dropped one or more labels (likely a UUID typo). "
-                    f"Manual intervention required."
-                )
+    new_id = str(created.get("id") or "")
+    if not new_id:
+        raise TowerError("Plane returned no id for the created root issue")
+    if label_uuids:
+        got = created.get("labels") or []
+        missing = [u for u in label_uuids if u not in got]
+        if missing:
+            raise UnlabelledSubIssueError(
+                f"created root issue {new_id} has labels={got} on POST "
+                f"response — expected {label_uuids}. Plane silently dropped "
+                f"one or more labels (likely a UUID typo). Manual intervention "
+                f"required."
+            )
 
-    seq = verified.get("sequence_id")
+    seq = created.get("sequence_id")
     identifier = f"{ctx.project_identifier}-{seq}" if ctx.project_identifier and seq else None
     return {
-        **_summarize_issue(verified),
+        **_summarize_issue(created),
         "identifier": identifier,
         "workspace_slug": ctx.config.workspace_slug,
     }
@@ -704,8 +697,8 @@ async def create_sub_issue(
         cannot both pass the duplicate-check and both create.
       - label-non-empty: resolves the artifact label UUID at call time;
         refuses if the workspace has no such label.
-      - post-create assert: re-reads the freshly-created sub-issue and fails
-        loudly if Plane silently dropped the labels list (UUID typo etc.).
+      - post-create assert: checks `created["labels"]` from the POST response
+        and fails loudly if Plane silently dropped the labels list (UUID typo).
       - title shape: `<Role>: <root_name> (<PROJECT_IDENTIFIER>-<N>)` per
         plane-api.md §6.5.
 
@@ -755,22 +748,21 @@ async def create_sub_issue(
             labels=[label_uuid],
             assignees=assignees,
         )
-        # Post-condition: re-read and verify the label stuck.
-        sub_id = str(created.get("id") or "")
-        if not sub_id:
-            raise TowerError("Plane returned no id for the created sub-issue")
-        verified = await plane.get_issue(ctx.config.project_id, sub_id)
-        labels = verified.get("labels") or []
-        if label_uuid not in labels:
-            raise UnlabelledSubIssueError(
-                f"created sub-issue {sub_id} has labels={labels} after create — "
-                f"expected {label_uuid}. Plane silently dropped the labels "
-                f"list (likely a UUID typo). The sub-issue exists but is "
-                f"unlabelled and will break find_artifact_by_label re-entry. "
-                f"Manual intervention required."
-            )
+    # Trust Plane's create-response: it returns the full record with labels.
+    sub_id = str(created.get("id") or "")
+    if not sub_id:
+        raise TowerError("Plane returned no id for the created sub-issue")
+    labels = created.get("labels") or []
+    if label_uuid not in labels:
+        raise UnlabelledSubIssueError(
+            f"created sub-issue {sub_id} has labels={labels} on POST "
+            f"response — expected {label_uuid}. Plane silently dropped the "
+            f"labels list (likely a UUID typo). The sub-issue exists but is "
+            f"unlabelled and will break find_artifact_by_label re-entry. "
+            f"Manual intervention required."
+        )
 
-    return _summarize_issue(verified)
+    return _summarize_issue(created)
 
 
 # Display name per role for sub-issue titles (mirrors plane-api.md §6.5).
@@ -977,6 +969,72 @@ async def read_artifact(
     }
 
 
+# ----- list_comments -------------------------------------------------------
+
+
+@mcp.tool()
+async def list_comments(
+    sub_uuid: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    description_format: str = "markdown",
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Return a sub-issue's comments without re-fetching its (possibly huge)
+    description.
+
+    Pagination shape mirrors `read_artifact`: newest-first
+    (`order='desc'`), sliced `[offset : offset + limit]`. Default
+    `limit=50` covers most iter_n-counting / re-entry-scan use cases in
+    one call; bump higher for full audits.
+
+    `description_format` controls whether comments come back as Markdown
+    (stripped via `html_to_markdown`, default) or raw HTML.
+
+    Use this when you've already called `read_artifact` once for the
+    description and now need older comments — re-calling `read_artifact`
+    with a larger `comments_limit` re-pulls the description (often 50 KB+).
+    """
+    if limit < 0 or offset < 0:
+        raise TowerError("limit and offset must be non-negative")
+    if description_format not in {"markdown", "html"}:
+        raise TowerError(
+            f"description_format must be 'markdown' or 'html', got {description_format!r}"
+        )
+    ctx = _registry().resolve(workspace=workspace)
+    sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
+    async with await _client_for(ctx) as plane:
+        comments = await plane.list_issue_comments(ctx.config.project_id, sub_uuid)
+
+    comments_sorted = sorted(comments, key=lambda c: c.get("created_at") or "", reverse=True)
+    total = len(comments_sorted)
+    sliced = comments_sorted[offset : offset + limit]
+    has_more = offset + len(sliced) < total
+
+    def _comment_text(c: dict[str, Any]) -> str:
+        raw = c.get("comment_html") or ""
+        return html_to_markdown(raw) if description_format == "markdown" else raw
+
+    return {
+        "comments": [
+            {
+                "id": c.get("id"),
+                "comment": _comment_text(c),
+                "actor": c.get("actor") or c.get("created_by"),
+                "created_at": c.get("created_at"),
+                "updated_at": c.get("updated_at"),
+            }
+            for c in sliced
+        ],
+        "order": "desc",
+        "offset": offset,
+        "returned": len(sliced),
+        "total": total,
+        "has_more": has_more,
+    }
+
+
 # ----- update_sub_issue_description ----------------------------------------
 
 
@@ -1016,101 +1074,55 @@ async def update_sub_issue_description(
 
 @mcp.tool()
 async def post_review(
-    target: str,
+    sub_uuid: str,
     verdict: str,
     body_html: str,
     *,
-    root_uuid: str | None = None,
+    iter_n: int = 1,
     next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Post a REVIEW comment on the artifact under review.
+    """Post a REVIEW comment on the given sub-issue.
 
-    `target` is one of:
-      - `spec` / `design` / `backend` / `frontend` / `api-tests` /
-        `ux-tests` → the comment goes on that artifact's sub-issue
-      - `root` → the comment goes on the root issue (cross-cutting verdict)
+    `sub_uuid` is the sub-issue receiving the comment. The agent already
+    has this — for the architect and coders it equals the spawn
+    `issue_uuid`; for the final reviewer iterating over multiple artifacts
+    it is the per-artifact sub_uuid resolved via `find_artifact_by_label`
+    or `list_sub_issues`.
 
-    `verdict` is `APPROVED` / `CHANGES_REQUIRED` / `BLOCKED`. The marker is
-    `ARCH_REVIEW` for the architect (when target='spec') and `REVIEW`
-    otherwise — the tower stamps it from `os.environ['AGENT_NICKNAME']` when
-    it equals 'architect', otherwise REVIEW.
+    `verdict` is `APPROVED` / `CHANGES_REQUIRED` / `BLOCKED`.
 
-    Iteration N is auto-detected by scanning prior review markers on the
-    target. Returns `{comment_id, iter, target_uuid}`.
+    `iter_n` is the iteration counter (1-based). Agents derive it from
+    prior comments they already read via `read_artifact` — tower no longer
+    walks all comments for auto-detection, that was a hang source.
 
-    Pass `root_uuid` when target is a sub-issue role; the tower resolves the
-    sub via find_artifact_by_label. For target='root', `root_uuid` is the
-    target itself.
+    `next_role` (optional) — pipeline role to mention alongside the
+    initiator. Tower resolves the role to its member UUID. `body_html`
+    must NOT contain `<mention-component>` — those are tower-managed.
 
-    `next_role` (optional) — pipeline role to mention in addition to the
-    initiator (e.g. `business-analyst` after a CHANGES_REQUIRED on root).
-    Tower resolves the role to its member UUID and stamps the mention; the
-    agent never types a UUID. `body_html` must NOT contain
-    `<mention-component>` — those are tower-managed.
+    One HTTP call (`create_issue_comment`). No `list_issues` /
+    `list_issue_comments` underneath.
     """
     _assert_no_mentions(body_html)
     verdict_clean = verdict.strip().upper()
     if verdict_clean not in {"APPROVED", "CHANGES_REQUIRED", "BLOCKED"}:
         raise TowerError(f"verdict must be APPROVED|CHANGES_REQUIRED|BLOCKED, got {verdict!r}")
+    if iter_n < 1:
+        raise TowerError(f"iter_n must be >= 1, got {iter_n}")
     ctx = _registry().resolve(workspace=workspace)
     next_mention = _role_mention(ctx, next_role) if next_role else ""
-    if target == "root":
-        if not root_uuid:
-            raise TowerError("target='root' requires root_uuid")
-        target_uuid = _ensure_uuid(root_uuid, "root_uuid")
-    else:
-        if not root_uuid:
-            raise TowerError(f"target={target!r} requires root_uuid")
-        root_uuid = _ensure_uuid(root_uuid, "root_uuid")
-        # find sub
-        label_uuid = ctx.artifact_label_uuid(target)
-        async with await _client_for(ctx) as plane:
-            items = await plane.list_issues(ctx.config.project_id)
-        matched = [
-            i
-            for i in items
-            if str(i.get("parent") or "") == root_uuid and label_uuid in (i.get("labels") or [])
-        ]
-        if not matched:
-            raise TowerError(f"no sub-issue with artifact:{target} under root {root_uuid}")
-        if len(matched) > 1:
-            raise DuplicateSubIssueError(
-                f"{len(matched)} sub-issues with artifact:{target} under root "
-                f"{root_uuid}; cannot post review until duplicates are merged"
-            )
-        target_uuid = str(matched[0].get("id") or "")
-
-    marker = (
-        "ARCH_REVIEW"
-        if (
-            os.environ.get("AGENT_NICKNAME") == "architect"
-            or (target == "spec" and os.environ.get("AGENT_NICKNAME", "").startswith("flynn"))
-        )
-        else "REVIEW"
+    sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
+    comment_html = (
+        f"<p><strong>REVIEW (iter {iter_n}) — {verdict_clean}.</strong></p>"
+        f"{body_html}"
+        f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
     )
-
-    # detect iteration
     async with await _client_for(ctx) as plane:
-        comments = await plane.list_issue_comments(ctx.config.project_id, target_uuid)
-        iter_n = 1
-        for c in comments:
-            for m in _REVIEW_MARKER_RE.finditer(c.get("comment_html") or ""):
-                if m.group("kind").upper() == marker:
-                    with contextlib.suppress(ValueError):
-                        iter_n = max(iter_n, int(m.group("iter")) + 1)
-
-        comment_html = (
-            f"<p><strong>{marker} (iter {iter_n}) — {verdict_clean}.</strong></p>"
-            f"{body_html}"
-            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
-        )
-        comment = await plane.create_issue_comment(ctx.config.project_id, target_uuid, comment_html)
+        comment = await plane.create_issue_comment(ctx.config.project_id, sub_uuid, comment_html)
     return {
         "comment_id": comment.get("id"),
         "iter": iter_n,
-        "marker": marker,
-        "target_uuid": target_uuid,
+        "sub_uuid": sub_uuid,
         "verdict": verdict_clean,
     }
 
@@ -1126,8 +1138,12 @@ async def mark_spec_approved(
     next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Post the SPEC_APPROVED marker comment after the architect's APPROVED
-    review. Refuses if the most recent ARCH_REVIEW on this sub is not APPROVED.
+    """Post the SPEC_APPROVED marker comment.
+
+    Caller is responsible for having posted an APPROVED REVIEW first —
+    tower no longer walks comments to verify (that was a hang source on
+    long pipelines). The architect is who calls this, and they just
+    posted the APPROVED review themselves one step earlier.
 
     `next_role` (optional) — pipeline role to mention alongside the
     initiator (typically the next coder, e.g. `django-developer`).
@@ -1137,38 +1153,11 @@ async def mark_spec_approved(
     ctx = _registry().resolve(workspace=workspace)
     next_mention = _role_mention(ctx, next_role) if next_role else ""
     spec_sub_uuid = _ensure_uuid(spec_sub_uuid, "spec_sub_uuid")
+    comment_html = (
+        f"<p><strong>SPEC_APPROVED</strong></p>{summary_html}"
+        f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
+    )
     async with await _client_for(ctx) as plane:
-        comments = await plane.list_issue_comments(ctx.config.project_id, spec_sub_uuid)
-        # Find the most recent ARCH_REVIEW marker by created_at, then read its
-        # verdict from the canonical regex group. Substring scans of the whole
-        # comment_html are unsafe — a CHANGES_REQUIRED comment's body can
-        # legitimately quote the word "APPROVED" (e.g. "previously APPROVED,
-        # now needs changes") and pass a naive `"APPROVED" in html` check.
-        latest_match: re.Match[str] | None = None
-        latest_at: str = ""
-        for c in comments:
-            body = c.get("comment_html") or ""
-            m = _REVIEW_MARKER_RE.search(body)
-            if not m or m.group("kind").upper() != "ARCH_REVIEW":
-                continue
-            created_at = str(c.get("created_at") or "")
-            if created_at >= latest_at:  # ISO-8601 strings sort lexicographically
-                latest_at = created_at
-                latest_match = m
-        if latest_match is None:
-            raise TowerError(
-                "no prior ARCH_REVIEW comment on this SPEC sub-issue; post APPROVED review first"
-            )
-        verdict = (latest_match.group("verdict") or "").upper()
-        if verdict != "APPROVED":
-            raise TowerError(
-                f"latest ARCH_REVIEW is not APPROVED (got {verdict or 'no verdict'!r}); "
-                f"cannot mark SPEC_APPROVED"
-            )
-        comment_html = (
-            f"<p><strong>SPEC_APPROVED</strong></p>{summary_html}"
-            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
-        )
         comment = await plane.create_issue_comment(
             ctx.config.project_id, spec_sub_uuid, comment_html
         )
@@ -1180,8 +1169,8 @@ async def mark_spec_approved(
 
 @mcp.tool()
 async def post_changes(
+    sub_uuid: str,
     target: str,
-    root_uuid: str,
     summary: str,
     files: list[list[str]],
     verification: list[list[str]],
@@ -1194,11 +1183,15 @@ async def post_changes(
     next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Post the canonical CHANGES comment on the role's sub-issue.
+    """Post the canonical CHANGES comment on the coder's sub-issue.
 
-    `target` is `backend` or `frontend`. `files`/`verification` are pairs of
-    `[path_or_command, oneline_summary_or_result]`. The op renders the
-    template and refuses `ready_for_review=True` when:
+    `sub_uuid` is the coder's sub-issue (equals the spawn `issue_uuid`).
+    `target` is `backend` or `frontend` — used only for the display label
+    and the OpenAPI verifier defense check.
+
+    `files`/`verification` are pairs of `[path_or_command,
+    oneline_summary_or_result]`. The op renders the template and refuses
+    `ready_for_review=True` when:
 
     - `verification` is empty
     - `target='backend'` and any path in `files` matches `views.py` /
@@ -1207,100 +1200,80 @@ async def post_changes(
       `verify-openapi` or `spectacular`).
 
     `next_role` (optional) — pipeline role to mention after the initiator
-    (typically `reviewer` once `ready_for_review=True`). Tower resolves the
-    role to its member UUID and stamps the mention; agent never types a
-    UUID. All scalar fields are HTML-escaped — agents cannot embed
-    `<mention-component>` themselves.
+    (typically `reviewer` once `ready_for_review=True`). Tower resolves
+    the role to its member UUID and stamps the mention.
+
+    One HTTP call (`create_issue_comment`). No `list_issues` underneath.
     """
     if target not in {"backend", "frontend"}:
         raise TowerError(f"post_changes target must be backend|frontend, got {target!r}")
     ctx = _registry().resolve(workspace=workspace)
     next_mention = _role_mention(ctx, next_role) if next_role else ""
-    label_uuid = ctx.artifact_label_uuid(target)
-    root_uuid = _ensure_uuid(root_uuid, "root_uuid")
+    sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
 
-    async with await _client_for(ctx) as plane:
-        items = await plane.list_issues(ctx.config.project_id)
-        matched = [
-            i
-            for i in items
-            if str(i.get("parent") or "") == root_uuid and label_uuid in (i.get("labels") or [])
-        ]
-        if not matched:
-            raise TowerError(
-                f"no sub-issue with artifact:{target} under root {root_uuid}; "
-                f"create_sub_issue first"
+    # Defenses on ready_for_review (no Plane API needed — run before HTTP)
+    if ready_for_review:
+        if not verification:
+            raise TowerError("ready_for_review=True requires non-empty verification")
+        if target == "backend":
+            touches_api = any(
+                re.search(r"(views|serializers|schemas)\.py$", path) for path, _ in (files or [])
             )
-        if len(matched) > 1:
-            raise DuplicateSubIssueError(
-                f"{len(matched)} sub-issues with artifact:{target} under root "
-                f"{root_uuid}; cannot post changes"
-            )
-        sub_uuid = str(matched[0].get("id"))
-
-        # Defenses on ready_for_review
-        if ready_for_review:
-            if not verification:
-                raise TowerError("ready_for_review=True requires non-empty verification")
-            if target == "backend":
-                touches_api = any(
-                    re.search(r"(views|serializers|schemas)\.py$", path)
-                    for path, _ in (files or [])
+            if touches_api:
+                has_openapi = any(
+                    ("verify-openapi" in cmd or "spectacular" in cmd) for cmd, _ in verification
                 )
-                if touches_api:
-                    has_openapi = any(
-                        ("verify-openapi" in cmd or "spectacular" in cmd) for cmd, _ in verification
+                if not has_openapi:
+                    raise TowerError(
+                        "API documentation defense (plane-api.md §6.7d): "
+                        "you modified views/serializers/schemas but "
+                        "verification does not include /verify-openapi (or "
+                        "spectacular --validate --fail-on-warn). Run the "
+                        "project's OpenAPI verifier before claiming ready_for_review."
                     )
-                    if not has_openapi:
-                        raise TowerError(
-                            "API documentation defense (plane-api.md §6.7d): "
-                            "you modified views/serializers/schemas but "
-                            "verification does not include /verify-openapi (or "
-                            "spectacular --validate --fail-on-warn). Run the "
-                            "project's OpenAPI verifier before claiming ready_for_review."
-                        )
 
-        # Render. All caller-controlled fragments are HTML-escaped (paths,
-        # summaries, command output, etc.). Plane's rich-text renderer trusts
-        # comment_html, so an unescaped angle-bracket in a path could break
-        # the comment shape or smuggle markup.
-        files_html = "".join(
-            f"<li><code>{_esc(path)}</code> — {_esc(summary_line)}</li>"
-            for path, summary_line in (files or [])
+    # Render. All caller-controlled fragments are HTML-escaped (paths,
+    # summaries, command output, etc.). Plane's rich-text renderer trusts
+    # comment_html, so an unescaped angle-bracket in a path could break
+    # the comment shape or smuggle markup.
+    files_html = "".join(
+        f"<li><code>{_esc(path)}</code> — {_esc(summary_line)}</li>"
+        for path, summary_line in (files or [])
+    )
+    verification_html = "".join(
+        f"<li><code>{_esc(cmd)}</code> — {_esc(result)}</li>"
+        for cmd, result in (verification or [])
+    )
+    migrations_html = ""
+    if migrations:
+        migrations_rows = "".join(
+            f"<li><code>{_esc(name)}</code> — {_esc(descr)}</li>" for name, descr in migrations
         )
-        verification_html = "".join(
-            f"<li><code>{_esc(cmd)}</code> — {_esc(result)}</li>"
-            for cmd, result in (verification or [])
-        )
-        migrations_html = ""
-        if migrations:
-            migrations_rows = "".join(
-                f"<li><code>{_esc(name)}</code> — {_esc(descr)}</li>" for name, descr in migrations
-            )
-            migrations_html = f"<h2>Migrations</h2><ul>{migrations_rows}</ul>"
-        perf_html = ""
-        if perf:
-            perf_html = "<h2>Performance</h2><pre>" + _esc(perf) + "</pre>"
-        dev_html = ""
-        if deviations_from_plan:
-            rows = "".join(f"<li>{_esc(d)}</li>" for d in deviations_from_plan)
-            dev_html = f"<h2>Deviations from PLAN</h2><ul>{rows}</ul>"
-        ni_html = ""
-        if not_implemented:
-            rows = "".join(f"<li>{_esc(d)}</li>" for d in not_implemented)
-            ni_html = f"<h2>Not implemented (deferred)</h2><ul>{rows}</ul>"
-        ready_html = "READY FOR REVIEW: yes" if ready_for_review else "READY FOR REVIEW: no"
+        migrations_html = f"<h2>Migrations</h2><ul>{migrations_rows}</ul>"
+    perf_html = ""
+    if perf:
+        perf_html = "<h2>Performance</h2><pre>" + _esc(perf) + "</pre>"
+    dev_html = ""
+    if deviations_from_plan:
+        rows = "".join(f"<li>{_esc(d)}</li>" for d in deviations_from_plan)
+        dev_html = f"<h2>Deviations from PLAN</h2><ul>{rows}</ul>"
+    ni_html = ""
+    if not_implemented:
+        rows = "".join(f"<li>{_esc(d)}</li>" for d in not_implemented)
+        ni_html = f"<h2>Not implemented (deferred)</h2><ul>{rows}</ul>"
+    ready_html = "READY FOR REVIEW: yes" if ready_for_review else "READY FOR REVIEW: no"
 
-        comment_html = (
-            f"<h1>{_esc(_role_display(target))} CHANGES</h1>"
-            f"<p>{_esc(summary)}</p>"
-            f"<h2>Files modified</h2><ul>{files_html}</ul>"
-            f"{migrations_html}"
-            f"<h2>Verification</h2><ul>{verification_html}</ul>"
-            f"{perf_html}{dev_html}{ni_html}"
-            f"<p><strong>{ready_html}</strong></p>"
-            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
-        )
+    comment_html = (
+        f"<h1>{_esc(_role_display(target))} CHANGES</h1>"
+        f"<p>{_esc(summary)}</p>"
+        f"<h2>Files modified</h2><ul>{files_html}</ul>"
+        f"{migrations_html}"
+        f"<h2>Verification</h2><ul>{verification_html}</ul>"
+        f"{perf_html}{dev_html}{ni_html}"
+        f"<p><strong>{ready_html}</strong></p>"
+        f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
+    )
+    async with await _client_for(ctx) as plane:
         comment = await plane.create_issue_comment(ctx.config.project_id, sub_uuid, comment_html)
     return {
         "comment_id": comment.get("id"),
@@ -1314,15 +1287,14 @@ async def post_changes(
 
 @mcp.tool()
 async def post_bug_report(
-    target: str,
-    affected_role: str,
+    test_sub_uuid: str,
     severity: str,
     title: str,
     repro_steps: list[str],
     actual: str,
     expected: str,
-    root_uuid: str,
     *,
+    affected_sub_uuid: str | None = None,
     failing_tc: str = "",
     environment: dict[str, Any] | None = None,
     fix_hint: str = "",
@@ -1330,92 +1302,73 @@ async def post_bug_report(
     next_role: str | None = None,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Post an ISTQB bug report on the test sub-issue + back-link the
-    affected coder's sub-issue. `target` ∈ {api-tests, ux-tests};
-    `affected_role` ∈ {backend, frontend}.
+    """Post an ISTQB bug report on the tester's sub-issue and (optionally)
+    back-link the affected coder's sub-issue.
+
+    `test_sub_uuid` is the tester's sub-issue receiving the bug comment
+    (equals the spawn `issue_uuid`). `affected_sub_uuid` is the coder's
+    sub-issue that gets the back-link; pass `None` to skip the back-link.
+
+    `severity` ∈ {blocker, major, minor, cosmetic}.
 
     `next_role` (optional) — pipeline role to mention alongside the
-    initiator (typically the coder responsible for `affected_role`, so
-    they re-enter and fix). Tower resolves the role to its member UUID.
+    initiator (typically the coder responsible for the affected role).
+
+    One HTTP call for the comment, one optional for the back-link. No
+    `list_issues` underneath.
     """
-    if target not in {"api-tests", "ux-tests"}:
-        raise TowerError("post_bug_report target must be api-tests|ux-tests")
-    if affected_role not in {"backend", "frontend"}:
-        raise TowerError("affected_role must be backend|frontend")
     severity = severity.strip().lower()
     if severity not in {"blocker", "major", "minor", "cosmetic"}:
         raise TowerError("severity must be blocker|major|minor|cosmetic")
 
     ctx = _registry().resolve(workspace=workspace)
     next_mention = _role_mention(ctx, next_role) if next_role else ""
-    test_label = ctx.artifact_label_uuid(target)
-    affected_label = ctx.artifact_label_uuid(affected_role)
-    root_uuid = _ensure_uuid(root_uuid, "root_uuid")
+    test_sub_uuid = _ensure_uuid(test_sub_uuid, "test_sub_uuid")
+    if affected_sub_uuid:
+        affected_sub_uuid = _ensure_uuid(affected_sub_uuid, "affected_sub_uuid")
+
+    steps_html = "".join(f"<li>{_esc(s)}</li>" for s in repro_steps)
+    env_html = ""
+    if environment:
+        rows = "".join(
+            f"<li><strong>{_esc(k)}:</strong> {_esc(v)}</li>" for k, v in environment.items()
+        )
+        env_html = f"<h2>Environment</h2><ul>{rows}</ul>"
+    screenshots_html = ""
+    if screenshots:
+        shots = "".join(f'<li><a href="{_esc(u)}">{_esc(u)}</a></li>' for u in screenshots)
+        screenshots_html = f"<h2>Attachments</h2><ul>{shots}</ul>"
+    fix_html = f"<p><em>Fix hint:</em> {_esc(fix_hint)}</p>" if fix_hint else ""
+
+    affected_id_disp = affected_sub_uuid or "?"
+    comment_html = (
+        f"<h1>Bug ({_esc(severity)}): {_esc(title)}</h1>"
+        f"<p><strong>Severity:</strong> {_esc(severity)}<br>"
+        f"<strong>Priority:</strong> TBD by initiator<br>"
+        f"<strong>Failing TC:</strong> {_esc(failing_tc or 'n/a')}</p>"
+        f"<h2>Steps to reproduce</h2><ol>{steps_html}</ol>"
+        f"<h2>Actual</h2><p>{_esc(actual)}</p>"
+        f"<h2>Expected</h2><p>{_esc(expected)}</p>"
+        f"{env_html}{screenshots_html}{fix_html}"
+        f"<p>Affected sub-issue: <code>{_esc(affected_id_disp)}</code></p>"
+        f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
+    )
 
     async with await _client_for(ctx) as plane:
-        items = await plane.list_issues(ctx.config.project_id)
-        test_sub = next(
-            (
-                i
-                for i in items
-                if str(i.get("parent") or "") == root_uuid and test_label in (i.get("labels") or [])
-            ),
-            None,
-        )
-        if not test_sub:
-            raise TowerError(f"no sub-issue with artifact:{target} under root {root_uuid}")
-        affected_sub = next(
-            (
-                i
-                for i in items
-                if str(i.get("parent") or "") == root_uuid
-                and affected_label in (i.get("labels") or [])
-            ),
-            None,
-        )
-        # affected_sub may be None — still post the bug, just no back-link.
-
-        steps_html = "".join(f"<li>{_esc(s)}</li>" for s in repro_steps)
-        env_html = ""
-        if environment:
-            rows = "".join(
-                f"<li><strong>{_esc(k)}:</strong> {_esc(v)}</li>" for k, v in environment.items()
-            )
-            env_html = f"<h2>Environment</h2><ul>{rows}</ul>"
-        screenshots_html = ""
-        if screenshots:
-            shots = "".join(f'<li><a href="{_esc(u)}">{_esc(u)}</a></li>' for u in screenshots)
-            screenshots_html = f"<h2>Attachments</h2><ul>{shots}</ul>"
-        fix_html = f"<p><em>Fix hint:</em> {_esc(fix_hint)}</p>" if fix_hint else ""
-
-        affected_id_disp = str(affected_sub.get("id")) if affected_sub else "?"
-        comment_html = (
-            f"<h1>Bug ({_esc(severity)}): {_esc(title)}</h1>"
-            f"<p><strong>Severity:</strong> {_esc(severity)}<br>"
-            f"<strong>Priority:</strong> TBD by initiator<br>"
-            f"<strong>Failing TC:</strong> {_esc(failing_tc or 'n/a')}</p>"
-            f"<h2>Steps to reproduce</h2><ol>{steps_html}</ol>"
-            f"<h2>Actual</h2><p>{_esc(actual)}</p>"
-            f"<h2>Expected</h2><p>{_esc(expected)}</p>"
-            f"{env_html}{screenshots_html}{fix_html}"
-            f"<p>Affected sub-issue: <code>{_esc(affected_id_disp)}</code></p>"
-            f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
-        )
         comment = await plane.create_issue_comment(
-            ctx.config.project_id, str(test_sub.get("id")), comment_html
+            ctx.config.project_id, test_sub_uuid, comment_html
         )
-
         # Back-link: a work-item link from the affected sub to the bug comment.
-        if affected_sub:
+        if affected_sub_uuid:
             try:
                 link_url = (
                     f"{ctx.config.plane_base_url}/{ctx.config.workspace_slug}/"
                     f"projects/{ctx.config.project_id}/issues/"
-                    f"{test_sub.get('id')}/#comment-{comment.get('id')}"
+                    f"{test_sub_uuid}/#comment-{comment.get('id')}"
                 )
                 await plane.create_issue_link(
                     ctx.config.project_id,
-                    str(affected_sub.get("id")),
+                    affected_sub_uuid,
                     url=link_url,
                     title=f"[{severity}] {title}",
                 )
@@ -1425,8 +1378,8 @@ async def post_bug_report(
 
     return {
         "comment_id": comment.get("id"),
-        "test_sub_uuid": str(test_sub.get("id")),
-        "affected_sub_uuid": str(affected_sub.get("id")) if affected_sub else None,
+        "test_sub_uuid": test_sub_uuid,
+        "affected_sub_uuid": affected_sub_uuid,
         "severity": severity,
     }
 
