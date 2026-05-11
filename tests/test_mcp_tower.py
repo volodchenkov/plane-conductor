@@ -1354,11 +1354,12 @@ async def test_read_artifact_html_format_returns_raw(
 
 
 @respx.mock
-async def test_read_artifact_comments_default_last_20_newest_first(
+async def test_read_artifact_comments_default_last_5_newest_first(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
-    """Comments come back newest-first; default limit=20 picks the last 20,
-    which is the slice an agent needs for verdict / clarification detection."""
+    """Comments come back newest-first; default limit=5 picks the last 5,
+    which is the re-entry slice — older comments are heartbeat noise that
+    agents don't need to scan linearly (structured tools handle history)."""
     from plane_conductor.mcp_tower import read_artifact
 
     comments = [
@@ -1375,13 +1376,12 @@ async def test_read_artifact_comments_default_last_20_newest_first(
     result = await read_artifact(SPEC_SUB_UUID, workspace=ctx.config.workspace_slug)
 
     assert result["total_comments"] == 25
-    assert result["comments_returned"] == 20
+    assert result["comments_returned"] == 5
     assert result["comments_offset"] == 0
     assert result["has_more_comments"] is True
     assert result["comments_order"] == "desc"
-    # Newest first → c24, c23, ..., c5
-    assert result["comments"][0]["id"] == "c24"
-    assert result["comments"][-1]["id"] == "c5"
+    # Newest first → c24, c23, c22, c21, c20
+    assert [c["id"] for c in result["comments"]] == ["c24", "c23", "c22", "c21", "c20"]
 
 
 @respx.mock
@@ -1454,3 +1454,98 @@ async def test_read_artifact_rejects_negative_pagination(
 
     with pytest.raises(TowerError, match="non-negative"):
         await read_artifact(SPEC_SUB_UUID, comments_offset=-1, workspace=ctx.config.workspace_slug)
+
+
+# ---------------------------------------------------------------------------
+# description size feedback (soft limit signal)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_update_sub_issue_description_reports_size_under_limit(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Author sees size on every write — small body, no warning."""
+    from plane_conductor.mcp_tower import (
+        DESCRIPTION_SOFT_LIMIT_CHARS,
+        update_sub_issue_description,
+    )
+
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.patch(f"{base}/issues/{SPEC_SUB_UUID}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": SPEC_SUB_UUID,
+                "sequence_id": 38,
+                "name": "SPEC",
+                "parent": ROOT_UUID,
+                "labels": [LABEL_SPEC],
+                "state": "in-progress",
+            },
+        )
+    )
+
+    result = await update_sub_issue_description(
+        SPEC_SUB_UUID,
+        "<p>short body</p>",
+        workspace=ctx.config.workspace_slug,
+    )
+
+    assert result["description_size_chars"] == len("short body")
+    assert result["description_soft_limit_chars"] == DESCRIPTION_SOFT_LIMIT_CHARS
+    assert result["description_size_warning"] is False
+
+
+@respx.mock
+async def test_update_sub_issue_description_warns_over_soft_limit(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """The conciseness signal: write past soft cap → flag flips. Tower does not
+    reject — the author still gets to write, but every subsequent read also
+    surfaces the warning so it cannot be missed."""
+    from plane_conductor.mcp_tower import (
+        DESCRIPTION_SOFT_LIMIT_CHARS,
+        update_sub_issue_description,
+    )
+
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.patch(f"{base}/issues/{SPEC_SUB_UUID}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": SPEC_SUB_UUID,
+                "sequence_id": 38,
+                "name": "SPEC",
+                "parent": ROOT_UUID,
+                "labels": [LABEL_SPEC],
+                "state": "in-progress",
+            },
+        )
+    )
+
+    fat = "<p>" + ("x" * (DESCRIPTION_SOFT_LIMIT_CHARS + 100)) + "</p>"
+    result = await update_sub_issue_description(
+        SPEC_SUB_UUID, fat, workspace=ctx.config.workspace_slug
+    )
+
+    assert result["description_size_chars"] > DESCRIPTION_SOFT_LIMIT_CHARS
+    assert result["description_size_warning"] is True
+
+
+@respx.mock
+async def test_read_artifact_surfaces_size_warning(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Read path carries the same signal — reviewer / architect sees a
+    bloated SPEC's size on every read, not only at write time."""
+    from plane_conductor.mcp_tower import DESCRIPTION_SOFT_LIMIT_CHARS, read_artifact
+
+    fat_html = "<p>" + ("x" * (DESCRIPTION_SOFT_LIMIT_CHARS + 100)) + "</p>"
+    _read_artifact_setup(ctx, project_id, description_html=fat_html, comments=[])
+
+    result = await read_artifact(SPEC_SUB_UUID, workspace=ctx.config.workspace_slug)
+
+    assert result["description_size_chars"] > DESCRIPTION_SOFT_LIMIT_CHARS
+    assert result["description_soft_limit_chars"] == DESCRIPTION_SOFT_LIMIT_CHARS
+    assert result["description_size_warning"] is True
