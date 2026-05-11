@@ -1328,6 +1328,10 @@ async def test_read_artifact_default_returns_markdown(
     assert "**bold**" in result["description"]
     assert "<" not in result["description"]
     assert result["description_size_chars"] == len(result["description"])
+    # No pagination requested → whole document, no more chunks.
+    assert result["description_offset"] == 0
+    assert result["description_returned_chars"] == len(result["description"])
+    assert result["description_has_more"] is False
     # Old key removed — callers must adapt; document the breaking change.
     assert "description_html" not in result
 
@@ -1454,6 +1458,99 @@ async def test_read_artifact_rejects_negative_pagination(
 
     with pytest.raises(TowerError, match="non-negative"):
         await read_artifact(SPEC_SUB_UUID, comments_offset=-1, workspace=ctx.config.workspace_slug)
+
+
+@respx.mock
+async def test_read_artifact_description_limit_returns_head_chunk(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """`description_limit` slices the rendered Markdown by chars. `has_more`
+    fires when the cap is below the full size — this is the walk-a-huge-SPEC
+    escape hatch."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    # html_to_markdown of <p>xxxx…</p> strips the tags, leaving the body chars.
+    body = "x" * 300
+    _read_artifact_setup(ctx, project_id, description_html=f"<p>{body}</p>", comments=[])
+
+    result = await read_artifact(
+        SPEC_SUB_UUID, description_limit=100, workspace=ctx.config.workspace_slug
+    )
+
+    assert result["description_size_chars"] == 300
+    assert result["description_offset"] == 0
+    assert result["description_returned_chars"] == 100
+    assert result["description"] == "x" * 100
+    assert result["description_has_more"] is True
+
+
+@respx.mock
+async def test_read_artifact_description_offset_walks_to_eof(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Caller bumps offset by `description_returned_chars` and re-calls until
+    `description_has_more` is False — that's the documented walk pattern."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    body = "x" * 300
+    _read_artifact_setup(ctx, project_id, description_html=f"<p>{body}</p>", comments=[])
+
+    chunks: list[str] = []
+    offset = 0
+    while True:
+        result = await read_artifact(
+            SPEC_SUB_UUID,
+            description_offset=offset,
+            description_limit=100,
+            workspace=ctx.config.workspace_slug,
+        )
+        chunks.append(result["description"])
+        if not result["description_has_more"]:
+            break
+        offset += result["description_returned_chars"]
+        assert len(chunks) < 10, "loop should terminate well before 10 iters"
+
+    assert "".join(chunks) == "x" * 300
+    assert offset + len(chunks[-1]) == 300
+
+
+@respx.mock
+async def test_read_artifact_description_offset_past_end_returns_empty(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Offset beyond document size → empty string, `has_more=False`. The
+    caller's loop already exits before this, but the tool must not raise."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    _read_artifact_setup(ctx, project_id, description_html="<p>short</p>", comments=[])
+
+    result = await read_artifact(
+        SPEC_SUB_UUID,
+        description_offset=10_000,
+        workspace=ctx.config.workspace_slug,
+    )
+
+    assert result["description"] == ""
+    assert result["description_returned_chars"] == 0
+    assert result["description_has_more"] is False
+    # Full size is still reported — it's the document size, not the slice size.
+    assert result["description_size_chars"] == len("short")
+
+
+@respx.mock
+async def test_read_artifact_rejects_negative_description_pagination(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    from plane_conductor.mcp_tower import read_artifact
+
+    with pytest.raises(TowerError, match="description_offset"):
+        await read_artifact(
+            SPEC_SUB_UUID, description_offset=-1, workspace=ctx.config.workspace_slug
+        )
+    with pytest.raises(TowerError, match="description_limit"):
+        await read_artifact(
+            SPEC_SUB_UUID, description_limit=-1, workspace=ctx.config.workspace_slug
+        )
 
 
 # ---------------------------------------------------------------------------

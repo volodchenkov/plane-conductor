@@ -798,6 +798,8 @@ async def read_artifact(
     sub_uuid: str,
     *,
     description_format: str = "markdown",
+    description_offset: int = 0,
+    description_limit: int | None = None,
     comments_limit: int = 5,
     comments_offset: int = 0,
     workspace: str | None = None,
@@ -812,6 +814,18 @@ async def read_artifact(
         Risk: a bloated SPEC's HTML can exceed Claude Code's MCP tool-result
         token cap and silently hang the agent.
 
+    Description pagination (`description_offset` / `description_limit`):
+      Slice of the (Markdown- or HTML-) rendered description in CHARACTERS,
+      counted on the converted body — i.e. align with `description_size_chars`,
+      not with the raw HTML. Default `description_limit=None` returns the
+      whole document (back-compat with pre-pagination callers). When a SPEC
+      exceeds the soft cap (`description_size_warning=True`) the caller can
+      walk it in chunks: pass `description_limit=40_000`, then re-call with
+      `description_offset += description_returned_chars` while
+      `description_has_more` is `True`. Chunk boundaries are NOT structural —
+      a chunk can split a heading/table mid-line; that is the caller's
+      problem to reassemble.
+
     Comments are returned newest-first (`comments_order='desc'`), sliced
     `[comments_offset : comments_offset + comments_limit]`. `comments_limit=0`
     means «no comments»; pass a large number to fetch all. The default of
@@ -823,7 +837,9 @@ async def read_artifact(
 
     Response carries `total_comments`, `comments_returned`, `comments_offset`,
     `has_more_comments` so the caller can decide whether to page back, plus
-    `description_size_chars` / `description_soft_limit_chars` /
+    `description_size_chars` (full size of the rendered description, NOT the
+    returned slice), `description_offset`, `description_returned_chars`,
+    `description_has_more`, `description_soft_limit_chars`,
     `description_size_warning` (cf. `DESCRIPTION_SOFT_LIMIT_CHARS`) — the
     same conciseness signal `update_sub_issue_description` returns.
     """
@@ -833,6 +849,10 @@ async def read_artifact(
         )
     if comments_limit < 0 or comments_offset < 0:
         raise TowerError("comments_limit and comments_offset must be non-negative")
+    if description_offset < 0:
+        raise TowerError("description_offset must be non-negative")
+    if description_limit is not None and description_limit < 0:
+        raise TowerError("description_limit must be non-negative or None")
 
     ctx = _registry().resolve(workspace=workspace)
     sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
@@ -844,9 +864,16 @@ async def read_artifact(
 
     raw_description = sub.get("description_html") or ""
     if description_format == "markdown":
-        description = html_to_markdown(raw_description)
+        full_description = html_to_markdown(raw_description)
     else:
-        description = raw_description
+        full_description = raw_description
+
+    desc_size = len(full_description)
+    if description_limit is None:
+        description = full_description[description_offset:]
+    else:
+        description = full_description[description_offset : description_offset + description_limit]
+    description_has_more = description_offset + len(description) < desc_size
 
     comments_sorted = sorted(comments, key=lambda c: c.get("created_at") or "", reverse=True)
     total = len(comments_sorted)
@@ -857,13 +884,15 @@ async def read_artifact(
         raw = c.get("comment_html") or ""
         return html_to_markdown(raw) if description_format == "markdown" else raw
 
-    desc_size = len(description)
     return {
         "id": sub.get("id"),
         "name": sub.get("name"),
         "description": description,
         "description_format": description_format,
         "description_size_chars": desc_size,
+        "description_offset": description_offset,
+        "description_returned_chars": len(description),
+        "description_has_more": description_has_more,
         "description_soft_limit_chars": DESCRIPTION_SOFT_LIMIT_CHARS,
         "description_size_warning": desc_size > DESCRIPTION_SOFT_LIMIT_CHARS,
         "labels": sub.get("labels") or [],
