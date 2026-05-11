@@ -336,8 +336,18 @@ class PlaneClient:
         seen_cursors: set[str] = set()
         while True:
             payload = await self._request("GET", path, params=params)
-            out.extend(self._results(payload))
+            page = self._results(payload)
+            out.extend(page)
             if not isinstance(payload, dict):
+                break
+            # Plane v1 returns a fresh-looking `next_cursor` on every page —
+            # even after the last row, where it keeps incrementing
+            # (`100:1:0` → `100:2:0` → `100:3:0` …) without ever flagging
+            # EOF. The natural EOF signal is an empty page: stop paginating
+            # the moment the server returns zero rows. The `seen_cursors`
+            # check is kept only as a belt-and-braces guard against a real
+            # cursor cycle (some Plane builds have repeated the same cursor).
+            if not page:
                 break
             cursor = payload.get("next_cursor") or payload.get("next")
             if not cursor or not isinstance(cursor, str) or cursor in seen_cursors:
