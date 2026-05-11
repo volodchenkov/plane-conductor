@@ -101,6 +101,13 @@ ARTIFACT_LABEL_BY_ROLE: dict[str, str] = {
 
 PIPELINE_DOC_ONLY_LABEL = "pipeline:doc-only"
 
+# Soft cap on artifact description size (Markdown chars after HTML-strip). Tower
+# does not reject above this — it just stamps `description_size_warning: True`
+# on every read / write so the author sees the cost. Chosen well below the
+# observed MCP tool-result token cap so there's headroom for the comment
+# slice that read_artifact returns alongside the description.
+DESCRIPTION_SOFT_LIMIT_CHARS = 50_000
+
 
 @dataclass
 class WorkspaceContext:
@@ -791,7 +798,7 @@ async def read_artifact(
     sub_uuid: str,
     *,
     description_format: str = "markdown",
-    comments_limit: int = 20,
+    comments_limit: int = 5,
     comments_offset: int = 0,
     workspace: str | None = None,
 ) -> dict[str, Any]:
@@ -807,12 +814,18 @@ async def read_artifact(
 
     Comments are returned newest-first (`comments_order='desc'`), sliced
     `[comments_offset : comments_offset + comments_limit]`. `comments_limit=0`
-    means «no comments»; pass a large number to fetch all. Defaults give the
-    20 most recent — the relevant slice for re-entry / verdict / clarification
-    detection. Older comments are paginated by bumping `comments_offset`.
+    means «no comments»; pass a large number to fetch all. The default of
+    5 is sized for re-entry / latest-verdict detection — most pipeline comment
+    history is heartbeat noise («@nick picking up», «exited 143»). Agents
+    that need older context paginate via `comments_offset`; agents that need
+    structured verdict parsing should use the dedicated tools (`mark_spec_approved`,
+    `post_review`'s prior-comment scan) which already filter internally.
 
     Response carries `total_comments`, `comments_returned`, `comments_offset`,
-    `has_more_comments` so the caller can decide whether to page back.
+    `has_more_comments` so the caller can decide whether to page back, plus
+    `description_size_chars` / `description_soft_limit_chars` /
+    `description_size_warning` (cf. `DESCRIPTION_SOFT_LIMIT_CHARS`) — the
+    same conciseness signal `update_sub_issue_description` returns.
     """
     if description_format not in {"markdown", "html"}:
         raise TowerError(
@@ -844,12 +857,15 @@ async def read_artifact(
         raw = c.get("comment_html") or ""
         return html_to_markdown(raw) if description_format == "markdown" else raw
 
+    desc_size = len(description)
     return {
         "id": sub.get("id"),
         "name": sub.get("name"),
         "description": description,
         "description_format": description_format,
-        "description_size_chars": len(description),
+        "description_size_chars": desc_size,
+        "description_soft_limit_chars": DESCRIPTION_SOFT_LIMIT_CHARS,
+        "description_size_warning": desc_size > DESCRIPTION_SOFT_LIMIT_CHARS,
         "labels": sub.get("labels") or [],
         "state": sub.get("state"),
         "updated_at": sub.get("updated_at"),
@@ -881,7 +897,14 @@ async def update_sub_issue_description(
     *,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Replace the sub-issue's `description_html`. Used for re-entry / rework."""
+    """Replace the sub-issue's `description_html`. Used for re-entry / rework.
+
+    Response includes `description_size_chars` (after Markdown stripping) and
+    `description_size_warning: True` when the new body crosses
+    `DESCRIPTION_SOFT_LIMIT_CHARS` — the author sees the cost on every write
+    and can apply the conciseness rules from artifact-templates (revisions
+    in place, ADR-thin, reference-don't-quote, soft section budget).
+    """
     ctx = _registry().resolve(workspace=workspace)
     sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
     async with await _client_for(ctx) as plane:
@@ -890,7 +913,12 @@ async def update_sub_issue_description(
             sub_uuid,
             {"description_html": description_html},
         )
-    return _summarize_issue(updated)
+    md_size = len(html_to_markdown(description_html))
+    summary = _summarize_issue(updated)
+    summary["description_size_chars"] = md_size
+    summary["description_soft_limit_chars"] = DESCRIPTION_SOFT_LIMIT_CHARS
+    summary["description_size_warning"] = md_size > DESCRIPTION_SOFT_LIMIT_CHARS
+    return summary
 
 
 # ----- post_review (architect + reviewer) ----------------------------------
