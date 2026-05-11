@@ -387,26 +387,12 @@ def _ensure_uuid(value: str | UUID, name: str) -> str:
         raise TowerError(f"{name} is not a valid UUID: {value!r}") from exc
 
 
-# One PlaneClient per workspace, keyed by slug, kept alive for the lifetime of
-# the tower process. Each MCP tool used to create + close a fresh client per
-# call → 30+ TCP/TLS handshakes per agent run to the same Plane endpoint.
-# Reusing one client per workspace reuses httpx's keep-alive pool. Tower is a
-# long-lived process (per agent spawn), so the client lifetime matches.
-_SHARED_CLIENTS: dict[str, PlaneClient] = {}
-
-
 async def _client_for(ctx: WorkspaceContext) -> PlaneClient:
-    slug = ctx.config.workspace_slug
-    client = _SHARED_CLIENTS.get(slug)
-    if client is None:
-        client = PlaneClient(
-            ctx.config.plane_base_url,
-            ctx.config.plane_api_key,
-            slug,
-            shared=True,
-        )
-        _SHARED_CLIENTS[slug] = client
-    return client
+    return PlaneClient(
+        ctx.config.plane_base_url,
+        ctx.config.plane_api_key,
+        ctx.config.workspace_slug,
+    )
 
 
 # ---------------------------------------------------------------------------
