@@ -1161,9 +1161,7 @@ async def test_list_comments_rejects_negative_pagination(
     registry: TowerRegistry, ctx: WorkspaceContext
 ) -> None:
     with pytest.raises(TowerError, match="non-negative"):
-        await list_comments(
-            sub_uuid=SPEC_SUB_UUID, offset=-1, workspace=ctx.config.workspace_slug
-        )
+        await list_comments(sub_uuid=SPEC_SUB_UUID, offset=-1, workspace=ctx.config.workspace_slug)
 
 
 # ---------------------------------------------------------------------------

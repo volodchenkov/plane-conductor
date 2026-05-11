@@ -425,8 +425,7 @@ _REGISTRY: TowerRegistry | None = None
 # call was in-flight at the time of a hang.
 if os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", "on"}:
     _log_path = (
-        Path(os.environ.get("LOG_DIR", "/var/log/plane-conductor"))
-        / f"tower-{os.getpid()}.jsonl"
+        Path(os.environ.get("LOG_DIR", "/var/log/plane-conductor")) / f"tower-{os.getpid()}.jsonl"
     )
     _log_path.parent.mkdir(parents=True, exist_ok=True)
     _log_fh = open(_log_path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115  (long-lived handle for process lifetime)
@@ -457,9 +456,7 @@ if os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", 
                     )
                     raise
                 size = (
-                    len(json.dumps(result, default=str))
-                    if isinstance(result, dict | list)
-                    else 0
+                    len(json.dumps(result, default=str)) if isinstance(result, dict | list) else 0
                 )
                 _emit(
                     event="end",
@@ -1220,8 +1217,7 @@ async def post_changes(
             raise TowerError("ready_for_review=True requires non-empty verification")
         if target == "backend":
             touches_api = any(
-                re.search(r"(views|serializers|schemas)\.py$", path)
-                for path, _ in (files or [])
+                re.search(r"(views|serializers|schemas)\.py$", path) for path, _ in (files or [])
             )
             if touches_api:
                 has_openapi = any(
