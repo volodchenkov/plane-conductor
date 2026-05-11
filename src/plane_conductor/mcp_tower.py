@@ -15,10 +15,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -399,6 +402,64 @@ async def _client_for(ctx: WorkspaceContext) -> PlaneClient:
 
 mcp = FastMCP("plane-tower")
 _REGISTRY: TowerRegistry | None = None
+
+
+# Call log: one JSON line per tool invocation, written to
+# $LOG_DIR/tower-<pid>.jsonl. Enabled by env `TOWER_CALL_LOG=1`. Off by
+# default. Used to diagnose «agent silently hung» — claude --print discards
+# child MCP server stderr, so without a sidecar log we can't tell which tool
+# call was in-flight at the time of a hang.
+if os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", "on"}:
+    _log_path = (
+        Path(os.environ.get("LOG_DIR", "/var/log/plane-conductor"))
+        / f"tower-{os.getpid()}.jsonl"
+    )
+    _log_path.parent.mkdir(parents=True, exist_ok=True)
+    _log_fh = open(_log_path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115  (long-lived handle for process lifetime)
+
+    def _emit(**event: Any) -> None:
+        with contextlib.suppress(Exception):
+            _log_fh.write(json.dumps(event, default=str) + "\n")
+
+    _orig_tool = mcp.tool
+
+    def _logged_tool(*a: Any, **kw: Any) -> Any:
+        register = _orig_tool(*a, **kw)
+
+        def wrap(fn: Any) -> Any:
+            @wraps(fn)
+            async def inner(*args: Any, **kwargs: Any) -> Any:
+                t0 = time.monotonic()
+                _emit(event="start", tool=fn.__name__, args=sorted(kwargs))
+                try:
+                    result = await fn(*args, **kwargs)
+                except Exception as exc:
+                    _emit(
+                        event="error",
+                        tool=fn.__name__,
+                        ms=int((time.monotonic() - t0) * 1000),
+                        exc=type(exc).__name__,
+                        msg=str(exc)[:300],
+                    )
+                    raise
+                size = (
+                    len(json.dumps(result, default=str))
+                    if isinstance(result, dict | list)
+                    else 0
+                )
+                _emit(
+                    event="end",
+                    tool=fn.__name__,
+                    ms=int((time.monotonic() - t0) * 1000),
+                    size=size,
+                )
+                return result
+
+            return register(inner)
+
+        return wrap
+
+    mcp.tool = _logged_tool  # type: ignore[method-assign]
 
 
 def _registry() -> TowerRegistry:
