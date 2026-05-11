@@ -1239,3 +1239,218 @@ async def test_post_changes_with_next_role_stamps_mention(
     )
     assert GEM_MEMBER in captured["body"]
     assert str(ctx_with_all_members.config.initiator_uuid) in captured["body"]
+
+
+# ---------------------------------------------------------------------------
+# read_artifact + html_to_markdown
+# ---------------------------------------------------------------------------
+
+
+def test_html_to_markdown_strips_to_compact_text() -> None:
+    """Plane editor HTML has class/style noise on every tag — the markdown
+    output should drop the markup but keep heading/list/emphasis structure,
+    so the agent's reasoning pass still sees the document outline."""
+    from plane_conductor.mcp_tower import html_to_markdown
+
+    html_input = (
+        '<h2 class="x" style="margin:0">Phase 1</h2>'
+        '<p class="x">Scope: <strong>customers-app</strong> with '
+        '<a href="https://example.io">spec</a>.</p>'
+        '<ul class="x"><li>Item one</li><li>Item two</li></ul>'
+        "<pre><code>def f(): pass</code></pre>"
+    )
+    md = html_to_markdown(html_input)
+
+    assert "## Phase 1" in md
+    assert "**customers-app**" in md
+    assert "[spec](https://example.io)" in md
+    assert "- Item one" in md
+    assert "- Item two" in md
+    assert "```\ndef f(): pass\n```" in md
+    # No stray HTML tags or attributes
+    assert "<" not in md and "class=" not in md and "style=" not in md
+    # Markdown is materially smaller than the input
+    assert len(md) < len(html_input)
+
+
+def test_html_to_markdown_empty_input() -> None:
+    from plane_conductor.mcp_tower import html_to_markdown
+
+    assert html_to_markdown("") == ""
+    assert html_to_markdown(None) == ""  # type: ignore[arg-type]
+
+
+def _read_artifact_setup(
+    ctx: WorkspaceContext,
+    project_id: str,
+    *,
+    description_html: str,
+    comments: list[dict[str, Any]],
+) -> None:
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": SPEC_SUB_UUID,
+                "name": "SPEC sub",
+                "description_html": description_html,
+                "labels": [LABEL_SPEC],
+                "state": "in-progress",
+                "updated_at": "2026-05-10T00:00:00Z",
+            },
+        )
+    )
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(200, json={"results": comments})
+    )
+
+
+@respx.mock
+async def test_read_artifact_default_returns_markdown(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Default `description_format='markdown'` — agents read here, so the
+    big SPECs no longer blow the MCP tool-result token cap."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    _read_artifact_setup(
+        ctx,
+        project_id,
+        description_html="<h1>SPEC</h1><p>body with <strong>bold</strong></p>",
+        comments=[],
+    )
+
+    result = await read_artifact(SPEC_SUB_UUID, workspace=ctx.config.workspace_slug)
+
+    assert result["description_format"] == "markdown"
+    assert "# SPEC" in result["description"]
+    assert "**bold**" in result["description"]
+    assert "<" not in result["description"]
+    assert result["description_size_chars"] == len(result["description"])
+    # Old key removed — callers must adapt; document the breaking change.
+    assert "description_html" not in result
+
+
+@respx.mock
+async def test_read_artifact_html_format_returns_raw(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """`description_format='html'` is the escape hatch — full markup, for
+    callers that genuinely need the HTML (e.g. relaying it back to Plane)."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    raw = '<p class="x">verbatim</p>'
+    _read_artifact_setup(ctx, project_id, description_html=raw, comments=[])
+
+    result = await read_artifact(
+        SPEC_SUB_UUID,
+        description_format="html",
+        workspace=ctx.config.workspace_slug,
+    )
+
+    assert result["description_format"] == "html"
+    assert result["description"] == raw
+
+
+@respx.mock
+async def test_read_artifact_comments_default_last_20_newest_first(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Comments come back newest-first; default limit=20 picks the last 20,
+    which is the slice an agent needs for verdict / clarification detection."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    comments = [
+        {
+            "id": f"c{i}",
+            "comment_html": f"<p>n{i}</p>",
+            "created_at": f"2026-05-10T00:{i:02d}:00Z",
+            "created_by": "u1",
+        }
+        for i in range(25)
+    ]
+    _read_artifact_setup(ctx, project_id, description_html="", comments=comments)
+
+    result = await read_artifact(SPEC_SUB_UUID, workspace=ctx.config.workspace_slug)
+
+    assert result["total_comments"] == 25
+    assert result["comments_returned"] == 20
+    assert result["comments_offset"] == 0
+    assert result["has_more_comments"] is True
+    assert result["comments_order"] == "desc"
+    # Newest first → c24, c23, ..., c5
+    assert result["comments"][0]["id"] == "c24"
+    assert result["comments"][-1]["id"] == "c5"
+
+
+@respx.mock
+async def test_read_artifact_comments_offset_paginates_into_older(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """offset=20 with default limit=20 returns the next-older slice."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    comments = [
+        {
+            "id": f"c{i}",
+            "comment_html": f"<p>n{i}</p>",
+            "created_at": f"2026-05-10T00:{i:02d}:00Z",
+        }
+        for i in range(25)
+    ]
+    _read_artifact_setup(ctx, project_id, description_html="", comments=comments)
+
+    result = await read_artifact(
+        SPEC_SUB_UUID,
+        comments_offset=20,
+        workspace=ctx.config.workspace_slug,
+    )
+
+    assert result["comments_returned"] == 5
+    assert result["has_more_comments"] is False
+    # Oldest 5 in desc order → c4, c3, c2, c1, c0
+    assert [c["id"] for c in result["comments"]] == ["c4", "c3", "c2", "c1", "c0"]
+
+
+@respx.mock
+async def test_read_artifact_comments_limit_zero_returns_empty(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Reading just the description without paying for comments."""
+    from plane_conductor.mcp_tower import read_artifact
+
+    comments = [{"id": "c0", "comment_html": "<p>x</p>", "created_at": "2026-05-10T00:00:00Z"}]
+    _read_artifact_setup(ctx, project_id, description_html="<p>body</p>", comments=comments)
+
+    result = await read_artifact(
+        SPEC_SUB_UUID, comments_limit=0, workspace=ctx.config.workspace_slug
+    )
+
+    assert result["comments"] == []
+    assert result["total_comments"] == 1
+    assert result["has_more_comments"] is True
+
+
+@respx.mock
+async def test_read_artifact_rejects_bad_format(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    from plane_conductor.mcp_tower import read_artifact
+
+    with pytest.raises(TowerError, match="description_format"):
+        await read_artifact(
+            SPEC_SUB_UUID,
+            description_format="plaintext",
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+@respx.mock
+async def test_read_artifact_rejects_negative_pagination(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    from plane_conductor.mcp_tower import read_artifact
+
+    with pytest.raises(TowerError, match="non-negative"):
+        await read_artifact(SPEC_SUB_UUID, comments_offset=-1, workspace=ctx.config.workspace_slug)

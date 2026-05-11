@@ -723,14 +723,104 @@ def _role_display(role: str) -> str:
 
 # ----- read_artifact -------------------------------------------------------
 
+# Plane stores description/comments as `description_html` / `comment_html`. The
+# editor (BlockNote/TipTap) emits valid but markup-heavy HTML: every <p> carries
+# class/style attributes, lists are nested deep, etc. For a real SPEC this means
+# the raw HTML is roughly 30 % larger than the underlying text — and on a
+# 100 KB-class document that pushes the MCP tool-result over Claude Code's
+# token cap, which is the failure mode the next two helpers exist to defuse.
+
+_MD_HEADING_RE = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.IGNORECASE | re.DOTALL)
+_MD_BOLD_RE = re.compile(r"<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)>", re.IGNORECASE | re.DOTALL)
+_MD_EM_RE = re.compile(r"<(?:em|i)\b[^>]*>(.*?)</(?:em|i)>", re.IGNORECASE | re.DOTALL)
+_MD_PRE_RE = re.compile(
+    r"<pre\b[^>]*>\s*<code\b[^>]*>(.*?)</code>\s*</pre>", re.IGNORECASE | re.DOTALL
+)
+_MD_CODE_RE = re.compile(r"<code\b[^>]*>(.*?)</code>", re.IGNORECASE | re.DOTALL)
+_MD_LINK_RE = re.compile(r'<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+_MD_LI_RE = re.compile(r"<li\b[^>]*>(.*?)</li>", re.IGNORECASE | re.DOTALL)
+_MD_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_MD_BLOCK_END_RE = re.compile(
+    r"</(?:p|div|h[1-6]|li|tr|pre|blockquote|ul|ol|table|thead|tbody)>", re.IGNORECASE
+)
+_MD_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_inline_tags(s: str) -> str:
+    return _MD_STRIP_TAGS_RE.sub("", s).strip()
+
+
+def html_to_markdown(html_text: str) -> str:
+    """Convert Plane's editor HTML to a compact Markdown-ish string.
+
+    Goal is token reduction without losing structure: headings stay as `#`,
+    lists as `- `, code as fenced/inline, links as `[text](url)`, emphasis as
+    `**`/`*`. This is NOT a general-purpose HTML-to-Markdown — it is sized for
+    the subset Plane emits (BlockNote/TipTap output: p, h1-h6, strong/b, em/i,
+    code, pre>code, a, ul/ol/li, br, simple tables). Adequate fidelity for an
+    agent's reasoning pass.
+
+    Empty input returns "" (callers can rely on bool-checks).
+    """
+    if not html_text:
+        return ""
+    s = html_text
+    s = _MD_PRE_RE.sub(
+        lambda m: "\n```\n" + html.unescape(_strip_inline_tags(m.group(1))) + "\n```\n", s
+    )
+    s = _MD_CODE_RE.sub(lambda m: "`" + html.unescape(_strip_inline_tags(m.group(1))) + "`", s)
+    s = _MD_HEADING_RE.sub(
+        lambda m: "\n" + "#" * int(m.group(1)) + " " + _strip_inline_tags(m.group(2)) + "\n", s
+    )
+    s = _MD_BOLD_RE.sub(lambda m: "**" + _strip_inline_tags(m.group(1)) + "**", s)
+    s = _MD_EM_RE.sub(lambda m: "*" + _strip_inline_tags(m.group(1)) + "*", s)
+    s = _MD_LINK_RE.sub(lambda m: "[" + _strip_inline_tags(m.group(2)) + "](" + m.group(1) + ")", s)
+    s = _MD_LI_RE.sub(lambda m: "- " + _strip_inline_tags(m.group(1)) + "\n", s)
+    s = _MD_BR_RE.sub("\n", s)
+    s = _MD_BLOCK_END_RE.sub("\n", s)
+    s = _MD_STRIP_TAGS_RE.sub("", s)
+    s = html.unescape(s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n[ \t]+", "\n", s)
+    return s.strip()
+
 
 @mcp.tool()
 async def read_artifact(
     sub_uuid: str,
     *,
+    description_format: str = "markdown",
+    comments_limit: int = 20,
+    comments_offset: int = 0,
     workspace: str | None = None,
 ) -> dict[str, Any]:
-    """Return description + comments of a sub-issue."""
+    """Return a sub-issue's description + a slice of its comments.
+
+    `description_format`:
+      - `'markdown'` (default) — HTML stripped to Markdown; typically ~70 % of
+        the raw size. **This is what you want for reading SPEC/REQUIREMENTS/etc.**
+      - `'html'` — raw `description_html` from Plane, full markup. Only use if
+        you genuinely need the HTML (e.g. relaying it back into Plane verbatim).
+        Risk: a bloated SPEC's HTML can exceed Claude Code's MCP tool-result
+        token cap and silently hang the agent.
+
+    Comments are returned newest-first (`comments_order='desc'`), sliced
+    `[comments_offset : comments_offset + comments_limit]`. `comments_limit=0`
+    means «no comments»; pass a large number to fetch all. Defaults give the
+    20 most recent — the relevant slice for re-entry / verdict / clarification
+    detection. Older comments are paginated by bumping `comments_offset`.
+
+    Response carries `total_comments`, `comments_returned`, `comments_offset`,
+    `has_more_comments` so the caller can decide whether to page back.
+    """
+    if description_format not in {"markdown", "html"}:
+        raise TowerError(
+            f"description_format must be 'markdown' or 'html', got {description_format!r}"
+        )
+    if comments_limit < 0 or comments_offset < 0:
+        raise TowerError("comments_limit and comments_offset must be non-negative")
+
     ctx = _registry().resolve(workspace=workspace)
     sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
     async with await _client_for(ctx) as plane:
@@ -738,23 +828,46 @@ async def read_artifact(
             plane.get_issue(ctx.config.project_id, sub_uuid),
             plane.list_issue_comments(ctx.config.project_id, sub_uuid),
         )
+
+    raw_description = sub.get("description_html") or ""
+    if description_format == "markdown":
+        description = html_to_markdown(raw_description)
+    else:
+        description = raw_description
+
+    comments_sorted = sorted(comments, key=lambda c: c.get("created_at") or "", reverse=True)
+    total = len(comments_sorted)
+    sliced = comments_sorted[comments_offset : comments_offset + comments_limit]
+    has_more = comments_offset + len(sliced) < total
+
+    def _comment_text(c: dict[str, Any]) -> str:
+        raw = c.get("comment_html") or ""
+        return html_to_markdown(raw) if description_format == "markdown" else raw
+
     return {
         "id": sub.get("id"),
         "name": sub.get("name"),
-        "description_html": sub.get("description_html") or "",
+        "description": description,
+        "description_format": description_format,
+        "description_size_chars": len(description),
         "labels": sub.get("labels") or [],
         "state": sub.get("state"),
         "updated_at": sub.get("updated_at"),
         "comments": [
             {
                 "id": c.get("id"),
-                "comment_html": c.get("comment_html") or "",
+                "comment": _comment_text(c),
                 "actor": c.get("actor") or c.get("created_by"),
                 "created_at": c.get("created_at"),
                 "updated_at": c.get("updated_at"),
             }
-            for c in comments
+            for c in sliced
         ],
+        "comments_order": "desc",
+        "comments_offset": comments_offset,
+        "comments_returned": len(sliced),
+        "total_comments": total,
+        "has_more_comments": has_more,
     }
 
 
