@@ -212,6 +212,99 @@ async def test_list_issues_forwards_fields_on_pagination(client: PlaneClient) ->
 
 
 @respx.mock
+async def test_request_retries_on_429_with_retry_after(client: PlaneClient) -> None:
+    """429 with `Retry-After: N` must sleep N seconds and retry. Plane's
+    `ApiKeyRateThrottle` (DRF) emits a whole-second Retry-After header."""
+    slept: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+
+    client._sleep = fake_sleep  # type: ignore[method-assign]
+    responses = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "2"}, json={"error": "throttled"}),
+            httpx.Response(200, json={"results": [{"id": "ok"}]}),
+        ]
+    )
+    route = respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/projects/").mock(
+        side_effect=lambda req: next(responses)
+    )
+    items = await client.ping()
+    assert items == [{"id": "ok"}]
+    assert route.call_count == 2
+    assert slept == [2.0]
+    await client.aclose()
+
+
+@respx.mock
+async def test_request_retries_on_429_with_exponential_backoff(client: PlaneClient) -> None:
+    """No Retry-After → exponential backoff: backoff_base * 2**attempt
+    (1.0, 2.0, 4.0 with defaults)."""
+    slept: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+
+    client._sleep = fake_sleep  # type: ignore[method-assign]
+    responses = iter(
+        [
+            httpx.Response(429, json={}),
+            httpx.Response(429, json={}),
+            httpx.Response(200, json={"results": [{"id": "ok"}]}),
+        ]
+    )
+    route = respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/projects/").mock(
+        side_effect=lambda req: next(responses)
+    )
+    await client.ping()
+    assert route.call_count == 3
+    assert slept == [1.0, 2.0]
+    await client.aclose()
+
+
+@respx.mock
+async def test_request_raises_429_after_max_retries(client: PlaneClient) -> None:
+    """Persistent 429 past `max_retries` re-raises PlaneAPIError(429) — the
+    caller still gets the error, just with retries first."""
+
+    async def fake_sleep(d: float) -> None:
+        pass
+
+    client._sleep = fake_sleep  # type: ignore[method-assign]
+    route = respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/projects/").mock(
+        return_value=httpx.Response(429, json={"error": "throttled"})
+    )
+    with pytest.raises(PlaneAPIError) as exc_info:
+        await client.ping()
+    assert exc_info.value.status_code == 429
+    # default max_retries=3 → 1 initial + 3 retries = 4 calls
+    assert route.call_count == 4
+    await client.aclose()
+
+
+@respx.mock
+async def test_request_does_not_retry_non_429(client: PlaneClient) -> None:
+    """500 (or any non-429 4xx/5xx) must NOT be retried — those are not
+    rate-limit signals and silent retries could mask real bugs."""
+    slept: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+
+    client._sleep = fake_sleep  # type: ignore[method-assign]
+    route = respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/projects/").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    with pytest.raises(PlaneAPIError) as exc_info:
+        await client.ping()
+    assert exc_info.value.status_code == 500
+    assert route.call_count == 1
+    assert slept == []
+    await client.aclose()
+
+
+@respx.mock
 async def test_create_state_and_get_issue(client: PlaneClient) -> None:
     state_url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/states/"
     respx.post(state_url).mock(
