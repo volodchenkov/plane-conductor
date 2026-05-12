@@ -515,12 +515,58 @@ async def test_create_sub_issue_refuses_when_duplicate_exists(
     registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
 ) -> None:
     base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{ROOT_UUID}/").mock(
+        return_value=httpx.Response(
+            200, json={"id": ROOT_UUID, "name": "Add user dashboard", "sequence_id": 42}
+        )
+    )
     respx.get(f"{base}/issues/").mock(
         return_value=httpx.Response(
             200,
             json={
                 "results": [
                     {"id": SPEC_SUB_UUID, "parent": ROOT_UUID, "labels": [LABEL_SPEC]},
+                ]
+            },
+        )
+    )
+    with pytest.raises(DuplicateSubIssueError, match="already exists"):
+        await create_sub_issue(
+            role="spec",
+            root_uuid=ROOT_UUID,
+            workspace=ctx.config.workspace_slug,
+        )
+
+
+@respx.mock
+async def test_create_sub_issue_refuses_when_name_matches_even_without_label(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Second-layer defense: a sub-issue under the same root with the same
+    canonical title and empty `labels: []` still counts as a duplicate.
+
+    Models the COINEX-48 / COINEX-50 incident: two SPEC sub-issues were
+    created under the same root with `labels: []`, getting past the
+    label-only check. The name pattern always survives, so we use it as
+    a fallback.
+    """
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{ROOT_UUID}/").mock(
+        return_value=httpx.Response(
+            200, json={"id": ROOT_UUID, "name": "Add user dashboard", "sequence_id": 42}
+        )
+    )
+    respx.get(f"{base}/issues/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": SPEC_SUB_UUID,
+                        "parent": ROOT_UUID,
+                        "labels": [],
+                        "name": "SPEC: Add user dashboard (TEST-42)",
+                    },
                 ]
             },
         )

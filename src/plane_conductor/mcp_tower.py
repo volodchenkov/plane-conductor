@@ -696,23 +696,7 @@ async def create_sub_issue(
 
     lock = _create_lock_for(ctx.config.workspace_slug, root_uuid, role)
     async with lock, await _client_for(ctx) as plane:
-        # Pre-condition: no duplicate
-        items = await plane.list_issues(ctx.config.project_id)
-        existing = [
-            i
-            for i in items
-            if str(i.get("parent") or "") == root_uuid and label_uuid in (i.get("labels") or [])
-        ]
-        if existing:
-            uuids = [str(i.get("id")) for i in existing]
-            raise DuplicateSubIssueError(
-                f"workspace {ctx.config.workspace_slug!r}: a sub-issue with "
-                f"label artifact:{role} already exists under root {root_uuid} "
-                f"({uuids}). Use re-entry path: read the existing artifact and "
-                f"update its description, do not create a second one."
-            )
-
-        # Resolve root for title + name
+        # Resolve root for title + name (also used by the name-fallback check).
         root = await plane.get_issue(ctx.config.project_id, root_uuid)
         root_name = str(root.get("name") or "").strip()
         seq = root.get("sequence_id")
@@ -720,6 +704,31 @@ async def create_sub_issue(
             f"{ctx.project_identifier}-{seq}" if ctx.project_identifier and seq else f"{seq}"
         )
         title = f"{_role_display(role)}: {root_name} ({identifier})"
+
+        # Pre-condition: no duplicate. Two-layer check.
+        #   (1) label match — the intended invariant: a sub-issue carrying
+        #       artifact:<role> already exists under this root.
+        #   (2) name match — fallback for label-loss incidents (label dropped
+        #       by Plane after create, or stripped by a later workflow). We
+        #       observed in 2026-05 that two SPEC sub-issues (COINEX-48/50)
+        #       were created under the same root with empty `labels: []` after
+        #       a successful create — the cause was not pinned down, but the
+        #       name pattern always survives, so we use it as a second net.
+        items = await plane.list_issues(ctx.config.project_id)
+        existing = [
+            i
+            for i in items
+            if str(i.get("parent") or "") == root_uuid
+            and (label_uuid in (i.get("labels") or []) or str(i.get("name") or "").strip() == title)
+        ]
+        if existing:
+            uuids = [str(i.get("id")) for i in existing]
+            raise DuplicateSubIssueError(
+                f"workspace {ctx.config.workspace_slug!r}: a sub-issue for "
+                f"role {role!r} already exists under root {root_uuid} "
+                f"({uuids}). Use re-entry path: read the existing artifact "
+                f"and update its description, do not create a second one."
+            )
 
         # Resolve assignee (the bot for this role/nickname).
         assignees: list[str] = []
