@@ -79,6 +79,8 @@ def test_filters_and_limit(log_dir: Path) -> None:
     assert {r["nickname"] for r in mcp_server.recent_runs(nickname="sark")} == {"sark"}
     assert len(mcp_server.recent_runs(issue_prefix="9405d99a")) == 2
     assert len(mcp_server.recent_runs(limit=1)) == 1
+    assert mcp_server.recent_runs(limit=0) == []
+    assert mcp_server.recent_runs(limit=-5) == []
 
 
 def test_non_log_files_are_ignored(log_dir: Path) -> None:

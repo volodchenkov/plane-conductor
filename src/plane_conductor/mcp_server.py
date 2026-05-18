@@ -25,8 +25,7 @@ SENTINEL_SUBDIR = ".active"
 _DEFAULT_LOG_DIR = "/var/log/plane-conductor"
 _AGENT_SUMMARY_TAIL_BYTES = 64 * 1024
 _LOG_NAME_RE = re.compile(
-    r"^(?P<timestamp>\d{8}T\d{6}Z)-(?P<rest>.+)-(?P<issue_short>[0-9a-fA-F]{8})"
-    r"\.log(?:\.\d+)?$"
+    r"^(?P<timestamp>\d{8}T\d{6}Z)-(?P<rest>.+)-(?P<issue_short>[0-9a-fA-F]{8})" r"\.log(?:\.\d+)?$"
 )
 
 mcp = FastMCP("plane-conductor")
@@ -187,6 +186,8 @@ def recent_runs(
     the largest `size_bytes`, so an operator scanning history doesn't see a
     wall of zero-byte stubs hiding the real logs.
     """
+    if limit <= 0:
+        return []
     ld = _log_dir()
     if not ld.exists():
         return []

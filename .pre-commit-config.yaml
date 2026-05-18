@@ -14,5 +14,9 @@ repos:
           - pydantic-settings>=2.2
           - structlog>=24.1
           - types-PyYAML
+          - fastapi>=0.110
+          - typer>=0.12
+          - uvicorn>=0.27
+          - mcp>=1.0
         args: [--config-file=pyproject.toml]
         files: ^src/plane_conductor/
