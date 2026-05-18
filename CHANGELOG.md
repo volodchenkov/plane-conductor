@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`retrieve_work_item_by_identifier`** MCP tool on tower — resolves a
+  human-readable identifier (`<PROJECT_IDENTIFIER>-<N>`, e.g. `COINEX-72`) to
+  its full work-item record with UUID. Counterpart to `pickup_issue` for
+  interactive use when the operator has only the canonical identifier (from a
+  Plane browse URL or a comment) and no UUID. SDLC-pipeline agents continue
+  to use `pickup_issue` — they receive UUIDs via the spawn prompt.
+- `PlaneClient.retrieve_issue_by_sequence_id` — underlying lookup, walks
+  `list_issues` and short-circuits on first match (Plane v1 silently ignores
+  `?sequence_id=` as a query filter).
+
 ## [0.1.0] — 2026-05-03
 
 ### Added

@@ -512,6 +512,65 @@ async def pickup_issue(
 # ----- find_artifact_by_label / list_sub_issues ----------------------------
 
 
+_IDENTIFIER_RE = re.compile(r"^([A-Z][A-Z0-9]*)-(\d+)$")
+
+
+@mcp.tool()
+async def retrieve_work_item_by_identifier(
+    identifier: str,
+    *,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Resolve a human-readable identifier `<PROJECT_IDENTIFIER>-<N>` to its UUID.
+
+    Counterpart to `pickup_issue` for interactive use — when the operator
+    has only the canonical identifier (e.g. from a Plane browse URL or a
+    comment reference) and no UUID. SDLC-pipeline agents already receive
+    UUIDs via the spawn prompt and should keep using `pickup_issue`.
+
+    Args:
+      identifier: full identifier like `"COINEX-72"` (case-insensitive
+        prefix). Must match `^[A-Z][A-Z0-9]*-\\d+$`.
+      workspace: explicit workspace slug. Optional — when the identifier
+        prefix matches a registered `project_identifier`, the workspace is
+        auto-resolved.
+
+    Returns the same shape as `pickup_issue` plus a canonical
+    `identifier` field. Raises `ValueError` on a malformed identifier or
+    when no work item with that sequence exists in the resolved project.
+    """
+    cleaned = identifier.strip().upper()
+    m = _IDENTIFIER_RE.match(cleaned)
+    if not m:
+        raise ValueError(
+            f"identifier {identifier!r} must match '<PROJECT_IDENTIFIER>-<N>' (e.g. 'COINEX-72')"
+        )
+    project_identifier, seq_str = m.group(1), m.group(2)
+    sequence_id = int(seq_str)
+
+    ctx = _registry().resolve(workspace=workspace, project_identifier=project_identifier)
+    async with await _client_for(ctx) as plane:
+        issue = await plane.retrieve_issue_by_sequence_id(ctx.config.project_id, sequence_id)
+    if issue is None:
+        raise ValueError(
+            f"work item {cleaned} not found in workspace {ctx.config.workspace_slug!r}"
+        )
+    return {
+        "id": issue.get("id"),
+        "sequence_id": issue.get("sequence_id"),
+        "identifier": f"{ctx.project_identifier}-{issue.get('sequence_id')}",
+        "name": issue.get("name"),
+        "project_id": str(ctx.config.project_id),
+        "project_identifier": ctx.project_identifier,
+        "workspace_slug": ctx.config.workspace_slug,
+        "url": f"{ctx.config.plane_base_url}/{ctx.config.workspace_slug}/projects/"
+        f"{ctx.config.project_id}/issues/{issue.get('id')}/",
+        "parent": issue.get("parent"),
+        "labels": issue.get("labels") or [],
+        "state": issue.get("state"),
+    }
+
+
 @mcp.tool()
 async def find_artifact_by_label(
     role: str,

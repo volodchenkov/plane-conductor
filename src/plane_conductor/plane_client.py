@@ -358,6 +358,28 @@ class PlaneClient:
                 params["fields"] = fields
         return out
 
+    async def retrieve_issue_by_sequence_id(
+        self,
+        project_id: str | UUID,
+        sequence_id: int,
+        *,
+        fields: str | None = LIST_ISSUES_DEFAULT_FIELDS,
+    ) -> dict[str, Any] | None:
+        """Resolve a project-scoped sequence_id (the `<N>` in `<IDENT>-<N>`) to
+        the full work-item record. Returns `None` if no issue with that
+        sequence exists.
+
+        Plane v1 silently ignores `?sequence_id=` as a query filter (same
+        category as `?parent=`), so we walk pages via `list_issues` and
+        short-circuit on first match. Typical projects have ≤ a few hundred
+        issues — at most two paginated round-trips.
+        """
+        issues = await self.list_issues(project_id, fields=fields)
+        for issue in issues:
+            if issue.get("sequence_id") == sequence_id:
+                return issue
+        return None
+
     async def get_project(self, project_id: str | UUID) -> dict[str, Any]:
         """Fetch a single project (identifier, name, ...). Wrap the GET so the
         tower doesn't reach into `_request` directly."""
