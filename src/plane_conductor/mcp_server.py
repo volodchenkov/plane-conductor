@@ -25,7 +25,7 @@ SENTINEL_SUBDIR = ".active"
 _DEFAULT_LOG_DIR = "/var/log/plane-conductor"
 _AGENT_SUMMARY_TAIL_BYTES = 64 * 1024
 _LOG_NAME_RE = re.compile(
-    r"^(?P<timestamp>\d{8}T\d{6}Z)-(?P<rest>.+)-(?P<issue_short>[0-9a-fA-F]{8})\.log$"
+    r"^(?P<timestamp>\d{8}T\d{6}Z)-(?P<rest>.+)-(?P<issue_short>[0-9a-fA-F]{8})" r"\.log(?:\.\d+)?$"
 )
 
 mcp = FastMCP("plane-conductor")
@@ -179,13 +179,21 @@ def recent_runs(
     `issue_prefix` (matches first 8 chars of issue UUID). Sorted by
     timestamp descending. Returns metadata only — call `read_log` to fetch
     contents or `agent_summary` for the final stdout block.
+
+    Logrotate-aware: a single agent run can exist on disk as `*.log` (fresh
+    empty stub after rotation) plus one or more `*.log.N` siblings holding
+    the actual content. Each agent run is deduplicated to the variant with
+    the largest `size_bytes`, so an operator scanning history doesn't see a
+    wall of zero-byte stubs hiding the real logs.
     """
-    out: list[dict[str, Any]] = []
+    if limit <= 0:
+        return []
     ld = _log_dir()
     if not ld.exists():
         return []
     known = _known_workspace_slugs()
-    for f in sorted(ld.glob("*.log"), reverse=True):
+    by_base: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for f in ld.glob("*.log*"):
         meta = _parse_log_filename(f.name, known_slugs=known)
         if not meta:
             continue
@@ -199,17 +207,23 @@ def recent_runs(
             stat = f.stat()
         except OSError:
             continue
-        out.append(
-            {
-                **meta,
-                "path": str(f),
-                "size_bytes": stat.st_size,
-                "mtime": stat.st_mtime,
-            }
+        key = (
+            meta["timestamp"],
+            meta["workspace"],
+            meta["nickname"],
+            meta["issue_short"],
         )
-        if len(out) >= limit:
-            break
-    return out
+        candidate = {
+            **meta,
+            "path": str(f),
+            "size_bytes": stat.st_size,
+            "mtime": stat.st_mtime,
+        }
+        prev = by_base.get(key)
+        if prev is None or candidate["size_bytes"] > prev["size_bytes"]:
+            by_base[key] = candidate
+    out = sorted(by_base.values(), key=lambda r: r["timestamp"], reverse=True)
+    return out[:limit]
 
 
 @mcp.tool()
