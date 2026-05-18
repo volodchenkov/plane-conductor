@@ -212,6 +212,48 @@ async def test_list_issues_forwards_fields_on_pagination(client: PlaneClient) ->
 
 
 @respx.mock
+async def test_retrieve_issue_by_sequence_id_finds_match(client: PlaneClient) -> None:
+    """First-match short-circuit — the iteration stops as soon as the sequence_id
+    is found, but the underlying list_issues walks pages until then."""
+    url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/"
+    respx.get(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": "uuid-71", "sequence_id": 71, "name": "Other"},
+                    {"id": "uuid-72", "sequence_id": 72, "name": "Target"},
+                    {"id": "uuid-73", "sequence_id": 73, "name": "Newer"},
+                ],
+                "next_cursor": None,
+            },
+        )
+    )
+    issue = await client.retrieve_issue_by_sequence_id(PROJECT, 72)
+    assert issue is not None
+    assert issue["id"] == "uuid-72"
+    assert issue["name"] == "Target"
+    await client.aclose()
+
+
+@respx.mock
+async def test_retrieve_issue_by_sequence_id_returns_none_when_missing(
+    client: PlaneClient,
+) -> None:
+    """Caller-friendly contract: missing sequence_id yields None, not an exception."""
+    url = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/"
+    respx.get(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": [{"id": "uuid-1", "sequence_id": 1}], "next_cursor": None},
+        )
+    )
+    issue = await client.retrieve_issue_by_sequence_id(PROJECT, 9999)
+    assert issue is None
+    await client.aclose()
+
+
+@respx.mock
 async def test_request_retries_on_429_with_retry_after(client: PlaneClient) -> None:
     """429 with `Retry-After: N` must sleep N seconds and retry. Plane's
     `ApiKeyRateThrottle` (DRF) emits a whole-second Retry-After header."""

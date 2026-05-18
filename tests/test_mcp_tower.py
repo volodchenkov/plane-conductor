@@ -43,6 +43,7 @@ from plane_conductor.mcp_tower import (
     post_comment,
     post_review,
     request_handoff,
+    retrieve_work_item_by_identifier,
 )
 
 # ---------------------------------------------------------------------------
@@ -190,6 +191,99 @@ async def test_pickup_issue_by_uuid(
     assert result["sequence_id"] == 42
     assert result["workspace_slug"] == ctx.config.workspace_slug
     assert result["project_identifier"] == "TEST"
+
+
+# ---------------------------------------------------------------------------
+# retrieve_work_item_by_identifier
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_retrieve_work_item_by_identifier_happy_path(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """The canonical use case: operator types 'TEST-42', tower resolves
+    workspace via the project_identifier prefix and returns the full record."""
+    list_url = (
+        f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/"
+        f"projects/{project_id}/issues/"
+    )
+    respx.get(list_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": "uuid-41", "sequence_id": 41, "name": "Older"},
+                    {
+                        "id": ROOT_UUID,
+                        "sequence_id": 42,
+                        "name": "Add user dashboard",
+                        "parent": None,
+                        "labels": [],
+                        "state": "state-uuid",
+                    },
+                ],
+                "next_cursor": None,
+            },
+        )
+    )
+    result = await retrieve_work_item_by_identifier(identifier="TEST-42")
+    assert result["id"] == ROOT_UUID
+    assert result["sequence_id"] == 42
+    assert result["identifier"] == "TEST-42"
+    assert result["workspace_slug"] == ctx.config.workspace_slug
+    assert result["project_identifier"] == "TEST"
+
+
+@respx.mock
+async def test_retrieve_work_item_by_identifier_case_insensitive(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Operators paste identifiers from many sources — accept lowercase too."""
+    list_url = (
+        f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/"
+        f"projects/{project_id}/issues/"
+    )
+    respx.get(list_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": [{"id": ROOT_UUID, "sequence_id": 42}], "next_cursor": None},
+        )
+    )
+    result = await retrieve_work_item_by_identifier(identifier="test-42")
+    assert result["sequence_id"] == 42
+
+
+async def test_retrieve_work_item_by_identifier_malformed_raises(
+    registry: TowerRegistry,
+) -> None:
+    """Identifier shape is part of the contract — reject early with a clear message."""
+    with pytest.raises(ValueError, match="must match"):
+        await retrieve_work_item_by_identifier(identifier="not-an-identifier")
+    with pytest.raises(ValueError, match="must match"):
+        await retrieve_work_item_by_identifier(identifier="42")
+    with pytest.raises(ValueError, match="must match"):
+        await retrieve_work_item_by_identifier(identifier="TEST-")
+
+
+@respx.mock
+async def test_retrieve_work_item_by_identifier_not_found_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """When the prefix resolves but the sequence_id isn't in the project,
+    callers get a ValueError naming the identifier they asked for."""
+    list_url = (
+        f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/"
+        f"projects/{project_id}/issues/"
+    )
+    respx.get(list_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": [{"id": "uuid-1", "sequence_id": 1}], "next_cursor": None},
+        )
+    )
+    with pytest.raises(ValueError, match="TEST-999 not found"):
+        await retrieve_work_item_by_identifier(identifier="TEST-999")
 
 
 # ---------------------------------------------------------------------------
