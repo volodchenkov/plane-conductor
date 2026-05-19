@@ -20,8 +20,13 @@ RINZLER = "22222222-2222-2222-2222-222222222222"
 
 
 class StubPlane:
-    def __init__(self, members: dict[str, dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        members: dict[str, dict[str, Any]] | None = None,
+        comments: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.members = members or {}
+        self.comments = comments or []
 
     async def get_member(self, member_id: str) -> dict[str, Any]:
         key = str(member_id).lower()
@@ -30,6 +35,9 @@ class StubPlane:
 
             raise PlaneAPIError(404, f"missing {member_id}")
         return self.members[key]
+
+    async def list_issue_comments(self, project_id: Any, issue_id: Any) -> list[dict[str, Any]]:
+        return list(self.comments)
 
     async def aclose(self) -> None:
         pass
@@ -545,3 +553,176 @@ def test_webhook_skipped_on_4xx_plane_error(
     resp = _send(client, settings, workspace_config, _comment_body(SARK))
     assert resp.status_code == 200
     assert resp.json()["skipped"][0]["reason"] == "lookup failed"
+
+
+# --- auto-resume on initiator reply ------------------------------------------
+
+
+def _initiator_reply_body(initiator_uuid: UUID, issue: str | None = None) -> bytes:
+    """Plane webhook for an initiator's free-text reply (no mention component)."""
+    return json.dumps(
+        {
+            "event": "issue_comment",
+            "action": "created",
+            "data": {
+                "issue": issue or "44444444-4444-4444-4444-444444444444",
+                "actor": str(initiator_uuid),
+                "comment_html": "<p>ответы выше, продолжай</p>",
+            },
+        }
+    ).encode()
+
+
+def _agent_handoff_comment(
+    actor: str, initiator_uuid: UUID, created_at: str, text: str = "PLAN ready"
+) -> dict[str, Any]:
+    """Comment shaped like one produced by `request_handoff(target_role='initiator', …)`.
+    Initiator mention is auto-stamped by tower at the top of `comment_html`."""
+    return {
+        "actor": actor,
+        "created_at": created_at,
+        "comment_html": (
+            f'<mention-component entity_identifier="{initiator_uuid}" '
+            f'entity_name="user_mention"></mention-component> {text}'
+        ),
+    }
+
+
+def test_auto_resume_respawns_agent_when_initiator_replies(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    plane = StubPlane(
+        members={SARK: {"email": "sark@example.io"}},
+        comments=[
+            _agent_handoff_comment(SARK, initiator_uuid, "2026-05-18T20:43:00Z", "SPEC ready"),
+        ],
+    )
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["spawned"] == ["sark"]
+    assert body["auto_resumed"] == SARK
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["nickname"] == "sark"
+
+
+def test_auto_resume_picks_latest_agent_when_several_have_pinged(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """Multiple agents pinged the initiator at different times — the latest one
+    is the one currently waiting for input, so it's the one we re-spawn."""
+    plane = StubPlane(
+        members={
+            SARK: {"email": "sark@example.io"},
+            RINZLER: {"email": "rinzler@example.io"},
+        },
+        comments=[
+            _agent_handoff_comment(SARK, initiator_uuid, "2026-05-18T18:00:00Z"),
+            _agent_handoff_comment(RINZLER, initiator_uuid, "2026-05-18T20:43:00Z"),
+        ],
+    )
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+
+    assert resp.status_code == 200
+    assert resp.json()["spawned"] == ["rinzler"]
+
+
+def test_auto_resume_skips_when_no_agent_pinged_initiator(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """Initiator's first-ever comment on the issue (no prior agent activity)
+    must not trigger any spawn — there's no one to «resume»."""
+    plane = StubPlane(members={SARK: {"email": "sark@example.io"}}, comments=[])
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["spawned"] == []
+    assert "auto_resumed" not in body
+    assert runner.calls == []
+
+
+def test_auto_resume_skips_when_agent_comment_has_no_initiator_mention(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """An agent comment without the initiator-mention auto-stamp is treated
+    as «not awaiting input» — it's progress noise, not a handoff."""
+    plane = StubPlane(
+        members={SARK: {"email": "sark@example.io"}},
+        comments=[
+            {
+                "actor": SARK,
+                "created_at": "2026-05-18T20:43:00Z",
+                "comment_html": "<p>Step 3 done. ✅ pytest green.</p>",
+            }
+        ],
+    )
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+
+    assert resp.status_code == 200
+    assert resp.json()["spawned"] == []
+    assert runner.calls == []
+
+
+def test_auto_resume_skips_when_commenter_is_not_initiator(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """A no-mention comment from someone OTHER than the initiator must not
+    auto-resume — that's a teammate / lurker, not the awaited reply."""
+    stranger = "99999999-9999-9999-9999-999999999999"
+    plane = StubPlane(
+        members={SARK: {"email": "sark@example.io"}},
+        comments=[_agent_handoff_comment(SARK, initiator_uuid, "2026-05-18T20:43:00Z")],
+    )
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    body = json.dumps(
+        {
+            "event": "issue_comment",
+            "action": "created",
+            "data": {
+                "issue": "44444444-4444-4444-4444-444444444444",
+                "actor": stranger,
+                "comment_html": "<p>by the way…</p>",
+            },
+        }
+    ).encode()
+    resp = _send(client, settings, workspace_config, body)
+
+    assert resp.status_code == 200
+    assert resp.json()["spawned"] == []
+    assert runner.calls == []
+
+
+def test_auto_resume_skips_unregistered_agent(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """Agent member who pinged the initiator is no longer in the workspace
+    roster (e.g. removed mid-flight) — fail closed, don't spawn."""
+    ex_agent = "abababab-abab-abab-abab-abababababab"
+    plane = StubPlane(
+        members={ex_agent: {"email": "ex-agent@example.io"}},
+        comments=[_agent_handoff_comment(ex_agent, initiator_uuid, "2026-05-18T20:43:00Z")],
+    )
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+
+    assert resp.status_code == 200
+    assert resp.json()["spawned"] == []
+    assert runner.calls == []

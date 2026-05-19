@@ -97,6 +97,69 @@ def _is_nickname_allowed(
     return nickname in allow
 
 
+_INITIATOR_MENTION_PROBE_CHARS = 500
+
+
+async def _resolve_pending_agent_member(
+    plane: PlaneClient,
+    workspace: WorkspaceConfig,
+    initiator_uuid: UUID,
+    issue_uuid: UUID,
+    agents_by_nick: dict[str, Any],
+) -> UUID | None:
+    """Find the agent (if any) currently waiting on the initiator for `issue_uuid`.
+
+    Returns the member UUID of the latest agent whose most recent comment on
+    the issue opens with an initiator `<mention-component>` (the auto-stamp
+    written by tower's `request_handoff(target_role='initiator', …)`). That's
+    the structured «I'm awaiting your input» signal agents already emit
+    today, so we read it instead of inventing a new state-tracking surface.
+
+    Returns None when there's no such comment, when the comment author isn't
+    a registered agent for this workspace, or when any Plane lookup fails.
+    The caller treats a None as «no auto-resume, return the original no-op».
+    """
+    try:
+        comments = await plane.list_issue_comments(workspace.project_id, issue_uuid)
+    except PlaneAPIError as exc:
+        log.info(
+            "auto_resume_comments_lookup_failed",
+            workspace=workspace.workspace_slug,
+            issue=str(issue_uuid),
+            status=exc.status_code,
+        )
+        return None
+
+    initiator_str = str(initiator_uuid).lower()
+    comments_sorted = sorted(comments, key=lambda c: c.get("created_at", ""), reverse=True)
+    for comment in comments_sorted:
+        actor_raw = comment.get("actor")
+        if not actor_raw:
+            continue
+        actor_str = str(actor_raw).lower()
+        if actor_str == initiator_str:
+            continue
+        body = (comment.get("comment_html") or "")[:_INITIATOR_MENTION_PROBE_CHARS]
+        if initiator_str not in body.lower():
+            continue
+        try:
+            actor_uuid = UUID(actor_str)
+        except ValueError:
+            continue
+        try:
+            member = await plane.get_member(actor_uuid)
+        except PlaneAPIError:
+            continue
+        email = _email_of(member)
+        if not email:
+            continue
+        nickname = email.split("@", 1)[0].lower()
+        if not _is_nickname_allowed(nickname, workspace, agents_by_nick):
+            continue
+        return actor_uuid
+    return None
+
+
 def build_router(
     settings: Settings,
     workspaces: dict[str, tuple[WorkspaceConfig, PlaneClient]],
@@ -163,6 +226,32 @@ def _register_workspace_route(
             return {"ok": True, "workspace": slug, "ignored": "bad issue uuid"}
 
         mention_uuids = extract_mention_uuids(comment_html)
+        auto_resumed: str | None = None
+        if not mention_uuids:
+            actor_raw = data.get("actor")
+            if actor_raw is not None and str(actor_raw).lower() == str(initiator_uuid).lower():
+                # Initiator replied without an explicit @-mention. Plane's
+                # mention component is rejected by tower in outbound agent
+                # comments, so agents end runs via `request_handoff(
+                # target_role='initiator', …)` — which stamps the initiator
+                # mention at the top of the agent's last comment. Use that
+                # signal to identify which agent is waiting and respawn it.
+                resumed_member = await _resolve_pending_agent_member(
+                    plane=plane,
+                    workspace=workspace,
+                    initiator_uuid=initiator_uuid,
+                    issue_uuid=issue_uuid,
+                    agents_by_nick=agents_by_nick,
+                )
+                if resumed_member is not None:
+                    mention_uuids = [resumed_member]
+                    auto_resumed = str(resumed_member)
+                    log.info(
+                        "auto_resume_triggered",
+                        workspace=slug,
+                        issue=str(issue_uuid),
+                        member=auto_resumed,
+                    )
         if not mention_uuids:
             return {
                 "ok": True,
@@ -236,4 +325,12 @@ def _register_workspace_route(
                 log.error("spawn_failed", workspace=slug, nickname=nickname, error=str(exc))
                 skipped.append({"nickname": nickname, "reason": "spawn failed"})
 
-        return {"ok": True, "workspace": slug, "spawned": spawned, "skipped": skipped}
+        result: dict[str, Any] = {
+            "ok": True,
+            "workspace": slug,
+            "spawned": spawned,
+            "skipped": skipped,
+        }
+        if auto_resumed is not None:
+            result["auto_resumed"] = auto_resumed
+        return result
