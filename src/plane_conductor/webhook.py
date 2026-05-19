@@ -97,9 +97,6 @@ def _is_nickname_allowed(
     return nickname in allow
 
 
-_INITIATOR_MENTION_PROBE_CHARS = 500
-
-
 async def _resolve_pending_agent_member(
     plane: PlaneClient,
     workspace: WorkspaceConfig,
@@ -116,12 +113,18 @@ async def _resolve_pending_agent_member(
     today, so we read it instead of inventing a new state-tracking surface.
 
     Returns None when there's no such comment, when the comment author isn't
-    a registered agent for this workspace, or when any Plane lookup fails.
+    a registered agent for this workspace, or when a 4xx Plane lookup fails.
     The caller treats a None as «no auto-resume, return the original no-op».
+
+    **Transient (5xx) Plane errors re-raise** — webhook handler turns them
+    into a 503 so Plane retries the webhook delivery, same contract as the
+    mention-driven spawn path.
     """
     try:
         comments = await plane.list_issue_comments(workspace.project_id, issue_uuid)
     except PlaneAPIError as exc:
+        if exc.is_transient:
+            raise
         log.info(
             "auto_resume_comments_lookup_failed",
             workspace=workspace.workspace_slug,
@@ -130,17 +133,21 @@ async def _resolve_pending_agent_member(
         )
         return None
 
-    initiator_str = str(initiator_uuid).lower()
+    initiator_uuid_obj = initiator_uuid
     comments_sorted = sorted(comments, key=lambda c: c.get("created_at", ""), reverse=True)
     for comment in comments_sorted:
         actor_raw = comment.get("actor")
         if not actor_raw:
             continue
         actor_str = str(actor_raw).lower()
-        if actor_str == initiator_str:
+        if actor_str == str(initiator_uuid_obj).lower():
             continue
-        body = (comment.get("comment_html") or "")[:_INITIATOR_MENTION_PROBE_CHARS]
-        if initiator_str not in body.lower():
+        # Require the structured `<mention-component entity_identifier="<initiator>">`
+        # tag as the first mention in the body — NOT just a substring match on the
+        # raw UUID. The tag is what tower stamps on `request_handoff`; raw UUID text
+        # in someone's prose is conversational noise and must not trigger a resume.
+        mentions = extract_mention_uuids(comment.get("comment_html") or "")
+        if not mentions or mentions[0] != initiator_uuid_obj:
             continue
         try:
             actor_uuid = UUID(actor_str)
@@ -148,7 +155,9 @@ async def _resolve_pending_agent_member(
             continue
         try:
             member = await plane.get_member(actor_uuid)
-        except PlaneAPIError:
+        except PlaneAPIError as exc:
+            if exc.is_transient:
+                raise
             continue
         email = _email_of(member)
         if not email:
@@ -236,13 +245,27 @@ def _register_workspace_route(
                 # target_role='initiator', …)` — which stamps the initiator
                 # mention at the top of the agent's last comment. Use that
                 # signal to identify which agent is waiting and respawn it.
-                resumed_member = await _resolve_pending_agent_member(
-                    plane=plane,
-                    workspace=workspace,
-                    initiator_uuid=initiator_uuid,
-                    issue_uuid=issue_uuid,
-                    agents_by_nick=agents_by_nick,
-                )
+                try:
+                    resumed_member = await _resolve_pending_agent_member(
+                        plane=plane,
+                        workspace=workspace,
+                        initiator_uuid=initiator_uuid,
+                        issue_uuid=issue_uuid,
+                        agents_by_nick=agents_by_nick,
+                    )
+                except PlaneAPIError as exc:
+                    # Helper re-raises only on transient (5xx). Match the
+                    # mention-driven path's behaviour: ask Plane to retry.
+                    log.warning(
+                        "webhook_returning_503_for_retry",
+                        workspace=slug,
+                        reason="auto_resume_probe",
+                        status=exc.status_code,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="plane api transient error; retry",
+                    ) from exc
                 if resumed_member is not None:
                     mention_uuids = [resumed_member]
                     auto_resumed = str(resumed_member)

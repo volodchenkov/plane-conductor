@@ -677,6 +677,49 @@ def test_auto_resume_skips_when_agent_comment_has_no_initiator_mention(
     assert runner.calls == []
 
 
+def test_auto_resume_skips_when_uuid_appears_as_plain_text(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """Raw initiator-UUID text inside prose must NOT count as a handoff stamp.
+    Only the structured `<mention-component entity_identifier="…">` tag at the
+    front of a comment is the signal — anything else is conversational noise."""
+    plane = StubPlane(
+        members={SARK: {"email": "sark@example.io"}},
+        comments=[
+            {
+                "actor": SARK,
+                "created_at": "2026-05-18T20:43:00Z",
+                "comment_html": f"<p>FYI initiator id is {initiator_uuid}</p>",
+            }
+        ],
+    )
+    runner = StubRunner()
+    client = TestClient(_app(settings, workspace_config, plane, runner))
+
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+
+    assert resp.status_code == 200
+    assert resp.json()["spawned"] == []
+    assert runner.calls == []
+
+
+def test_auto_resume_returns_503_on_transient_comment_lookup(
+    settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
+) -> None:
+    """A 5xx from `list_issue_comments` must surface as 503 so Plane retries
+    the webhook — same contract as the mention-driven `get_member` path. We
+    don't want a transient blip to silently swallow an auto-resume."""
+    from plane_conductor.exceptions import PlaneAPIError
+
+    class FlakyPlane(StubPlane):
+        async def list_issue_comments(self, project_id: Any, issue_id: Any) -> list[dict[str, Any]]:
+            raise PlaneAPIError(503, "service unavailable")
+
+    client = TestClient(_app(settings, workspace_config, FlakyPlane(), StubRunner()))
+    resp = _send(client, settings, workspace_config, _initiator_reply_body(initiator_uuid))
+    assert resp.status_code == 503
+
+
 def test_auto_resume_skips_when_commenter_is_not_initiator(
     settings: Settings, workspace_config: WorkspaceConfig, initiator_uuid: UUID
 ) -> None:
