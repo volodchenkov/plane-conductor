@@ -32,7 +32,6 @@ from plane_conductor.exceptions import (
     AgentSpawnError,
     CapacityFullError,
     PlaneAPIError,
-    SessionAlreadyRunningError,
 )
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
@@ -325,22 +324,23 @@ def _register_workspace_route(
                 continue
 
             try:
-                await runner.spawn(
+                spawn_result = await runner.request_spawn(
                     workspace=workspace,
                     plane=plane,
                     nickname=nickname,
                     issue_uuid=issue_uuid,
                     triggered_by_email=email,
                 )
-                spawned.append(nickname)
-            except SessionAlreadyRunningError:
-                log.info(
-                    "duplicate_trigger",
-                    workspace=slug,
-                    nickname=nickname,
-                    issue=str(issue_uuid),
-                )
-                skipped.append({"nickname": nickname, "reason": "already running"})
+                if spawn_result.get("status") == "queued":
+                    log.info(
+                        "spawn_deferred_until_active_clears",
+                        workspace=slug,
+                        nickname=nickname,
+                        issue=str(issue_uuid),
+                    )
+                    skipped.append({"nickname": nickname, "reason": "queued"})
+                else:
+                    spawned.append(nickname)
             except CapacityFullError:
                 log.warning("capacity_full", workspace=slug, nickname=nickname)
                 skipped.append({"nickname": nickname, "reason": "capacity full"})
