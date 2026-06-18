@@ -455,6 +455,18 @@ class Runner:
                 issue=str(pending.issue_uuid),
                 error=str(exc),
             )
+        except Exception as exc:
+            # Catch-all: this runs detached from any webhook caller, so an
+            # uncaught OSError / PermissionError / unexpected subprocess
+            # failure would just go into asyncio's unraisable handler with
+            # no operator-visible signal. Log it structurally instead.
+            log.exception(
+                "pending_flush_unexpected_error",
+                workspace=pending.workspace.workspace_slug,
+                nickname=pending.nickname,
+                issue=str(pending.issue_uuid),
+                error=str(exc),
+            )
 
     async def _kill_group(self, proc: asyncio.subprocess.Process) -> int:
         """SIGTERM the process group; SIGKILL after 5s if it didn't exit."""
@@ -604,10 +616,30 @@ class Runner:
                 with contextlib.suppress(Exception):
                     await proc.wait()
             # Final drain — any flush tasks scheduled after we ran out of
-            # grace still get awaited so their file handles close.
+            # grace still get awaited so their file handles close. Bounded
+            # so a misbehaving flush (queued spawn that itself blocks on a
+            # broken plane API, etc.) can't park shutdown indefinitely.
+            post_kill_deadline = asyncio.get_running_loop().time() + 5.0
             while self._tasks:
+                remaining = post_kill_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    log.warning(
+                        "wait_idle_post_kill_drain_timeout",
+                        leftover_tasks=len(self._tasks),
+                    )
+                    break
                 snapshot = list(self._tasks)
-                await asyncio.gather(*snapshot, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*snapshot, return_exceptions=True),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    log.warning(
+                        "wait_idle_post_kill_drain_timeout",
+                        leftover_tasks=len(self._tasks),
+                    )
+                    break
 
 
 # ---------------------------------------------------------------------------
