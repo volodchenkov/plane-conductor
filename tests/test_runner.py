@@ -302,6 +302,142 @@ async def test_runner_capacity_cap(
     await runner.wait_idle(grace_seconds=0.1)
 
 
+async def test_request_spawn_immediate_when_not_active(
+    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+) -> None:
+    """When the triple isn't running, request_spawn fires immediately."""
+    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
+    runner = Runner(settings=s)
+
+    result = await runner.request_spawn(
+        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
+    )  # type: ignore[arg-type]
+    assert result["status"] == "spawned"
+    assert "log_path" in result
+
+    await runner.wait_idle()
+    assert runner.active_count == 0
+    assert runner.pending_count == 0
+
+
+async def test_request_spawn_queues_when_active(
+    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+) -> None:
+    """Second request for the same triple queues instead of raising."""
+    fake_claude = tmp_path / "fake_claude"
+    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
+    fake_claude.chmod(0o755)
+    s = settings.model_copy(
+        update={"claude_binary": str(fake_claude), "log_dir": tmp_path / "logs"}
+    )
+    runner = Runner(settings=s)
+
+    first = await runner.request_spawn(
+        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
+    )  # type: ignore[arg-type]
+    assert first["status"] == "spawned"
+
+    second = await runner.request_spawn(
+        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
+    )  # type: ignore[arg-type]
+    assert second["status"] == "queued"
+    assert runner.pending_count == 1
+
+    third = await runner.request_spawn(
+        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
+    )  # type: ignore[arg-type]
+    assert third["status"] == "queued"
+    assert runner.pending_count == 1  # coalesced — same key, overwrites
+
+    await runner.wait_idle(grace_seconds=0.1)
+
+
+async def test_request_spawn_flushes_pending_on_active_exit(
+    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+) -> None:
+    """A queued spawn fires after the active session for the same key exits."""
+    # First session uses a short-lived /bin/true so it exits ~immediately.
+    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
+    runner = Runner(settings=s)
+
+    plane = StubPlane()
+    first = await runner.request_spawn(
+        workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=ISSUE
+    )  # type: ignore[arg-type]
+    assert first["status"] == "spawned"
+
+    # Queue a second spawn for the same triple before the first finishes.
+    second = await runner.request_spawn(
+        workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=ISSUE
+    )  # type: ignore[arg-type]
+    assert second["status"] == "queued"
+
+    # First session exits → pending must flush → second session runs → both
+    # eventually drain. wait_idle waits for ALL active + flushed sessions.
+    await runner.wait_idle(grace_seconds=0.2)
+    assert runner.active_count == 0
+    assert runner.pending_count == 0
+
+
+async def test_request_spawn_capacity_full_still_raises(
+    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+) -> None:
+    """Capacity is a hard cap — request_spawn raises rather than queueing."""
+    from plane_conductor.exceptions import CapacityFullError
+
+    fake_claude = tmp_path / "fake_claude"
+    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
+    fake_claude.chmod(0o755)
+    s = settings.model_copy(
+        update={
+            "claude_binary": str(fake_claude),
+            "max_concurrent_sessions": 1,
+            "log_dir": tmp_path / "logs",
+        }
+    )
+    runner = Runner(settings=s)
+
+    await runner.request_spawn(
+        workspace=workspace_config, plane=StubPlane(), nickname="a", issue_uuid=UUID(int=1)
+    )  # type: ignore[arg-type]
+    with pytest.raises(CapacityFullError):
+        await runner.request_spawn(
+            workspace=workspace_config, plane=StubPlane(), nickname="b", issue_uuid=UUID(int=2)
+        )  # type: ignore[arg-type]
+
+    await runner.wait_idle(grace_seconds=0.1)
+
+
+async def test_request_spawn_independent_triples_run_in_parallel(
+    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+) -> None:
+    """request_spawn for a different (nick, issue) doesn't queue against an unrelated active."""
+    fake_claude = tmp_path / "fake_claude"
+    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
+    fake_claude.chmod(0o755)
+    s = settings.model_copy(
+        update={
+            "claude_binary": str(fake_claude),
+            "max_concurrent_sessions": 4,
+            "log_dir": tmp_path / "logs",
+        }
+    )
+    runner = Runner(settings=s)
+    plane = StubPlane()
+
+    a = await runner.request_spawn(
+        workspace=workspace_config, plane=plane, nickname="a", issue_uuid=UUID(int=1)
+    )  # type: ignore[arg-type]
+    b = await runner.request_spawn(
+        workspace=workspace_config, plane=plane, nickname="b", issue_uuid=UUID(int=2)
+    )  # type: ignore[arg-type]
+    assert a["status"] == b["status"] == "spawned"
+    assert runner.active_count == 2
+    assert runner.pending_count == 0
+
+    await runner.wait_idle(grace_seconds=0.1)
+
+
 async def test_active_set_clears_after_exit(
     settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
 ) -> None:

@@ -45,6 +45,10 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
     "mcp>=1.0",
+    # starlette 1.0 switched its TestClient backend to httpx2; the deprecation
+    # warning hits strict-mode pytest at collection. Pinning httpx2 here lets
+    # TestClient pick it up without us touching production deps.
+    "httpx2>=0.1",
 ]
 mcp = [
     "mcp>=1.0",

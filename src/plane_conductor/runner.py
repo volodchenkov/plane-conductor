@@ -1,11 +1,18 @@
 """Subprocess spawner — multi-workspace, defends against realistic failure modes.
 
-- **Dedup**: the same `(workspace_slug, nickname, issue_uuid)` cannot be spawned
-  twice in this orchestrator. Plane delivers webhooks at-least-once and the
-  human can double-mention; without this, two agents race to create the same
-  artifact. The slug is included so two workspaces can share nicknames safely.
+- **Dedup + queue-on-running**: the same `(workspace_slug, nickname, issue_uuid)`
+  cannot be spawned twice concurrently. Plane delivers webhooks at-least-once
+  and an agent can self-handoff via `request_handoff`; without dedup, two agents
+  race to create the same artifact. When a spawn for an in-flight triple is
+  requested via `request_spawn`, we **queue** it (last-write-wins) and fire it
+  the moment the active session exits — so step-execution chains
+  (`agent → request_handoff(target_role='<self>') → next step`) don't lose the
+  re-entry to a race where the comment-webhook arrives before the previous
+  process has cleaned up. Direct `spawn()` callers still get the raise.
 - **Capacity cap**: `MAX_CONCURRENT_SESSIONS` is host-wide — it counts active
   agents across all workspaces. Stops a flood of mentions from melting the box.
+  Queued (pending) spawns do NOT count toward the cap; the cap is checked
+  again at flush time.
 - **Process group**: every subprocess is spawned in its own session
   (`start_new_session=True`). On timeout we `killpg(SIGTERM)` then SIGKILL the
   whole group, so descendants of `claude` (MCP servers, helper procs) die too.
@@ -18,8 +25,11 @@
   subprocess, then update that same comment when the agent exits.
 
 State kept in memory: `_tasks` (supervisor task pins), `_active`
-(in-flight `(slug, nick, issue)` keys), `_procs` (process handles for shutdown).
-All three are derivable from "what's running right now"; nothing is persisted.
+(in-flight `(slug, nick, issue)` keys), `_procs` (process handles for shutdown),
+`_pending` (queued spawns waiting for the corresponding `_active` key to clear).
+All four are derivable from "what's running / queued right now"; nothing is
+persisted — a conductor restart drops queued spawns the same way it drops
+active ones (sentinels cover restart recovery for active sessions only).
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ import json
 import os
 import signal
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO
@@ -99,6 +110,22 @@ def _format_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
+@dataclass(frozen=True)
+class _PendingSpawn:
+    """A spawn request deferred until the matching `_active` key clears.
+
+    Holds the same arguments `spawn()` takes. The `PlaneClient` is the
+    long-lived per-workspace client owned by the router (it outlives any
+    individual webhook handler), so it's safe to capture by reference here.
+    """
+
+    workspace: WorkspaceConfig
+    plane: PlaneClient
+    nickname: str
+    issue_uuid: UUID
+    triggered_by_email: str | None
+
+
 class Runner:
     """Spawns claude subprocesses with dedup, capacity, and process-group control.
 
@@ -113,10 +140,79 @@ class Runner:
         self._active: set[tuple[str, str, UUID]] = set()
         # pid → Process. pid is also the pgid since we use start_new_session=True.
         self._procs: dict[int, asyncio.subprocess.Process] = {}
+        # Pending spawns keyed by (slug, nick, issue). Last-write-wins:
+        # multiple handoffs targeting the same triple while one is active
+        # coalesce — only one spawn fires at exit because the next agent
+        # reads actual state from Plane, not from queued trigger metadata.
+        self._pending: dict[tuple[str, str, UUID], _PendingSpawn] = {}
 
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    async def request_spawn(
+        self,
+        *,
+        workspace: WorkspaceConfig,
+        plane: PlaneClient,
+        nickname: str,
+        issue_uuid: UUID,
+        triggered_by_email: str | None = None,
+    ) -> dict[str, object]:
+        """Spawn-or-queue. Prefer this over `spawn()` for webhook-driven calls.
+
+        If the `(slug, nick, issue)` triple is already in flight, the spawn is
+        **queued** and fires automatically when the active session exits. This
+        closes the race where an agent's `request_handoff(target_role='<self>')`
+        comment-webhook arrives before the previous subprocess has finished
+        cleaning up — without it, the chain dies silently as a
+        `SessionAlreadyRunningError` log entry.
+
+        Returns one of:
+            `{"status": "spawned", "log_path": Path}` — fresh spawn fired.
+            `{"status": "queued"}` — added to pending; fires on session exit.
+                If a pending entry for the triple already existed, it's
+                **overwritten** (last-write-wins; see class docstring).
+
+        Raises:
+            CapacityFullError: host-wide cap reached at decision time. Pending
+                entries are NOT counted; the cap is rechecked at flush time
+                and queued spawns are dropped (with a log) if capacity is
+                still full then.
+            AgentSpawnError: claude binary missing (immediate spawn path only).
+        """
+        slug = workspace.workspace_slug
+        key = (slug, nickname, issue_uuid)
+        if key in self._active:
+            already_queued = key in self._pending
+            self._pending[key] = _PendingSpawn(
+                workspace=workspace,
+                plane=plane,
+                nickname=nickname,
+                issue_uuid=issue_uuid,
+                triggered_by_email=triggered_by_email,
+            )
+            log.info(
+                "spawn_queued",
+                workspace=slug,
+                nickname=nickname,
+                issue=str(issue_uuid),
+                replaced_existing=already_queued,
+                pending=len(self._pending),
+            )
+            return {"status": "queued"}
+        log_path = await self.spawn(
+            workspace=workspace,
+            plane=plane,
+            nickname=nickname,
+            issue_uuid=issue_uuid,
+            triggered_by_email=triggered_by_email,
+        )
+        return {"status": "spawned", "log_path": log_path}
 
     async def spawn(
         self,
@@ -128,6 +224,9 @@ class Runner:
         triggered_by_email: str | None = None,
     ) -> Path:
         """Spawn `claude --agent <nickname>` for `(workspace, issue_uuid)`.
+
+        Direct-spawn path: raises rather than queues on conflict. Webhook
+        callers should prefer `request_spawn` to get queue-on-running.
 
         Raises:
             SessionAlreadyRunningError: an agent for this triple is in flight.
@@ -271,9 +370,20 @@ class Runner:
             if transport is not None:
                 with contextlib.suppress(Exception):
                     transport.close()
-            self._active.discard((workspace_slug, nickname, issue_uuid))
+            key = (workspace_slug, nickname, issue_uuid)
+            self._active.discard(key)
             self._procs.pop(proc.pid, None)
             self._clear_sentinel(workspace_slug, nickname, issue_uuid)
+            pending = self._pending.pop(key, None)
+            if pending is not None:
+                # Schedule the queued spawn on a fresh task — don't await it
+                # in the supervise `finally` because that would keep this
+                # supervisor (and its log fp / transport refs) alive longer
+                # than necessary and could deadlock if the new spawn itself
+                # blocks on something this supervisor is holding.
+                flush_task = asyncio.create_task(self._flush_pending(pending))
+                self._tasks.add(flush_task)
+                flush_task.add_done_callback(self._tasks.discard)
 
         duration = time.monotonic() - started_at
         log.info(
@@ -301,6 +411,61 @@ class Runner:
         elif exit_code != 0 or timed_out:
             await self._notify_failure(
                 plane, project_id, nickname, issue_uuid, exit_code, timed_out
+            )
+
+    async def _flush_pending(self, pending: _PendingSpawn) -> None:
+        """Fire a queued spawn from `_supervise`'s exit hook.
+
+        Errors are logged and swallowed — we never raise out of this path
+        because the original webhook that enqueued the pending spawn has
+        long since returned its 200 to Plane. There's no caller to surface
+        the error to. If capacity is now full, or the binary went missing,
+        we log it and the chain stops there; an initiator can re-trigger.
+        """
+        try:
+            await self.spawn(
+                workspace=pending.workspace,
+                plane=pending.plane,
+                nickname=pending.nickname,
+                issue_uuid=pending.issue_uuid,
+                triggered_by_email=pending.triggered_by_email,
+            )
+        except SessionAlreadyRunningError:
+            # Lost the race with a fresh direct trigger that landed between
+            # `_active.discard` and this flush. The direct trigger covers
+            # the same intent; safe to drop.
+            log.info(
+                "pending_flush_skipped_already_running",
+                workspace=pending.workspace.workspace_slug,
+                nickname=pending.nickname,
+                issue=str(pending.issue_uuid),
+            )
+        except CapacityFullError:
+            log.warning(
+                "pending_flush_skipped_capacity_full",
+                workspace=pending.workspace.workspace_slug,
+                nickname=pending.nickname,
+                issue=str(pending.issue_uuid),
+            )
+        except AgentSpawnError as exc:
+            log.error(
+                "pending_flush_failed",
+                workspace=pending.workspace.workspace_slug,
+                nickname=pending.nickname,
+                issue=str(pending.issue_uuid),
+                error=str(exc),
+            )
+        except Exception as exc:
+            # Catch-all: this runs detached from any webhook caller, so an
+            # uncaught OSError / PermissionError / unexpected subprocess
+            # failure would just go into asyncio's unraisable handler with
+            # no operator-visible signal. Log it structurally instead.
+            log.exception(
+                "pending_flush_unexpected_error",
+                workspace=pending.workspace.workspace_slug,
+                nickname=pending.nickname,
+                issue=str(pending.issue_uuid),
+                error=str(exc),
             )
 
     async def _kill_group(self, proc: asyncio.subprocess.Process) -> int:
@@ -423,14 +588,24 @@ class Runner:
     # -- shutdown -------------------------------------------------------------
 
     async def wait_idle(self, grace_seconds: float = 30.0) -> None:
-        """Wait for in-flight supervisors. After `grace_seconds`, kill all groups."""
-        if not self._tasks:
-            return
+        """Wait for in-flight supervisors. After `grace_seconds`, kill all groups.
+
+        Loops: a queued spawn flushed from an exiting supervisor adds a fresh
+        supervisor task, which `_flush_pending` schedules AFTER the parent
+        `_supervise` is already done — so a single `gather(*_tasks)` would
+        miss it. We re-snapshot until the set drains.
+        """
+        deadline = asyncio.get_running_loop().time() + grace_seconds
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*self._tasks, return_exceptions=True),
-                timeout=grace_seconds,
-            )
+            while self._tasks:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError
+                snapshot = list(self._tasks)
+                await asyncio.wait_for(
+                    asyncio.gather(*snapshot, return_exceptions=True),
+                    timeout=remaining,
+                )
         except TimeoutError:
             procs = list(self._procs.values())
             log.warning("shutdown_grace_expired", killing_groups=len(procs))
@@ -440,7 +615,31 @@ class Runner:
             for proc in procs:
                 with contextlib.suppress(Exception):
                     await proc.wait()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            # Final drain — any flush tasks scheduled after we ran out of
+            # grace still get awaited so their file handles close. Bounded
+            # so a misbehaving flush (queued spawn that itself blocks on a
+            # broken plane API, etc.) can't park shutdown indefinitely.
+            post_kill_deadline = asyncio.get_running_loop().time() + 5.0
+            while self._tasks:
+                remaining = post_kill_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    log.warning(
+                        "wait_idle_post_kill_drain_timeout",
+                        leftover_tasks=len(self._tasks),
+                    )
+                    break
+                snapshot = list(self._tasks)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*snapshot, return_exceptions=True),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    log.warning(
+                        "wait_idle_post_kill_drain_timeout",
+                        leftover_tasks=len(self._tasks),
+                    )
+                    break
 
 
 # ---------------------------------------------------------------------------

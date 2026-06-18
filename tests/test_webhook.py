@@ -47,8 +47,9 @@ class StubRunner:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    async def spawn(self, **kwargs: Any) -> None:
+    async def request_spawn(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
+        return {"status": "spawned"}
 
 
 def _sign(secret: str, body: bytes) -> str:
@@ -453,7 +454,7 @@ def test_webhook_handles_spawn_failure(
     from plane_conductor.exceptions import AgentSpawnError
 
     class CrashingRunner:
-        async def spawn(self, **kwargs: Any) -> None:
+        async def request_spawn(self, **kwargs: Any) -> dict[str, Any]:
             raise AgentSpawnError("boom")
 
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
@@ -492,25 +493,29 @@ def _comment_body(mention_uuid: str) -> bytes:
     ).encode()
 
 
-def test_webhook_skipped_on_dedup(settings: Settings, workspace_config: WorkspaceConfig) -> None:
-    from plane_conductor.exceptions import SessionAlreadyRunningError
+def test_webhook_queues_when_runner_reports_already_running(
+    settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    """When request_spawn reports queued (because the triple is already in
+    flight), webhook records it as `skipped: queued` — the runner will fire
+    the spawn itself when the active session exits."""
 
-    class DupRunner:
-        async def spawn(self, **kwargs: Any) -> None:
-            raise SessionAlreadyRunningError("already running")
+    class QueueingRunner:
+        async def request_spawn(self, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "queued"}
 
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
-    client = TestClient(_app(settings, workspace_config, plane, DupRunner()))
+    client = TestClient(_app(settings, workspace_config, plane, QueueingRunner()))
     resp = _send(client, settings, workspace_config, _comment_body(SARK))
     assert resp.status_code == 200
-    assert resp.json()["skipped"] == [{"nickname": "sark", "reason": "already running"}]
+    assert resp.json()["skipped"] == [{"nickname": "sark", "reason": "queued"}]
 
 
 def test_webhook_skipped_on_capacity(settings: Settings, workspace_config: WorkspaceConfig) -> None:
     from plane_conductor.exceptions import CapacityFullError
 
     class FullRunner:
-        async def spawn(self, **kwargs: Any) -> None:
+        async def request_spawn(self, **kwargs: Any) -> dict[str, Any]:
             raise CapacityFullError("full")
 
     plane = StubPlane({SARK: {"email": "sark@example.io"}})
