@@ -197,7 +197,7 @@ class ResolvedMention(BaseModel):
 
 ```python
 class AgentSession(BaseModel):
-    session_id: UUID                     # generated locally
+    session_id: UUID  # generated locally
     nickname: str
     issue_identifier: str
     pid: int
