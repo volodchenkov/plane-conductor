@@ -259,8 +259,12 @@ class Runner:
             self.settings.claude_binary,
             "--agent",
             agent_name,
+            # `auto`, not `acceptEdits`: under --print nobody can answer a prompt,
+            # so acceptEdits silently denies every Bash command outside the
+            # allowlist and the agent improvises workarounds. `auto` lets the
+            # classifier decide; deny rules in settings still always win.
             "--permission-mode",
-            "acceptEdits",
+            "auto",
             "--print",
         ]
         cwd = workspace.agent_working_dir or Path.cwd()
