@@ -140,7 +140,9 @@ log "installing plane-conductor (editable)"
 "${PREFIX}/.venv/bin/pip" install --upgrade pip --quiet
 # Editable install: source changes are picked up on `systemctl restart`,
 # no pip reinstall needed for code-only updates.
-"${PREFIX}/.venv/bin/pip" install --quiet -e "${PREFIX}"
+# [mcp] — the plane-conductor-mcp / tower entrypoints import the MCP SDK;
+# without the extra a stale or missing mcp stays in the venv.
+"${PREFIX}/.venv/bin/pip" install --quiet --upgrade -e "${PREFIX}[mcp]"
 
 # ---------------------------------------------------------------------------
 # 3. Config dir + runtime.env + conductor.d skeletons
