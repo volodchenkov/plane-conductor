@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from plane_conductor.conductor_config import (
     WorkspaceConfig,
@@ -401,11 +401,11 @@ async def _client_for(ctx: WorkspaceContext) -> PlaneClient:
 
 
 # ---------------------------------------------------------------------------
-# FastMCP server + tools
+# MCP server + tools
 # ---------------------------------------------------------------------------
 
 
-mcp = FastMCP("plane-tower")
+mcp = MCPServer("plane-tower")
 _REGISTRY: TowerRegistry | None = None
 
 
