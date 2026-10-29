@@ -44,14 +44,14 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "types-PyYAML",
-    "mcp>=1.0",
+    "mcp>=2,<3",
     # starlette 1.0 switched its TestClient backend to httpx2; the deprecation
     # warning hits strict-mode pytest at collection. Pinning httpx2 here lets
     # TestClient pick it up without us touching production deps.
     "httpx2>=0.1",
 ]
 mcp = [
-    "mcp>=1.0",
+    "mcp>=2,<3",
 ]
 # `tower` is the public, intent-named extra; aliased to `mcp` so the two
 # can't drift on the next bump. `pip install plane-conductor[tower]` and
@@ -123,6 +123,7 @@ minversion = "8.0"
 addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error"]
 
 [tool.coverage.run]

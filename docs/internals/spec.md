@@ -165,15 +165,17 @@ class PlaneEvent(BaseModel):
     data: dict  # raw payload, parsed by event-specific submodels
     workspace: str  # workspace slug
 
+
 class IssueCommentEvent(PlaneEvent):
     event: Literal["issue_comment"]
     data: IssueCommentData
 
+
 class IssueCommentData(BaseModel):
-    id: str           # comment UUID
-    issue: str        # issue UUID
-    project: str      # project UUID
-    actor: str        # user UUID who posted the comment
+    id: str  # comment UUID
+    issue: str  # issue UUID
+    project: str  # project UUID
+    actor: str  # user UUID who posted the comment
     comment_html: str
     comment_stripped: str
     created_at: datetime
@@ -184,12 +186,12 @@ class IssueCommentData(BaseModel):
 
 ```python
 class ResolvedMention(BaseModel):
-    member_id: UUID                      # Plane member UUID
-    nickname: str                        # email local part: "sark"
-    prompt_role: str                     # mapped role: "system-analyst"
-    issue_identifier: str                # "EXAMPLE-42"
+    member_id: UUID  # Plane member UUID
+    nickname: str  # email local part: "sark"
+    prompt_role: str  # mapped role: "system-analyst"
+    issue_identifier: str  # "EXAMPLE-42"
     issue_uuid: UUID
-    triggered_by: UUID                   # Dmitry's UUID
+    triggered_by: UUID  # Dmitry's UUID
     triggered_at: datetime
 ```
 
@@ -197,7 +199,7 @@ class ResolvedMention(BaseModel):
 
 ```python
 class AgentSession(BaseModel):
-    session_id: UUID                     # generated locally
+    session_id: UUID  # generated locally
     nickname: str
     issue_identifier: str
     pid: int

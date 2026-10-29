@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 SENTINEL_SUBDIR = ".active"
 _DEFAULT_LOG_DIR = "/var/log/plane-conductor"
@@ -28,7 +28,7 @@ _LOG_NAME_RE = re.compile(
     r"^(?P<timestamp>\d{8}T\d{6}Z)-(?P<rest>.+)-(?P<issue_short>[0-9a-fA-F]{8})" r"\.log(?:\.\d+)?$"
 )
 
-mcp = FastMCP("plane-conductor")
+mcp = MCPServer("plane-conductor")
 
 
 def _log_dir() -> Path:
