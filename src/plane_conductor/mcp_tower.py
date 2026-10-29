@@ -99,6 +99,7 @@ ARTIFACT_LABEL_BY_ROLE: dict[str, str] = {
     "frontend": "artifact:frontend",
     "api-tests": "artifact:api-testing",
     "ux-tests": "artifact:ux-testing",
+    "infra": "artifact:infra",
     "requirements": "artifact:requirements",
 }
 
@@ -841,6 +842,7 @@ _ROLE_DISPLAY = {
     "frontend-react": "Frontend (React)",
     "api-tests": "API Tests",
     "ux-tests": "UX Tests",
+    "infra": "Infra",
 }
 
 
@@ -1257,7 +1259,7 @@ async def post_changes(
     """Post the canonical CHANGES comment on the coder's sub-issue.
 
     `sub_uuid` is the coder's sub-issue (equals the spawn `issue_uuid`).
-    `target` is `backend` or `frontend` — used only for the display label
+    `target` is `backend`, `frontend` or `infra` — used only for the display label
     and the OpenAPI verifier defense check.
 
     `files`/`verification` are pairs of `[path_or_command,
@@ -1276,8 +1278,8 @@ async def post_changes(
 
     One HTTP call (`create_issue_comment`). No `list_issues` underneath.
     """
-    if target not in {"backend", "frontend"}:
-        raise TowerError(f"post_changes target must be backend|frontend, got {target!r}")
+    if target not in {"backend", "frontend", "infra"}:
+        raise TowerError(f"post_changes target must be backend|frontend|infra, got {target!r}")
     ctx = _registry().resolve(workspace=workspace)
     next_mention = _role_mention(ctx, next_role) if next_role else ""
     sub_uuid = _ensure_uuid(sub_uuid, "sub_uuid")
