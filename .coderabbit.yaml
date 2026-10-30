@@ -23,7 +23,7 @@ reviews:
     enabled: true
     drafts: false                 # don't waste cycles on drafts
     base_branches:
-      - main
+      - master
 
   # Skip noise that doesn't benefit from a code review:
   #   - lock files (pinned by tooling, no human-decision content)
