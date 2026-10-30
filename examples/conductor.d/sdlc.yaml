@@ -71,6 +71,7 @@ labels:
     - { name: "artifact:frontend", color: "#22d3ee" }
     - { name: "artifact:api-testing", color: "#f59e0b" }
     - { name: "artifact:ux-testing", color: "#f97316" }
+    - { name: "artifact:infra", color: "#64748b" }
     - { name: "artifact:review", color: "#ef4444" }
   roles:
     - { name: "role:business-analyst", color: "#a78bfa" }
