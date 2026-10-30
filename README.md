@@ -1,6 +1,6 @@
 # Plane Conductor
 
-[![CI](https://github.com/volodchenkov/plane-conductor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/volodchenkov/plane-conductor/actions/workflows/ci.yml)
+[![CI](https://github.com/volodchenkov/plane-conductor/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/volodchenkov/plane-conductor/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://github.com/astral-sh/ruff)

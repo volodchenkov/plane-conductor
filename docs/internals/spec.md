@@ -91,7 +91,7 @@ plane-conductor/
 │   ├── workflows/
 │   │   ├── ci.yml                       # ruff, mypy, pytest, on push/PR
 │   │   ├── publish.yml                  # PyPI release on tag
-│   │   └── docs.yml                     # mkdocs deploy on main
+│   │   └── docs.yml                     # mkdocs deploy on master
 │   ├── ISSUE_TEMPLATE/
 │   │   ├── bug_report.md
 │   │   └── feature_request.md
@@ -380,7 +380,7 @@ server {
 
 For the public repo:
 - **README.md**: hero section with one-liner, animated GIF or screenshot of a Plane issue with `@rinzler` triggering an agent run, badges (PyPI, Python versions, CI, license, codecov), 30-second quickstart, link to docs.
-- **mkdocs-material** for docs site (deployed to GitHub Pages on push to main).
+- **mkdocs-material** for docs site (deployed to GitHub Pages on push to master).
 - **Architecture diagram** as Mermaid in README + docs/architecture.md.
 - **CHANGELOG.md** following Keep a Changelog format. Conventional Commits in git history.
 - **CONTRIBUTING.md**: dev setup, lint commands, PR template, issue triage flow.

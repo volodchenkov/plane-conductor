@@ -25,7 +25,7 @@ pytest
 
 ## Pull requests
 
-- Branch from `main`. Keep PRs focused — one concern per PR.
+- Branch from `master`. Keep PRs focused — one concern per PR.
 - Conventional commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`).
 - Update `CHANGELOG.md` under `[Unreleased]` with a one-liner.
 - New behavior needs tests. Bug fixes should add a regression test.
