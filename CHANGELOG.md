@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`finalize_done`** MCP tool on tower — closes a finished task (plane-api.md
+  §6.12): moves every direct sub-issue, then the root, to the `completed`-group
+  state; refuses a non-root; idempotent; fails loudly if a sub-issue is still
+  open after the pass.
 - **`retrieve_work_item_by_identifier`** MCP tool on tower — resolves a
   human-readable identifier (`<PROJECT_IDENTIFIER>-<N>`, e.g. `COINEX-72`) to
   its full work-item record with UUID. Counterpart to `pickup_issue` for

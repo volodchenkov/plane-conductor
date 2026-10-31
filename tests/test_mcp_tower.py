@@ -34,6 +34,7 @@ from plane_conductor.mcp_tower import (
     create_root_issue,
     create_sub_issue,
     escalate_upstream_gap,
+    finalize_done,
     find_artifact_by_label,
     list_comments,
     mark_phase_complete,
@@ -1709,3 +1710,122 @@ async def test_read_artifact_surfaces_size_warning(
     assert result["description_size_chars"] > DESCRIPTION_SOFT_LIMIT_CHARS
     assert result["description_soft_limit_chars"] == DESCRIPTION_SOFT_LIMIT_CHARS
     assert result["description_size_warning"] is True
+
+
+# ---------------------------------------------------------------------------
+# finalize_done
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_finalize_done_closes_children_then_root_and_skips_done(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    ctx.state_by_group["completed"] = "state-done"
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{ROOT_UUID}/").mock(
+        return_value=httpx.Response(
+            200, json={"id": ROOT_UUID, "parent": None, "state": "state-bl"}
+        )
+    )
+    respx.get(f"{base}/issues/").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": ROOT_UUID, "parent": None, "state": "state-bl"},
+                        {"id": SPEC_SUB_UUID, "parent": ROOT_UUID, "state": "state-done"},
+                        {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "state": "state-bl"},
+                        {
+                            "id": "55555555-5555-5555-5555-555555555555",
+                            "parent": None,
+                            "state": "state-bl",
+                        },
+                    ],
+                    "next_cursor": "100:1:0",
+                },
+            ),
+            httpx.Response(200, json={"results": []}),
+            httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": SPEC_SUB_UUID, "parent": ROOT_UUID, "state": "state-done"},
+                        {"id": BACKEND_SUB_UUID, "parent": ROOT_UUID, "state": "state-done"},
+                    ]
+                },
+            ),
+            httpx.Response(200, json={"results": []}),
+        ]
+    )
+    order: list[str] = []
+
+    def _patch(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        assert _json.loads(request.content.decode()) == {"state": "state-done"}
+        order.append(request.url.path.rstrip("/").rsplit("/", 1)[-1])
+        return httpx.Response(200, json={})
+
+    respx.patch(url__regex=rf"{base}/issues/[0-9a-f-]+/").mock(side_effect=_patch)
+
+    result = await finalize_done(ROOT_UUID, workspace=ctx.config.workspace_slug)
+
+    assert order == [BACKEND_SUB_UUID, ROOT_UUID]
+    assert result["closed"] == [BACKEND_SUB_UUID, ROOT_UUID]
+    assert result["already_done"] == [SPEC_SUB_UUID]
+
+
+@respx.mock
+async def test_finalize_done_refuses_a_sub_issue(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    ctx.state_by_group["completed"] = "state-done"
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.get(f"{base}/issues/{SPEC_SUB_UUID}/").mock(
+        return_value=httpx.Response(200, json={"id": SPEC_SUB_UUID, "parent": ROOT_UUID})
+    )
+    patch = respx.patch(url__regex=rf"{base}/issues/.*").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    with pytest.raises(TowerError, match="closes a root"):
+        await finalize_done(SPEC_SUB_UUID, workspace=ctx.config.workspace_slug)
+    assert not patch.called
+
+
+async def test_finalize_done_without_completed_state_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    with pytest.raises(TowerError, match="no state in group 'completed'"):
+        await finalize_done(ROOT_UUID, workspace=ctx.config.workspace_slug)
+
+
+@respx.mock
+async def test_finalize_done_fails_loudly_on_a_child_opened_meanwhile(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    ctx.state_by_group["completed"] = "state-done"
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    late = "66666666-6666-6666-6666-666666666666"
+    respx.get(f"{base}/issues/{ROOT_UUID}/").mock(
+        return_value=httpx.Response(
+            200, json={"id": ROOT_UUID, "parent": None, "state": "state-bl"}
+        )
+    )
+    respx.get(f"{base}/issues/").mock(
+        side_effect=[
+            # no next_cursor → each listing is one page
+            httpx.Response(
+                200, json={"results": [{"id": ROOT_UUID, "parent": None, "state": "state-bl"}]}
+            ),
+            httpx.Response(
+                200, json={"results": [{"id": late, "parent": ROOT_UUID, "state": "state-bl"}]}
+            ),
+        ]
+    )
+    respx.patch(url__regex=rf"{base}/issues/.*").mock(return_value=httpx.Response(200, json={}))
+
+    with pytest.raises(TowerError, match=late):
+        await finalize_done(ROOT_UUID, workspace=ctx.config.workspace_slug)

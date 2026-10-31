@@ -626,6 +626,62 @@ async def list_sub_issues(
     return [_summarize_issue(c) for c in children]
 
 
+@mcp.tool()
+async def finalize_done(
+    root_uuid: str,
+    *,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Close a finished task: move the root and every direct sub-issue to the Done state.
+
+    plane-api.md §6.12. The initiator's (or Tron's, on the initiator's request) final
+    action after acceptance — pipeline agents never call it. Refuses a non-root issue
+    (one with a parent). Idempotent: items already in the Done state are left untouched
+    and reported under `already_done`.
+    """
+    ctx = _registry().resolve(workspace=workspace)
+    root_uuid = _ensure_uuid(root_uuid, "root_uuid")
+    done = ctx.state_by_group.get("completed")
+    if not done:
+        raise TowerError(
+            f"workspace {ctx.config.workspace_slug!r}: no state in group 'completed' — "
+            f"cannot close. Known groups: {sorted(ctx.state_by_group)}"
+        )
+    async with await _client_for(ctx) as plane:
+        root = await plane.get_issue(ctx.config.project_id, root_uuid)
+        if root.get("parent"):
+            raise TowerError(
+                f"{root_uuid} has parent {root.get('parent')} — finalize_done closes a root, "
+                f"pass the root issue"
+            )
+        items = await plane.list_issues(ctx.config.project_id)
+        children = [i for i in items if str(i.get("parent") or "") == root_uuid]
+        closed: list[str] = []
+        already: list[str] = []
+        # Children first: a root shown Done while a child is still open would be a lie.
+        for item in [*children, root]:
+            item_id = str(item.get("id"))
+            if str(item.get("state") or "") == done:
+                already.append(item_id)
+                continue
+            await plane.update_issue(ctx.config.project_id, item_id, {"state": done})
+            closed.append(item_id)
+        # No lock against a concurrent create_sub_issue (finalize runs after acceptance, when no
+        # agent is active); a re-read afterwards turns that race into a loud error, not a silent lie.
+        after = await plane.list_issues(ctx.config.project_id)
+    still_open = [
+        str(i.get("id"))
+        for i in after
+        if str(i.get("parent") or "") == root_uuid and str(i.get("state") or "") != done
+    ]
+    if still_open:
+        raise TowerError(
+            f"root {root_uuid} closed, but sub-issues opened meanwhile are not Done: {still_open}. "
+            f"Re-run finalize_done."
+        )
+    return {"root": root_uuid, "state": done, "closed": closed, "already_done": already}
+
+
 def _summarize_issue(item: dict[str, Any]) -> dict[str, Any]:
     """Project a Plane issue dict onto the small surface the tower exposes to agents."""
     return {
