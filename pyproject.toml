@@ -49,6 +49,7 @@ dev = [
     # warning hits strict-mode pytest at collection. Pinning httpx2 here lets
     # TestClient pick it up without us touching production deps.
     "httpx2>=0.1",
+    "trustme>=1.1",
 ]
 mcp = [
     "mcp>=2,<3",

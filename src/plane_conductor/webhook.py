@@ -36,6 +36,7 @@ from plane_conductor.exceptions import (
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
 from plane_conductor.runner import Runner
+from plane_conductor.workbench_client import Notifier, detect_gate
 
 log = get_logger(__name__)
 
@@ -168,10 +169,43 @@ async def _resolve_pending_agent_member(
     return None
 
 
+def _publish_gate(
+    notifier: Notifier | None,
+    workspace: WorkspaceConfig,
+    data: dict[str, Any],
+    comment_html: str,
+    mentions: list[UUID],
+    issue_uuid: UUID,
+) -> None:
+    """Hand a gate (an initiator-addressed handoff comment) to the workbench spool.
+
+    A local file write only; any failure is logged and the webhook is unaffected.
+    """
+    if notifier is None:
+        return
+    try:
+        event = detect_gate(
+            data.get("id"),
+            comment_html,
+            mentions,
+            data.get("actor"),
+            workspace.initiator_uuid,
+            workspace.workspace_slug,
+            str(issue_uuid),
+            workspace.plane_base_url,
+            str(workspace.project_id),
+        )
+        if event is not None:
+            notifier.publish(event)
+    except Exception as exc:  # never break the Plane webhook
+        log.warning("gate_publish_failed", error=type(exc).__name__)
+
+
 def build_router(
     settings: Settings,
     workspaces: dict[str, tuple[WorkspaceConfig, PlaneClient]],
     runner: Runner,
+    notifier: Notifier | None = None,
 ) -> APIRouter:
     """Build a FastAPI router with one /<slug>/webhook route per workspace.
 
@@ -184,7 +218,7 @@ def build_router(
         log.warning("no_workspaces_loaded", conductor_dir=str(settings.conductor_dir))
 
     for slug, (workspace, plane) in workspaces.items():
-        _register_workspace_route(router, slug, workspace, plane, runner)
+        _register_workspace_route(router, slug, workspace, plane, runner, notifier)
     return router
 
 
@@ -194,6 +228,7 @@ def _register_workspace_route(
     workspace: WorkspaceConfig,
     plane: PlaneClient,
     runner: Runner,
+    notifier: Notifier | None = None,
 ) -> None:
     sig_header = workspace.webhook_signature_header
     agents_by_nick = workspace.agents_by_nickname()
@@ -234,6 +269,7 @@ def _register_workspace_route(
             return {"ok": True, "workspace": slug, "ignored": "bad issue uuid"}
 
         mention_uuids = extract_mention_uuids(comment_html)
+        _publish_gate(notifier, workspace, data, comment_html, mention_uuids, issue_uuid)
         auto_resumed: str | None = None
         if not mention_uuids:
             actor_raw = data.get("actor")

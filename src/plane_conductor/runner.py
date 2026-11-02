@@ -83,6 +83,18 @@ def build_prompt(
     return "\n".join(lines)
 
 
+def spawn_env(slug: str) -> dict[str, str]:
+    """Environment of a spawned agent: ``WORKSPACE_SLUG`` plus workbench isolation.
+
+    ``WORKBENCH_DRIVER=runner`` and no ``TMUX`` make ``workbench-hook`` a no-op for the
+    claude processes this runner starts, even when the conductor itself was started inside
+    tmux. Independent of whether notifications are configured.
+    """
+    env = {**os.environ, "WORKSPACE_SLUG": slug, "WORKBENCH_DRIVER": "runner"}
+    env.pop("TMUX", None)
+    return env
+
+
 def log_path_for(log_dir: Path, workspace_slug: str, nickname: str, issue_uuid: UUID) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -286,7 +298,7 @@ class Runner:
                 # / etc. auto-resolve workspace without the agent having to pass
                 # `workspace=` on every call. Conductor already knows the slug at
                 # spawn time — agents shouldn't have to re-discover it from the URL.
-                env={**os.environ, "WORKSPACE_SLUG": slug},
+                env=spawn_env(slug),
                 start_new_session=True,
             )
         except FileNotFoundError as exc:

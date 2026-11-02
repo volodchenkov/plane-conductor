@@ -18,6 +18,7 @@ from plane_conductor.logging_config import configure_logging, get_logger
 from plane_conductor.plane_client import PlaneClient
 from plane_conductor.runner import Runner, recover_orphaned_sessions
 from plane_conductor.webhook import build_router
+from plane_conductor.workbench_client import build_notifier
 
 log = get_logger(__name__)
 
@@ -52,6 +53,7 @@ def create_app(
 
     workspaces_with_clients = _build_clients(workspaces)
     runner = Runner(settings=settings)
+    notifier = build_notifier(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -66,9 +68,13 @@ def create_app(
             await recover_orphaned_sessions(settings, workspaces_with_clients)
         except Exception as exc:
             log.error("recovery_scan_failed", error=str(exc))
+        if notifier is not None:
+            notifier.start()
         try:
             yield
         finally:
+            if notifier is not None:
+                await notifier.stop()
             await runner.wait_idle(grace_seconds=settings.shutdown_grace_seconds)
             for _ws, plane in workspaces_with_clients.values():
                 await plane.aclose()
@@ -79,6 +85,7 @@ def create_app(
     app.state.workspaces = workspaces
     app.state.workspaces_with_clients = workspaces_with_clients
     app.state.runner = runner
+    app.state.notifier = notifier
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -88,5 +95,5 @@ def create_app(
             "workspaces": sorted(workspaces),
         }
 
-    app.include_router(build_router(settings, workspaces_with_clients, runner))
+    app.include_router(build_router(settings, workspaces_with_clients, runner, notifier))
     return app

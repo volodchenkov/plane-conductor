@@ -53,6 +53,28 @@ class Settings(BaseSettings):
     session_timeout_seconds: int = Field(default=3600, ge=10)
     shutdown_grace_seconds: float = Field(default=30.0, ge=0.0)
 
+    # --- Notifications to a workbench instance (Telegram bridge); empty URL = off ---
+    workbench_notify_url: str = Field(
+        default="",
+        description="Base URL of the workbench ingest (any host). Empty = notifications off. "
+        "https is required unless the host is a loopback literal (127.0.0.0/8, ::1).",
+    )
+    workbench_notify_token_file: Path | None = Field(
+        default=None, description="File holding the ingest bearer; re-read on every send."
+    )
+    workbench_notify_timeout: float = Field(
+        default=3.0, gt=0, description="Total seconds per call."
+    )
+    workbench_notify_connect_timeout: float = Field(default=2.0, gt=0)
+    workbench_notify_ca_file: Path | None = Field(
+        default=None, description="Private CA bundle; empty = system trust store."
+    )
+    workbench_notify_spool_dir: Path | None = Field(
+        default=None, description="Failure spool; default <log_dir>/workbench-notify-spool."
+    )
+    workbench_notify_spool_max: int = Field(default=200, ge=1)
+    workbench_notify_spool_max_age: int = Field(default=24 * 3600, ge=60, description="Seconds.")
+
     @field_validator("log_format")
     @classmethod
     def _validate_log_format(cls, v: str) -> str:

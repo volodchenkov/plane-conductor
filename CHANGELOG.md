@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §6.12): moves every direct sub-issue, then the root, to the `completed`-group
   state; refuses a non-root; idempotent; fails loudly if a sub-issue is still
   open after the pass.
+- **Gate notifications to workbench**: a Plane gate (an initiator-addressed handoff comment) is
+  written to a local spool by the webhook handler and delivered by a background sender to a
+  workbench ingest (`WORKBENCH_NOTIFY_URL`, off by default; same host or another host over
+  verified https). A workbench outage never affects Plane processing. See `docs/configuration.md`.
+- The runner starts agents with `WORKBENCH_DRIVER=runner` and without `TMUX`.
 - **`retrieve_work_item_by_identifier`** MCP tool on tower — resolves a
   human-readable identifier (`<PROJECT_IDENTIFIER>-<N>`, e.g. `COINEX-72`) to
   its full work-item record with UUID. Counterpart to `pickup_issue` for

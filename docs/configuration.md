@@ -56,6 +56,33 @@ Full template lives at [`examples/runtime.env.example`](../examples/runtime.env.
 | `SESSION_TIMEOUT_SECONDS` | `3600` | Per-agent timeout. After that the supervisor kills the whole process group (SIGTERM, then SIGKILL after 5s). |
 | `SHUTDOWN_GRACE_SECONDS` | `30` | On `systemctl stop`, how long to wait for in-flight agents to finish before SIGKILL. Keep below systemd's `TimeoutStopSec` (default 90s). |
 
+### Gate notifications to workbench (optional)
+
+A Plane *gate* — a comment written by tower's `request_handoff(target_role='initiator', …)` — is
+forwarded to a [workbench](https://github.com/volodchenkov/workbench) instance, which posts it to
+Telegram. Off unless `WORKBENCH_NOTIFY_URL` is set. The workbench may run on the same host or on
+another one. A workbench problem never fails or delays a Plane webhook: the event is written to a
+local spool first and delivered by a background task (at-least-once; workbench dedupes on the Plane
+comment id).
+
+| Var | Default | Purpose |
+|---|---|---|
+| `WORKBENCH_NOTIFY_URL` | _(empty = off)_ | Base URL of the ingest, e.g. `http://127.0.0.1:8780` (same host) or `https://<ingest host>` (other host). Plain `http` is accepted only for a loopback **literal** (`127.0.0.0/8`, `::1`; `localhost` is a name and needs https). Anything else is logged as a config error and notifications stay off; the conductor still starts. Redirects are never followed. |
+| `WORKBENCH_NOTIFY_TOKEN_FILE` | _(none)_ | File holding the ingest bearer. Re-read on every send, so a rotated token needs no restart. Never logged. |
+| `WORKBENCH_NOTIFY_CA_FILE` | _(system store)_ | Private CA bundle for the workbench certificate. The certificate is always verified; verification cannot be turned off. |
+| `WORKBENCH_NOTIFY_TIMEOUT` / `…_CONNECT_TIMEOUT` | `3` / `2` | Seconds, total and connect, per call. |
+| `WORKBENCH_NOTIFY_SPOOL_DIR` | `<LOG_DIR>/workbench-notify-spool` | Failure spool; must be writable under the unit sandbox. |
+| `WORKBENCH_NOTIFY_SPOOL_MAX` / `…_MAX_AGE` | `200` / `86400` | Bound by file count and by age in seconds; the oldest are dropped with an error log. |
+
+Delivery rules: `202` deletes the file; `400`/`413` (the body is wrong) delete it without retry; every
+other answer (`401`, `403`, `404`, `429`, `5xx`, TLS/DNS/connection errors, timeouts) **keeps** it — an
+operator fixes those. Retries back off from 30 s to a 5 min cap with jitter, one attempt per cycle
+whatever the spool size. Rotating the token on the workbench side makes the conductor see `401` and
+keep its spool until the new token file is laid on the conductor host.
+
+Independently of this setting, the runner starts agents with `WORKBENCH_DRIVER=runner` and without
+`TMUX`, so workbench's terminal hooks ignore the conductor's own `claude -p` runs.
+
 ---
 
 ## `conductor.d/<slug>.yaml` — per-workspace config
