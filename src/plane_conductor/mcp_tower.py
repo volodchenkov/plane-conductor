@@ -198,6 +198,27 @@ class TowerRegistry:
             ctx = self.by_project_identifier.get(project_identifier.upper())
             if ctx:
                 return ctx
+        # Interactive fallback: match the process cwd to a workspace's
+        # agent_working_dir. Conductor-spawned pipeline agents set WORKSPACE_SLUG
+        # (handled above), so this only helps an interactive caller (Tron) who
+        # runs the tower from inside one project checkout and omits `workspace`.
+        # Only resolves when exactly one workspace's dir contains the cwd, and
+        # only when no explicit project_identifier was given — an unknown
+        # identifier must raise below, not silently route to the cwd's workspace.
+        if not project_identifier:
+            cwd = str(Path.cwd().resolve())
+            cwd_matches = [
+                c
+                for c in self.by_slug.values()
+                if c.config.agent_working_dir
+                and (
+                    cwd == str(Path(c.config.agent_working_dir).resolve())
+                    or cwd.startswith(str(Path(c.config.agent_working_dir).resolve()) + os.sep)
+                )
+            ]
+            if len(cwd_matches) == 1:
+                return cwd_matches[0]
+
         # Note: a UUID-based fallback would require an API probe per workspace;
         # we don't auto-resolve from root_uuid alone — caller passes workspace
         # explicitly or via WORKSPACE_SLUG env.
