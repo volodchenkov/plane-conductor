@@ -206,16 +206,22 @@ class TowerRegistry:
         # only when no explicit project_identifier was given — an unknown
         # identifier must raise below, not silently route to the cwd's workspace.
         if not project_identifier:
-            cwd = str(Path.cwd().resolve())
-            cwd_matches = [
-                c
-                for c in self.by_slug.values()
-                if c.config.agent_working_dir
-                and (
-                    cwd == str(Path(c.config.agent_working_dir).resolve())
-                    or cwd.startswith(str(Path(c.config.agent_working_dir).resolve()) + os.sep)
-                )
-            ]
+            cwd = Path.cwd().resolve()
+            cwd_matches = []
+            for c in self.by_slug.values():
+                awd = c.config.agent_working_dir
+                if not awd:
+                    continue
+                base = Path(awd)
+                # A relative agent_working_dir would resolve against the tower
+                # process cwd and match anything — unreliable, so only trust
+                # absolute dirs here. is_relative_to handles the fs-root case
+                # that a string prefix ("/" -> "//") would miss.
+                if not base.is_absolute():
+                    continue
+                base = base.resolve()
+                if cwd == base or cwd.is_relative_to(base):
+                    cwd_matches.append(c)
             if len(cwd_matches) == 1:
                 return cwd_matches[0]
 
