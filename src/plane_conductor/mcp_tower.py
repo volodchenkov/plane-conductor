@@ -168,6 +168,10 @@ class TowerRegistry:
     by_slug: dict[str, WorkspaceContext] = field(default_factory=dict)
     by_project_id: dict[str, WorkspaceContext] = field(default_factory=dict)
     by_project_identifier: dict[str, WorkspaceContext] = field(default_factory=dict)
+    #: (slug, absolute agent_working_dir) for EVERY configured workspace, incl.
+    #: ones that failed to hydrate — so the cwd fallback detects an ambiguous
+    #: checkout instead of collapsing onto the only surviving workspace.
+    configured_dirs: list[tuple[str, Path]] = field(default_factory=list)
 
     def slugs(self) -> list[str]:
         """Sorted list of workspace slugs known to this tower instance."""
@@ -206,24 +210,27 @@ class TowerRegistry:
         # only when no explicit project_identifier was given — an unknown
         # identifier must raise below, not silently route to the cwd's workspace.
         if not project_identifier:
+            # Ambiguity is checked against EVERY configured workspace dir
+            # (configured_dirs holds only absolute paths; a relative
+            # agent_working_dir is unreliable and excluded at build time), incl.
+            # workspaces that failed to hydrate — otherwise a shared/nested
+            # checkout would silently collapse onto the one that happened to
+            # load. is_relative_to handles the fs-root case a string prefix
+            # ("/" -> "//") would miss.
             cwd = Path.cwd().resolve()
-            cwd_matches = []
-            for c in self.by_slug.values():
-                awd = c.config.agent_working_dir
-                if not awd:
-                    continue
-                base = Path(awd)
-                # A relative agent_working_dir would resolve against the tower
-                # process cwd and match anything — unreliable, so only trust
-                # absolute dirs here. is_relative_to handles the fs-root case
-                # that a string prefix ("/" -> "//") would miss.
-                if not base.is_absolute():
-                    continue
-                base = base.resolve()
-                if cwd == base or cwd.is_relative_to(base):
-                    cwd_matches.append(c)
-            if len(cwd_matches) == 1:
-                return cwd_matches[0]
+            containing = [
+                slug
+                for slug, base in self.configured_dirs
+                if cwd == base or cwd.is_relative_to(base)
+            ]
+            if len(containing) == 1:
+                ctx = self.by_slug.get(containing[0])
+                if ctx is not None:
+                    return ctx
+                raise WorkspaceNotResolvedError(
+                    f"workspace {containing[0]!r} matches cwd but failed to hydrate "
+                    "(Plane unreachable or key revoked). Pass workspace=… explicitly."
+                )
 
         # Note: a UUID-based fallback would require an API probe per workspace;
         # we don't auto-resolve from root_uuid alone — caller passes workspace
@@ -298,6 +305,10 @@ async def build_registry(conductor_dir: Path | str) -> TowerRegistry:
     ws_list = list(workspaces.values())
     if not ws_list:
         return registry
+    for ws in ws_list:
+        awd = ws.agent_working_dir
+        if awd and Path(awd).is_absolute():
+            registry.configured_dirs.append((ws.workspace_slug, Path(awd).resolve()))
     results = await asyncio.gather(
         *(_hydrate_workspace(ws) for ws in ws_list),
         return_exceptions=True,
