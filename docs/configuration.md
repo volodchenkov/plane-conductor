@@ -80,6 +80,15 @@ operator fixes those. Retries back off from 30 s to a 5 min cap with jitter, one
 whatever the spool size. Rotating the token on the workbench side makes the conductor see `401` and
 keep its spool until the new token file is laid on the conductor host.
 
+**Events and the session topic.** Two kinds are sent: `gate` (a handoff addressed to the initiator)
+and `handoff` (a handoff whose first mention is another member; a short progress line). Both carry
+`root_id`, the Plane root issue UUID: the sender looks the issue up in Plane (a sub-issue resolves
+to its parent) just before delivery, never inside the webhook handler, and caches the answer.
+Workbench uses it to put the event into the topic of the session that filed the task. A `404` on
+the lookup (issue deleted) sends the event without `root_id`; any other lookup failure (5xx,
+timeout of 15 s, `401`/`403`/`429`) keeps the spool file and retries with the same back-off.
+Spool files written by an older conductor (plain body, no lookup context) are still delivered.
+
 Independently of this setting, the runner starts agents with `WORKBENCH_DRIVER=runner` and without
 `TMUX`, so workbench's terminal hooks ignore the conductor's own `claude -p` runs.
 

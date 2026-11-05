@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written to a local spool by the webhook handler and delivered by a background sender to a
   workbench ingest (`WORKBENCH_NOTIFY_URL`, off by default; same host or another host over
   verified https). A workbench outage never affects Plane processing. See `docs/configuration.md`.
+- **Workbench events carry `root_id` and a `handoff` kind**: the sender resolves the Plane root
+  issue of the comment (parent lookup, cached; 404 → unbound, transient → retried) so workbench
+  can route the event to the session topic that filed the task; role-to-role handoffs are sent as
+  progress lines.
 - The runner starts agents with `WORKBENCH_DRIVER=runner` and without `TMUX`.
 - **`retrieve_work_item_by_identifier`** MCP tool on tower — resolves a
   human-readable identifier (`<PROJECT_IDENTIFIER>-<N>`, e.g. `COINEX-72`) to

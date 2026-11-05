@@ -18,7 +18,7 @@ from plane_conductor.logging_config import configure_logging, get_logger
 from plane_conductor.plane_client import PlaneClient
 from plane_conductor.runner import Runner, recover_orphaned_sessions
 from plane_conductor.webhook import build_router
-from plane_conductor.workbench_client import build_notifier
+from plane_conductor.workbench_client import build_notifier, make_root_resolver
 
 log = get_logger(__name__)
 
@@ -54,6 +54,8 @@ def create_app(
     workspaces_with_clients = _build_clients(workspaces)
     runner = Runner(settings=settings)
     notifier = build_notifier(settings)
+    if notifier is not None:
+        notifier.resolver = make_root_resolver(workspaces_with_clients)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

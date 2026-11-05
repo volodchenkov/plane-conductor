@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from plane_conductor import workbench_client
 from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
+from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.runner import spawn_env
 from plane_conductor.webhook import build_router
 from plane_conductor.workbench_client import (
@@ -134,6 +135,12 @@ def spool_files(n: Notifier) -> list[Path]:
     return list(n.files())
 
 
+def spooled(f: Path) -> dict[str, Any]:
+    """The event of a spool file, plain or in the ``{"event", "ctx"}`` envelope."""
+    doc = json.loads(f.read_text())
+    return doc.get("event", doc)
+
+
 # ---------------------------------------------------------------- webhook -> spool -> ingest (N1-N5, N10)
 
 
@@ -176,7 +183,7 @@ def test_n1_gate_comment_writes_one_spool_file_before_the_response(
     resp = post_gate(app_with(settings, workspace_config, n), workspace_config, gate_body())
     assert resp.status_code == 200
     (f,) = spool_files(n)  # on disk by the time the response returned
-    body = json.loads(f.read_text())
+    body = spooled(f)
     assert body["v"] == 1 and body["source"] == "plane" and body["kind"] == "gate"
     assert body["event_id"] == "c1" and body["text"] == "approve?"
     assert body["url"].startswith(
@@ -208,7 +215,7 @@ def test_n2_same_comment_twice_gives_two_spool_files_with_the_same_event_id(
     client = app_with(settings, workspace_config, n)
     post_gate(client, workspace_config, gate_body())
     post_gate(client, workspace_config, gate_body())  # an edit of the same comment
-    ids = [json.loads(f.read_text())["event_id"] for f in spool_files(n)]
+    ids = [spooled(f)["event_id"] for f in spool_files(n)]
     assert ids == ["c1", "c1"]
 
 
@@ -219,7 +226,7 @@ def test_not_a_gate_nothing_spooled(
     client = app_with(settings, workspace_config, n)
     # by the initiator himself
     post_gate(client, workspace_config, gate_body(actor=str(INIT)))
-    # mention is not first / not the initiator
+    # no mention at all
     other = json.dumps(
         {
             "event": "issue_comment",
@@ -228,7 +235,7 @@ def test_not_a_gate_nothing_spooled(
                 "id": "c9",
                 "actor": "a",
                 "issue": ISSUE,
-                "comment_html": mention("11111111-1111-1111-1111-111111111111"),
+                "comment_html": "<p>plain comment, no mention</p>",
             },
         }
     ).encode()
@@ -350,7 +357,7 @@ def test_n7_spool_bounded_by_count_oldest_dropped(tmp_path: Path) -> None:
     n = make_notifier(tmp_path, lambda r: httpx.Response(500), spool_max=5)
     for i in range(8):
         n.publish(event(f"e{i}"))
-    ids = [json.loads(f.read_text())["event_id"] for f in spool_files(n)]
+    ids = [spooled(f)["event_id"] for f in spool_files(n)]
     assert ids == [f"e{i}" for i in range(3, 8)]
 
 
@@ -361,7 +368,7 @@ def test_n7_spool_bounded_by_age(tmp_path: Path) -> None:
     for f in spool_files(n):
         os.utime(f, (clock.now - 7200, clock.now - 7200))
     n.publish(event("new"))
-    assert [json.loads(f.read_text())["event_id"] for f in spool_files(n)] == ["new"]
+    assert [spooled(f)["event_id"] for f in spool_files(n)] == ["new"]
 
 
 def test_n8_url_empty_means_no_http_and_no_spool_file(
@@ -643,3 +650,210 @@ def test_gate_text_decodes_html_entities_and_spool_is_utf8(tmp_path: Path) -> No
     )
     assert ev is not None and "Tom & Jerry <ok> привет" in ev["text"]
     assert "&amp;" not in ev["text"]
+
+
+# ---------------------------------------------------------------- handoff + root resolution (N17-N26)
+
+ROOT = "44444444-4444-4444-4444-444444444444"
+AGENT = UUID("22222222-2222-2222-2222-222222222222")
+CTX = {"workspace": "ws", "project": "p", "issue": ISSUE}
+
+
+def handoff_args(**kw: Any) -> tuple[Any, ...]:
+    base = {
+        "comment_id": "h1",
+        "comment_html": mention(AGENT, "BA done, over to SA"),
+        "mentions": [AGENT],
+        "actor": "someone",
+    }
+    base.update(kw)
+    return (
+        base["comment_id"],
+        base["comment_html"],
+        base["mentions"],
+        base["actor"],
+        INIT,
+        "ws",
+        ISSUE,
+        "https://p",
+        "p",
+    )
+
+
+def test_n17_handoff_detector_rules() -> None:
+    ev = workbench_client.detect_handoff(*handoff_args())
+    assert ev is not None and ev["kind"] == "handoff" and ev["event_id"] == "h1"
+    assert "BA done" in ev["text"]
+    assert workbench_client.detect_handoff(*handoff_args(mentions=[INIT])) is None  # that is a gate
+    assert workbench_client.detect_handoff(*handoff_args(actor=str(INIT))) is None
+    assert workbench_client.detect_handoff(*handoff_args(actor=str(AGENT))) is None  # self-mention
+    assert workbench_client.detect_handoff(*handoff_args(mentions=[])) is None
+    assert workbench_client.detect_handoff(*handoff_args(comment_id=None)) is None
+
+
+def test_n18_webhook_spools_a_handoff_with_the_ctx_envelope_and_a_gate_stays_a_gate(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    n = make_notifier(tmp_path, lambda r: httpx.Response(202))
+    client = app_with(settings, workspace_config, n)
+    body = json.dumps(
+        {
+            "event": "issue_comment",
+            "action": "created",
+            "data": {
+                "id": "h1",
+                "actor": "someone",
+                "issue": ISSUE,
+                "comment_html": mention(AGENT, "over to SA"),
+            },
+        }
+    ).encode()
+    assert post_gate(client, workspace_config, body).status_code == 200
+    assert post_gate(client, workspace_config, gate_body("g1")).status_code == 200
+    docs = [json.loads(f.read_text()) for f in spool_files(n)]
+    assert [d["event"]["kind"] for d in docs] == ["handoff", "gate"]
+    assert all(d["ctx"]["issue"] == ISSUE for d in docs)
+    assert docs[0]["ctx"]["workspace"] == workspace_config.workspace_slug
+
+
+async def deliver(
+    tmp_path: Path,
+    resolver: Any,
+    published: dict[str, Any] | None = None,
+    ctx: Any = CTX,
+    **kw: Any,
+) -> tuple[list[dict[str, Any]], Notifier]:
+    sent: list[dict[str, Any]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(req.content))
+        return httpx.Response(202)
+
+    n = make_notifier(tmp_path, handler, **kw)
+    n.resolver = resolver
+    n.publish(published or event(), ctx)
+    await n.send_pass()
+    return sent, n
+
+
+async def test_n19_sender_resolves_a_sub_issue_to_its_root_and_sends_root_id(
+    tmp_path: Path,
+) -> None:
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        assert (ws, project, issue) == ("ws", "p", ISSUE)
+        return ROOT
+
+    sent, n = await deliver(tmp_path, resolver)
+    assert sent[0]["root_id"] == ROOT and "ctx" not in sent[0] and "event" not in sent[0]
+    assert spool_files(n) == []
+
+
+async def test_n20_root_lookup_is_cached(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        calls.append(issue)
+        return ROOT
+
+    sent, n = await deliver(tmp_path, resolver)
+    n.publish(event("c2"), CTX)
+    await n.send_pass()
+    assert len(sent) == 2 and calls == [ISSUE]
+
+
+async def test_n20b_cached_root_expires_so_a_reparented_issue_is_re_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        calls.append(issue)
+        return ROOT
+
+    monkeypatch.setattr(workbench_client, "ROOT_CACHE_TTL", 0.0)
+    sent, n = await deliver(tmp_path, resolver)
+    n.publish(event("c2"), CTX)
+    await n.send_pass()
+    assert len(sent) == 2 and calls == [ISSUE, ISSUE]
+
+
+async def test_n21_deleted_issue_404_is_sent_unbound(tmp_path: Path) -> None:
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        raise PlaneAPIError(404, "gone")
+
+    sent, n = await deliver(tmp_path, resolver)
+    assert len(sent) == 1 and "root_id" not in sent[0]
+    assert spool_files(n) == []
+
+
+@pytest.mark.parametrize("status", [0, 429, 500, 503, 401, 403])
+async def test_n22_transient_or_auth_lookup_failure_keeps_the_file_and_backs_off(
+    tmp_path: Path, status: int
+) -> None:
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        raise PlaneAPIError(status, "nope")
+
+    sent, n = await deliver(tmp_path, resolver)
+    assert sent == [] and len(spool_files(n)) == 1 and n.next_try > 0
+
+
+async def test_n23_hanging_lookup_is_bounded_and_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workbench_client, "RESOLVE_TIMEOUT", 0.05)
+
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        await asyncio.sleep(5)
+        return ROOT
+
+    sent, n = await asyncio.wait_for(deliver(tmp_path, resolver), timeout=2)
+    assert sent == [] and len(spool_files(n)) == 1
+
+
+async def test_n24_envelope_without_a_resolver_and_plain_legacy_file_are_sent_as_is(
+    tmp_path: Path,
+) -> None:
+    sent, _ = await deliver(tmp_path, None)
+    assert len(sent) == 1 and "root_id" not in sent[0]
+    (tmp_path / "b").mkdir()
+    sent2, _ = await deliver(tmp_path / "b", None, ctx=None)
+    assert len(sent2) == 1 and sent2[0]["event_id"] == "c1"
+
+
+async def test_n25_duplicate_comment_produces_two_files_with_one_event_id(tmp_path: Path) -> None:
+    async def resolver(ws: str, project: str, issue: str) -> str | None:
+        return ROOT
+
+    sent, n = await deliver(tmp_path, resolver)
+    n.publish(event(), CTX)  # a replayed webhook: same event_id; workbench dedupes on it
+    await n.send_pass()
+    assert [e["event_id"] for e in sent] == ["c1", "c1"] and all(e["root_id"] == ROOT for e in sent)
+
+
+async def test_n26_make_root_resolver_parent_root_and_unknown_workspace() -> None:
+    class P:
+        def __init__(self, data: dict[str, Any]) -> None:
+            self.data = data
+
+        async def get_issue(self, project: Any, issue: Any) -> dict[str, Any]:
+            return self.data
+
+    clients = {
+        "ws": (None, P({"id": ISSUE, "parent": ROOT})),
+        "root": (None, P({"id": ROOT, "parent": None})),
+    }
+    r = workbench_client.make_root_resolver(clients)
+    assert await r("ws", "p", ISSUE) == ROOT
+    assert await r("root", "p", ROOT) == ROOT
+    assert await r("other", "p", ISSUE) is None
+
+
+def test_n27_server_wires_the_resolver(
+    settings: Settings, workspaces: dict[str, WorkspaceConfig]
+) -> None:
+    from plane_conductor.server import create_app
+
+    app = create_app(
+        settings.model_copy(update={"workbench_notify_url": "http://127.0.0.1:1"}), workspaces
+    )
+    assert app.state.notifier is not None and app.state.notifier.resolver is not None

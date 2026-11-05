@@ -36,7 +36,7 @@ from plane_conductor.exceptions import (
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
 from plane_conductor.runner import Runner
-from plane_conductor.workbench_client import Notifier, detect_gate
+from plane_conductor.workbench_client import Notifier, detect_gate, detect_handoff
 
 log = get_logger(__name__)
 
@@ -177,14 +177,14 @@ def _publish_gate(
     mentions: list[UUID],
     issue_uuid: UUID,
 ) -> None:
-    """Hand a gate (an initiator-addressed handoff comment) to the workbench spool.
+    """Hand a gate (an initiator-addressed handoff) or a role handoff to the workbench spool.
 
     A local file write only; any failure is logged and the webhook is unaffected.
     """
     if notifier is None:
         return
     try:
-        event = detect_gate(
+        args = (
             data.get("id"),
             comment_html,
             mentions,
@@ -195,8 +195,17 @@ def _publish_gate(
             workspace.plane_base_url,
             str(workspace.project_id),
         )
+        event = detect_gate(*args) or detect_handoff(*args)
         if event is not None:
-            notifier.publish(event)
+            # the root issue is resolved by the sender task, never here
+            notifier.publish(
+                event,
+                {
+                    "workspace": workspace.workspace_slug,
+                    "project": str(workspace.project_id),
+                    "issue": str(issue_uuid),
+                },
+            )
     except Exception as exc:  # never break the Plane webhook
         log.warning("gate_publish_failed", error=type(exc).__name__)
 

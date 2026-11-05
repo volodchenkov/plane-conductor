@@ -21,7 +21,7 @@ import random
 import re
 import ssl
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,8 +30,11 @@ from uuid import UUID
 
 import httpx
 
+from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
+from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.logging_config import get_logger
+from plane_conductor.plane_client import PlaneClient
 
 log = get_logger(__name__)
 
@@ -42,6 +45,9 @@ MAX_URL = 500
 BACKOFF_START = 30.0
 BACKOFF_CAP = 300.0
 ERROR_LOG_EVERY = 600.0
+RESOLVE_TIMEOUT = 15.0
+ROOT_CACHE_MAX = 512
+ROOT_CACHE_TTL = 600.0  # seconds; an issue can be reparented, so a cached root goes stale
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -117,6 +123,34 @@ def _fit_bytes(event: dict[str, Any]) -> dict[str, Any]:
     return event
 
 
+def _build_event(
+    kind: str,
+    title: str,
+    comment_id: str,
+    comment_html: str,
+    workspace: str,
+    issue: str,
+    base_url: str,
+    project: str,
+) -> dict[str, Any]:
+    # Plain text for a Telegram notice: structure is irrelevant (unlike mcp_tower.html_to_markdown,
+    # which feeds an agent and lives in the MCP layer), but entities must be decoded.
+    text = re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub(" ", comment_html))).strip()
+    url: str | None = f"{base_url.rstrip('/')}/{workspace}/projects/{project}/issues/{issue}"
+    if url is None or not url.startswith("https://") or len(url) > MAX_URL:
+        url = None
+    event: dict[str, Any] = {
+        "v": 1,
+        "source": "plane",
+        "kind": kind,
+        "event_id": str(comment_id)[:128],
+        "title": _cut(title, MAX_TITLE),
+        "text": _cut(text, MAX_TEXT),
+        "url": url,
+    }
+    return _fit_bytes(event)
+
+
 def detect_gate(
     comment_id: str | None,
     comment_html: str,
@@ -133,22 +167,72 @@ def detect_gate(
         return None
     if not mentions or mentions[0] != initiator_uuid:
         return None
-    # Plain text for a Telegram notice: structure is irrelevant (unlike mcp_tower.html_to_markdown,
-    # which feeds an agent and lives in the MCP layer), but entities must be decoded.
-    text = re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub(" ", comment_html))).strip()
-    url: str | None = f"{base_url.rstrip('/')}/{workspace}/projects/{project}/issues/{issue}"
-    if url is None or not url.startswith("https://") or len(url) > MAX_URL:
-        url = None
-    event: dict[str, Any] = {
-        "v": 1,
-        "source": "plane",
-        "kind": "gate",
-        "event_id": str(comment_id)[:128],
-        "title": _cut(f"Plane gate: {workspace}", MAX_TITLE),
-        "text": _cut(text, MAX_TEXT),
-        "url": url,
-    }
-    return _fit_bytes(event)
+    return _build_event(
+        "gate",
+        f"Plane gate: {workspace}",
+        comment_id,
+        comment_html,
+        workspace,
+        issue,
+        base_url,
+        project,
+    )
+
+
+def detect_handoff(
+    comment_id: str | None,
+    comment_html: str,
+    mentions: list[UUID],
+    actor: str | None,
+    initiator_uuid: UUID,
+    workspace: str,
+    issue: str,
+    base_url: str,
+    project: str,
+) -> dict[str, Any] | None:
+    """The ingest body for a role-to-role handoff (a progress line), or None.
+
+    A handoff is a comment whose first mention is somebody other than the initiator, written by
+    somebody else than the initiator and than the mentioned member (a self-mention is no handoff).
+    """
+    if not comment_id or not mentions or mentions[0] == initiator_uuid:
+        return None
+    author = str(actor).lower() if actor else ""
+    if author in {str(initiator_uuid).lower(), str(mentions[0]).lower()}:
+        return None
+    return _build_event(
+        "handoff",
+        f"Plane handoff: {workspace}",
+        comment_id,
+        comment_html,
+        workspace,
+        issue,
+        base_url,
+        project,
+    )
+
+
+RootResolver = Callable[[str, str, str], Awaitable[str | None]]
+"""``(workspace, project, issue) -> root issue id``; raises PlaneAPIError (404 = issue is gone)."""
+
+
+def make_root_resolver(clients: dict[str, tuple[WorkspaceConfig, PlaneClient]]) -> RootResolver:
+    """A resolver over the conductor's Plane clients (``slug -> (WorkspaceConfig, PlaneClient)``).
+
+    A sub-issue resolves to its parent, a root to itself. Runs in the sender task only, never in
+    the webhook handler.
+    """
+
+    async def resolve(workspace: str, project: str, issue: str) -> str | None:
+        if workspace not in clients:
+            return None
+        plane = clients[workspace][1]
+        data = await plane.get_issue(project, issue)
+        parent = data.get("parent")
+        root = parent if isinstance(parent, str) and parent else data.get("id") or issue
+        return str(root)
+
+    return resolve
 
 
 # ------------------------------------------------------------------ spool + sender
@@ -175,17 +259,25 @@ class Notifier:
         self.last_error_log = 0.0
         self._task: asyncio.Task[None] | None = None
         self._seq = 0
+        self.resolver: RootResolver | None = None
+        self._roots: dict[tuple[str, str], tuple[float, str | None]] = {}
 
     # ---- spool ----------------------------------------------------------------
-    def publish(self, event: dict[str, Any]) -> bool:
-        """Write the event to the spool (tmp + rename) and wake the sender. Never raises."""
+    def publish(self, event: dict[str, Any], ctx: dict[str, str] | None = None) -> bool:
+        """Write the event to the spool (tmp + rename) and wake the sender. Never raises.
+
+        With ``ctx`` (workspace, project, issue) the file is an envelope ``{"event", "ctx"}`` and
+        the sender resolves the root issue id before delivery; without it the file is the plain
+        body (also what a spool written by an older conductor looks like).
+        """
         try:
             self.cfg.spool_dir.mkdir(parents=True, exist_ok=True)
             self._seq += 1
             safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(event["event_id"]))[:64]
             name = f"{time.time_ns():020d}-{self._seq:06d}-{safe}.json"
             tmp = self.cfg.spool_dir / f".{name}.tmp"
-            tmp.write_text(json.dumps(event, ensure_ascii=False), encoding="utf-8")
+            doc = {"event": event, "ctx": ctx} if ctx else event
+            tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, self.cfg.spool_dir / name)
             self._enforce_bounds()
         except OSError as exc:
@@ -264,11 +356,27 @@ class Notifier:
 
     async def _send_file(self, client: httpx.AsyncClient, path: Path) -> str:
         try:
-            body = json.loads(path.read_text(encoding="utf-8"))
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                raise ValueError("not an object")
         except (OSError, ValueError):
             log.error("workbench_notify_bad_spool_file")
             path.unlink(missing_ok=True)
             return "dropped"
+        body, ctx = (doc["event"], doc.get("ctx")) if "event" in doc else (doc, None)
+        if not isinstance(body, dict):
+            log.error("workbench_notify_bad_spool_file")
+            path.unlink(missing_ok=True)
+            return "dropped"
+        if isinstance(ctx, dict) and self.resolver is not None:
+            try:
+                root = await self._root_of(ctx)
+            except PlaneAPIError as exc:  # transient, auth, rate limit: keep the file, retry later
+                return f"plane_{exc.status_code}"
+            except Exception as exc:  # hanging / unexpected lookup: same
+                return f"plane_{type(exc).__name__}"
+            if root:
+                body = {**body, "root_id": root}
         token = self._token()
         headers = {"Content-Type": "application/json"}
         if token:
@@ -289,6 +397,27 @@ class Notifier:
             return "dropped"
         # 401/403/404/429/5xx and redirects: an operator fixes these; deleting would lose the gate
         return f"http_{status}"
+
+    async def _root_of(self, ctx: dict[str, str]) -> str | None:
+        """Root issue id for the envelope; None when the issue is gone (404 → sent unbound)."""
+        assert self.resolver is not None
+        key = (str(ctx.get("workspace")), str(ctx.get("issue")))
+        hit = self._roots.get(key)
+        if hit is not None and time.monotonic() - hit[0] < ROOT_CACHE_TTL:
+            return hit[1]
+        try:
+            root = await asyncio.wait_for(
+                self.resolver(key[0], str(ctx.get("project")), key[1]), timeout=RESOLVE_TIMEOUT
+            )
+        except PlaneAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            root = None
+        self._roots.pop(key, None)
+        if len(self._roots) >= ROOT_CACHE_MAX:
+            self._roots.pop(next(iter(self._roots)))
+        self._roots[key] = (time.monotonic(), root)
+        return root
 
     def _schedule_retry(self, reason: str) -> None:
         now = self._clock()
