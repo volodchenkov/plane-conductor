@@ -362,3 +362,122 @@ async def test_create_state_and_get_issue(client: PlaneClient) -> None:
     issue = await client.get_issue(PROJECT, issue_id)
     assert issue["name"] == "QSALE-42"
     await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# QSALE-55: bounded Retry-After, request deadline, comment pagination
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_retry_after_above_cap_fails_fast_with_retry_exhausted() -> None:
+    """Given 429 `Retry-After: 3600`; Then the error comes at once (no hour-long sleep)."""
+    slept: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+
+    client = PlaneClient(BASE, "k", SLUG, sleep=fake_sleep)
+    respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/members/").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "3600"}, json={})
+    )
+    with pytest.raises(PlaneAPIError) as ei:
+        await client.list_workspace_members()
+    assert ei.value.status_code == 429 and ei.value.retry_exhausted and ei.value.is_transient
+    assert slept == []
+    await client.aclose()
+
+
+@respx.mock
+async def test_retry_after_total_budget_is_bounded() -> None:
+    slept: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+
+    client = PlaneClient(BASE, "k", SLUG, sleep=fake_sleep, retry_total_max_seconds=25)
+    respx.get(f"{BASE}/api/v1/workspaces/{SLUG}/members/").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "20"}, json={})
+    )
+    with pytest.raises(PlaneAPIError) as ei:
+        await client.list_workspace_members()
+    assert ei.value.retry_exhausted
+    assert slept == [20.0]  # the second 20 s would exceed the 25 s total
+    await client.aclose()
+
+
+async def test_request_deadline_turns_a_hang_into_status_0() -> None:
+    import asyncio
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={})
+
+    client = PlaneClient(
+        BASE,
+        "k",
+        SLUG,
+        request_deadline_seconds=0.05,
+        client=httpx.AsyncClient(base_url=BASE, transport=httpx.MockTransport(slow)),
+    )
+    with pytest.raises(PlaneAPIError) as ei:
+        await client.list_workspace_members()
+    assert ei.value.status_code == 0 and "deadline" in ei.value.message
+    assert ei.value.is_transient
+
+
+@respx.mock
+async def test_error_carries_http_method(client: PlaneClient) -> None:
+    respx.post(f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/i1/comments/").mock(
+        return_value=httpx.Response(502, text="bad gateway")
+    )
+    with pytest.raises(PlaneAPIError) as ei:
+        await client.create_issue_comment(PROJECT, "i1", "<p>x</p>")
+    assert ei.value.method == "POST"
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_issue_comments_all_follows_cursor_and_stops(client: PlaneClient) -> None:
+    path = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/i1/comments/"
+    route = respx.get(path).mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"results": [{"id": "a"}], "next_cursor": "c1", "next_page_results": True}
+            ),
+            httpx.Response(
+                200,
+                json={"results": [{"id": "b"}], "next_cursor": "c2", "next_page_results": False},
+            ),
+        ]
+    )
+    out = await client.list_issue_comments_all(PROJECT, "i1")
+    assert [c["id"] for c in out] == ["a", "b"]
+    assert route.call_count == 2
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_issue_comments_all_stops_on_repeated_cursor(client: PlaneClient) -> None:
+    path = f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/i1/comments/"
+    respx.get(path).mock(
+        return_value=httpx.Response(
+            200, json={"results": [{"id": "a"}], "next_cursor": "same", "next_page_results": True}
+        )
+    )
+    out = await client.list_issue_comments_all(PROJECT, "i1")
+    assert len(out) == 2  # page 1, page 2 (same cursor seen) → stop
+    await client.aclose()
+
+
+@respx.mock
+async def test_create_comment_with_external_id_sends_idempotency_fields(
+    client: PlaneClient,
+) -> None:
+    route = respx.post(
+        f"{BASE}/api/v1/workspaces/{SLUG}/projects/{PROJECT}/issues/i1/comments/"
+    ).mock(return_value=httpx.Response(201, json={"id": "c1"}))
+    await client.create_issue_comment(PROJECT, "i1", "<p>x</p>", external_id="k1")
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["external_id"] == "k1" and sent["external_source"] == "conductor"
+    await client.aclose()

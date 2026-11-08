@@ -1,35 +1,19 @@
-"""Subprocess spawner — multi-workspace, defends against realistic failure modes.
+"""Subprocess runner — one supervised *slot* per ``(workspace, nickname, root)``.
 
-- **Dedup + queue-on-running**: the same `(workspace_slug, nickname, issue_uuid)`
-  cannot be spawned twice concurrently. Plane delivers webhooks at-least-once
-  and an agent can self-handoff via `request_handoff`; without dedup, two agents
-  race to create the same artifact. When a spawn for an in-flight triple is
-  requested via `request_spawn`, we **queue** it (last-write-wins) and fire it
-  the moment the active session exits — so step-execution chains
-  (`agent → request_handoff(target_role='<self>') → next step`) don't lose the
-  re-entry to a race where the comment-webhook arrives before the previous
-  process has cleaned up. Direct `spawn()` callers still get the raise.
-- **Capacity cap**: `MAX_CONCURRENT_SESSIONS` is host-wide — it counts active
-  agents across all workspaces. Stops a flood of mentions from melting the box.
-  Queued (pending) spawns do NOT count toward the cap; the cap is checked
-  again at flush time.
-- **Process group**: every subprocess is spawned in its own session
-  (`start_new_session=True`). On timeout we `killpg(SIGTERM)` then SIGKILL the
-  whole group, so descendants of `claude` (MCP servers, helper procs) die too.
-- **Sentinel files**: before spawn we touch `logs/.active/<slug>-<nick>-<issue>.json`
-  and remove it on exit. On startup the server scans those — anything left
-  over means conductor restarted while an agent was running, and we post a
-  recovery comment to the right Plane workspace.
-- **Announce-spawn (optional, per-workspace)**: when the workspace's
-  `announce_spawn=True` we post a comment to the issue the moment we spawn the
-  subprocess, then update that same comment when the agent exits.
+QSALE-55 rework. The Dispatcher (``dispatcher.py``) decides *whether* a run starts and
+inserts the ``slots`` + ``runs`` rows in one transaction; this module owns *how* it runs:
 
-State kept in memory: `_tasks` (supervisor task pins), `_active`
-(in-flight `(slug, nick, issue)` keys), `_procs` (process handles for shutdown),
-`_pending` (queued spawns waiting for the corresponding `_active` key to clear).
-All four are derivable from "what's running / queued right now"; nothing is
-persisted — a conductor restart drops queued spawns the same way it drops
-active ones (sentinels cover restart recovery for active sessions only).
+- ``claude --output-format stream-json --verbose`` is read line by line (``stream.py``):
+  tower connection (FR-2), handoffs and messages to the initiator (FR-4/5), journaled to
+  ``<state_dir>/streams/<run_id>.ndjson`` *before* parsing so it can be replayed;
+- **watchdog / start failure (FR-2)**: no tower in ``init`` (or process exit / hang without any
+  tower call) kills the group and retries up to ``start_retries`` with backoff, each attempt a
+  new ``runs`` row; exhausted → one ``start_failed`` alert;
+- **outcome (FR-5)** in one transaction (run exit, alert, triggers done, slot release or
+  deferred rerun) once the *whole process group* is gone and the stdout reader hit EOF;
+- process-group control: own session per agent, SIGTERM→SIGKILL on timeout.
+
+All state is in the SQLite store; nothing here is memory-only except task handles.
 """
 
 from __future__ import annotations
@@ -39,25 +23,36 @@ import contextlib
 import json
 import os
 import signal
+import sqlite3
 import time
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 from uuid import UUID
 
+from plane_conductor import alerts
 from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
-from plane_conductor.exceptions import (
-    AgentSpawnError,
-    CapacityFullError,
-    PlaneAPIError,
-    SessionAlreadyRunningError,
-)
+from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.logging_config import get_logger
 from plane_conductor.plane_client import PlaneClient
+from plane_conductor.store import Store
+from plane_conductor.stream import (
+    EV_TOWER_BAD,
+    EV_TOWER_CALL,
+    EV_TOWER_UP,
+    StreamRegistrar,
+    replay_journal,
+)
 
 log = get_logger(__name__)
+
+STREAM_LIMIT = 32 * 1024 * 1024
+GROUP_TERM_AFTER = 10.0
+GROUP_KILL_AFTER = 15.0
 
 
 def build_prompt(
@@ -83,32 +78,29 @@ def build_prompt(
     return "\n".join(lines)
 
 
-def spawn_env(slug: str) -> dict[str, str]:
+def spawn_env(slug: str, run_id: str | None = None) -> dict[str, str]:
     """Environment of a spawned agent: ``WORKSPACE_SLUG`` plus workbench isolation.
 
     ``WORKBENCH_DRIVER=runner`` and no ``TMUX`` make ``workbench-hook`` a no-op for the
     claude processes this runner starts, even when the conductor itself was started inside
-    tmux. Independent of whether notifications are configured.
+    tmux. ``CONDUCTOR_RUN_ID`` marks every descendant of the run: after a conductor crash the
+    next start finds survivors through ``/proc/<pid>/environ`` (SPEC §4.5).
     """
     env = {**os.environ, "WORKSPACE_SLUG": slug, "WORKBENCH_DRIVER": "runner"}
+    if run_id:
+        env["CONDUCTOR_RUN_ID"] = run_id
     env.pop("TMUX", None)
     return env
 
 
-def log_path_for(log_dir: Path, workspace_slug: str, nickname: str, issue_uuid: UUID) -> Path:
+def log_path_for(log_dir: Path, workspace_slug: str, nickname: str, issue_uuid: UUID | str) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     return log_dir / f"{ts}-{workspace_slug}-{nickname}-{str(issue_uuid)[:8]}.log"
 
 
-def _sentinel_dir(log_dir: Path) -> Path:
-    p = log_dir / ".active"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _sentinel_path(log_dir: Path, workspace_slug: str, nickname: str, issue_uuid: UUID) -> Path:
-    return _sentinel_dir(log_dir) / f"{workspace_slug}-{nickname}-{issue_uuid}.json"
+def journal_path(state_dir: Path, run_id: str) -> Path:
+    return state_dir / "streams" / f"{run_id}.ndjson"
 
 
 def _format_duration(seconds: float) -> str:
@@ -122,206 +114,253 @@ def _format_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
-@dataclass(frozen=True)
-class _PendingSpawn:
-    """A spawn request deferred until the matching `_active` key clears.
+@dataclass
+class AttemptResult:
+    """What one process attempt did."""
 
-    Holds the same arguments `spawn()` takes. The `PlaneClient` is the
-    long-lived per-workspace client owned by the router (it outlives any
-    individual webhook handler), so it's safe to capture by reference here.
-    """
-
-    workspace: WorkspaceConfig
-    plane: PlaneClient
-    nickname: str
-    issue_uuid: UUID
-    triggered_by_email: str | None
+    start_failure: str | None = None
+    exit_code: int = -1
+    timed_out: bool = False
+    tower_seen: bool = False
+    registration_dirty: bool = False
+    log_name: str = ""
 
 
 class Runner:
-    """Spawns claude subprocesses with dedup, capacity, and process-group control.
+    """Supervises agents of slots the Dispatcher created. Capacity lives in ``slots``."""
 
-    Multi-workspace: the runner itself doesn't know which workspaces exist; it
-    receives one `WorkspaceConfig` (and its matching `PlaneClient`) per spawn.
-    The host-wide capacity cap is enforced across all workspaces.
-    """
-
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        store: Store,
+        workspaces: dict[str, tuple[WorkspaceConfig, PlaneClient]],
+        *,
+        on_change: Callable[[], None] | None = None,
+        on_alert: Callable[[], None] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
         self.settings = settings
+        self.store = store
+        self.workspaces = workspaces
+        self.on_change: Callable[[], None] = on_change or (lambda: None)
+        self.on_alert: Callable[[], None] = on_alert or (lambda: None)
+        #: Awaited with the finishing run before its slot is released, so deferred reruns are
+        #: re-validated like any other start (set by the Dispatcher).
+        self.pre_release: Callable[[sqlite3.Row], Awaitable[None]] | None = None
+        self._sleep = sleep or asyncio.sleep
         self._tasks: set[asyncio.Task[None]] = set()
-        self._active: set[tuple[str, str, UUID]] = set()
-        # pid → Process. pid is also the pgid since we use start_new_session=True.
+        # pgid (== pid, own session) → Process, for shutdown.
         self._procs: dict[int, asyncio.subprocess.Process] = {}
-        # Pending spawns keyed by (slug, nick, issue). Last-write-wins:
-        # multiple handoffs targeting the same triple while one is active
-        # coalesce — only one spawn fires at exit because the next agent
-        # reads actual state from Plane, not from queued trigger metadata.
-        self._pending: dict[tuple[str, str, UUID], _PendingSpawn] = {}
+        self._configs = {slug: ws for slug, (ws, _p) in workspaces.items()}
+        self.stopping = False
+
+    # -- public --------------------------------------------------------------
 
     @property
     def active_count(self) -> int:
-        return len(self._active)
+        return self.store.scalar("SELECT count(*) FROM slots")
 
-    @property
-    def pending_count(self) -> int:
-        return len(self._pending)
+    def launch(self, run_id: str) -> None:
+        """Supervise the slot whose first run is ``run_id`` (already committed)."""
+        task = asyncio.create_task(self._supervise_slot(run_id), name=f"slot-{run_id[:8]}")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
-    async def request_spawn(
-        self,
-        *,
-        workspace: WorkspaceConfig,
-        plane: PlaneClient,
-        nickname: str,
-        issue_uuid: UUID,
-        triggered_by_email: str | None = None,
-    ) -> dict[str, object]:
-        """Spawn-or-queue. Prefer this over `spawn()` for webhook-driven calls.
+    # -- slot supervision ------------------------------------------------------
 
-        If the `(slug, nick, issue)` triple is already in flight, the spawn is
-        **queued** and fires automatically when the active session exits. This
-        closes the race where an agent's `request_handoff(target_role='<self>')`
-        comment-webhook arrives before the previous subprocess has finished
-        cleaning up — without it, the chain dies silently as a
-        `SessionAlreadyRunningError` log entry.
-
-        Returns one of:
-            `{"status": "spawned", "log_path": Path}` — fresh spawn fired.
-            `{"status": "queued"}` — added to pending; fires on session exit.
-                If a pending entry for the triple already existed, it's
-                **overwritten** (last-write-wins; see class docstring).
-
-        Raises:
-            CapacityFullError: host-wide cap reached at decision time. Pending
-                entries are NOT counted; the cap is rechecked at flush time
-                and queued spawns are dropped (with a log) if capacity is
-                still full then.
-            AgentSpawnError: claude binary missing (immediate spawn path only).
-        """
-        slug = workspace.workspace_slug
-        key = (slug, nickname, issue_uuid)
-        if key in self._active:
-            already_queued = key in self._pending
-            self._pending[key] = _PendingSpawn(
-                workspace=workspace,
-                plane=plane,
-                nickname=nickname,
-                issue_uuid=issue_uuid,
-                triggered_by_email=triggered_by_email,
-            )
-            log.info(
-                "spawn_queued",
-                workspace=slug,
-                nickname=nickname,
-                issue=str(issue_uuid),
-                replaced_existing=already_queued,
-                pending=len(self._pending),
-            )
-            return {"status": "queued"}
-        log_path = await self.spawn(
-            workspace=workspace,
-            plane=plane,
-            nickname=nickname,
-            issue_uuid=issue_uuid,
-            triggered_by_email=triggered_by_email,
-        )
-        return {"status": "spawned", "log_path": log_path}
-
-    async def spawn(
-        self,
-        *,
-        workspace: WorkspaceConfig,
-        plane: PlaneClient,
-        nickname: str,
-        issue_uuid: UUID,
-        triggered_by_email: str | None = None,
-    ) -> Path:
-        """Spawn `claude --agent <nickname>` for `(workspace, issue_uuid)`.
-
-        Direct-spawn path: raises rather than queues on conflict. Webhook
-        callers should prefer `request_spawn` to get queue-on-running.
-
-        Raises:
-            SessionAlreadyRunningError: an agent for this triple is in flight.
-            CapacityFullError: MAX_CONCURRENT_SESSIONS reached (host-wide).
-            AgentSpawnError: claude binary missing.
-        """
-        slug = workspace.workspace_slug
-        key = (slug, nickname, issue_uuid)
-        if key in self._active:
-            raise SessionAlreadyRunningError(
-                f"@{nickname} already running on {issue_uuid} in {slug}"
-            )
-        if len(self._active) >= self.settings.max_concurrent_sessions:
-            raise CapacityFullError(
-                f"max_concurrent_sessions={self.settings.max_concurrent_sessions} reached"
-            )
-
-        log_path = log_path_for(self.settings.log_dir, slug, nickname, issue_uuid)
-        prompt = build_prompt(
-            nickname=nickname,
-            issue_uuid=issue_uuid,
-            plane_base_url=workspace.plane_base_url,
-            workspace_slug=slug,
-            project_id=workspace.project_id,
-            triggered_by_email=triggered_by_email,
-        )
-        agent_cfg = workspace.agents_by_nickname().get(nickname)
-        agent_name = agent_cfg.prompt_role if agent_cfg else nickname
-        argv = [
-            self.settings.claude_binary,
-            "--agent",
-            agent_name,
-            # `auto`, not `acceptEdits`: under --print nobody can answer a prompt,
-            # so acceptEdits silently denies every Bash command outside the
-            # allowlist and the agent improvises workarounds. `auto` lets the
-            # classifier decide; deny rules in settings still always win.
-            "--permission-mode",
-            "auto",
-            "--print",
-        ]
-        cwd = workspace.agent_working_dir or Path.cwd()
-
-        log_fp = log_path.open("ab", buffering=0)
-        log_fp.write(
-            f"# {datetime.now(UTC).isoformat()} spawn workspace={slug} argv={argv!r} cwd={cwd}\n".encode()
-        )
-        log_fp.write(f"# prompt:\n{prompt}\n# --- stdout/stderr ---\n".encode())
-
+    async def _supervise_slot(self, run_id: str) -> None:
+        current: str | None = run_id
         try:
+            while current is not None:
+                current = await self._run_group(current)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("slot_supervisor_crashed", run_id=run_id)
+            self._emergency_release(current or run_id)
+        finally:
+            self.on_change()
+
+    def _run_row(self, run_id: str) -> sqlite3.Row:
+        row = self.store.one("SELECT * FROM runs WHERE run_id=?", (run_id,))
+        assert row is not None, run_id
+        return row
+
+    async def _run_group(self, run_id: str) -> str | None:
+        """Run attempts until one gets tower (or retries run out); then the outcome.
+
+        Returns the run id of a deferred rerun that took over the slot, or ``None``.
+        """
+        run = self._run_row(run_id)
+        started = time.monotonic()
+        announce = self._start_announce(run)
+        while True:
+            res = await self._attempt(run)
+            if (
+                res.start_failure
+                and int(run["attempt"]) < self.settings.start_retries
+                and not self.stopping
+            ):
+                self._finish_failed_attempt(run, res)
+                backoffs = self.settings.start_retry_backoff_seconds or [0.0]
+                delay = backoffs[min(int(run["attempt"]), len(backoffs) - 1)]
+                log.warning(
+                    "start_retry",
+                    workspace=run["workspace"],
+                    nickname=run["nickname"],
+                    issue=run["issue_id"],
+                    attempt=int(run["attempt"]) + 1,
+                    cause=res.start_failure,
+                    backoff_s=delay,
+                )
+                await self._sleep(delay)
+                if self.stopping:
+                    # shutdown began during the backoff: do not start a process that the
+                    # shutdown snapshot has not seen
+                    res.start_failure = f"{res.start_failure} (retry skipped: shutting down)"
+                    break
+                run = self._new_attempt(run)
+                continue
+            break
+        if self.pre_release is not None:
+            try:
+                await self.pre_release(run)
+            except (
+                Exception
+            ):  # a validation bug must not leak the slot; the rerun then goes unchecked
+                log.exception("pre_release_failed", run_id=run["run_id"])
+        next_run = self._complete(run, res)
+        duration = time.monotonic() - started
+        log.info(
+            "agent_exited",
+            workspace=run["workspace"],
+            nickname=run["nickname"],
+            issue=run["issue_id"],
+            exit_code=res.exit_code,
+            timed_out=res.timed_out,
+            start_failure=res.start_failure,
+            duration_s=round(duration, 1),
+        )
+        await self._finish_announce(run, announce, res, duration)
+        return next_run
+
+    def _new_attempt(self, prev: sqlite3.Row) -> sqlite3.Row:
+        new_id = uuid.uuid4().hex
+        with self.store.tx() as c:
+            c.execute(
+                "INSERT INTO runs(run_id, group_id, attempt, workspace, plane_base_url, project_id,"
+                " nickname, root_id, issue_id, triggered_by_email, state, started_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?, 'starting', ?)",
+                (
+                    new_id,
+                    prev["group_id"],
+                    int(prev["attempt"]) + 1,
+                    prev["workspace"],
+                    prev["plane_base_url"],
+                    prev["project_id"],
+                    prev["nickname"],
+                    prev["root_id"],
+                    prev["issue_id"],
+                    prev["triggered_by_email"],
+                    time.time(),
+                ),
+            )
+            c.execute(
+                "UPDATE slots SET run_id=? WHERE workspace=? AND nickname=? AND root_id=?",
+                (new_id, prev["workspace"], prev["nickname"], prev["root_id"]),
+            )
+        return self._run_row(new_id)
+
+    # -- one process attempt ---------------------------------------------------
+
+    async def _attempt(self, run: sqlite3.Row) -> AttemptResult:
+        res = AttemptResult()
+        run_id = str(run["run_id"])
+        ws = self._configs.get(str(run["workspace"]))
+        if ws is None:
+            res.start_failure = f"spawn_error: workspace {run['workspace']!r} not configured"
+            return res
+        log_fp: IO[bytes] | None = None
+        journal_fp: IO[bytes] | None = None
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            log_path = log_path_for(
+                self.settings.log_dir, str(run["workspace"]), str(run["nickname"]), run["issue_id"]
+            )
+            res.log_name = log_path.name
+            jpath = journal_path(self.settings.state_dir, run_id)
+            jpath.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            log_fp = log_path.open("ab", buffering=0)
+            journal_fp = jpath.open("ab", buffering=0)
+            prompt = build_prompt(
+                nickname=str(run["nickname"]),
+                issue_uuid=UUID(str(run["issue_id"])),
+                plane_base_url=str(run["plane_base_url"]),
+                workspace_slug=str(run["workspace"]),
+                project_id=str(run["project_id"]),
+                triggered_by_email=run["triggered_by_email"],
+            )
+            agent_cfg = ws.agents_by_nickname().get(str(run["nickname"]))
+            agent_name = agent_cfg.prompt_role if agent_cfg else str(run["nickname"])
+            argv = [
+                self.settings.claude_binary,
+                "--agent",
+                agent_name,
+                # `auto`, not `acceptEdits`: under --print nobody can answer a prompt.
+                "--permission-mode",
+                "auto",
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ]
+            cwd = ws.agent_working_dir or Path.cwd()
+            log_fp.write(
+                f"# {datetime.now(UTC).isoformat()} spawn run={run_id} attempt={run['attempt']}"
+                f" workspace={run['workspace']} argv={argv!r} cwd={cwd}\n".encode()
+            )
+            log_fp.write(f"# prompt:\n{prompt}\n# --- stderr / stream events ---\n".encode())
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
-                stdout=log_fp,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=log_fp,
                 cwd=str(cwd),
-                # Inject WORKSPACE_SLUG so tower's pickup_issue / find_artifact_by_label
-                # / etc. auto-resolve workspace without the agent having to pass
-                # `workspace=` on every call. Conductor already knows the slug at
-                # spawn time — agents shouldn't have to re-discover it from the URL.
-                env=spawn_env(slug),
+                env=spawn_env(str(run["workspace"]), run_id),
                 start_new_session=True,
+                limit=STREAM_LIMIT,
             )
-        except FileNotFoundError as exc:
-            log_fp.close()
-            raise AgentSpawnError(
-                f"claude binary not found at {self.settings.claude_binary!r}"
-            ) from exc
+        except Exception as exc:  # any failure between the claim commit and a running process
+            res.start_failure = f"spawn_error: {type(exc).__name__}: {exc}"
+            for fp in (log_fp, journal_fp):
+                if fp is not None:
+                    with contextlib.suppress(Exception):
+                        fp.close()
+            log.error(
+                "spawn_failed",
+                run_id=run_id,
+                nickname=run["nickname"],
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return res
 
-        self._active.add(key)
+        assert log_fp is not None and journal_fp is not None
         self._procs[proc.pid] = proc
-        self._write_sentinel(slug, nickname, issue_uuid, log_path)
-
+        with contextlib.suppress(sqlite3.Error):
+            self.store.execute(
+                "UPDATE runs SET state='running', pid=?, pgid=? WHERE run_id=?",
+                (proc.pid, proc.pid, run_id),
+            )
         log.info(
             "agent_spawned",
-            workspace=slug,
-            nickname=nickname,
-            issue=str(issue_uuid),
+            run_id=run_id,
+            workspace=run["workspace"],
+            nickname=run["nickname"],
+            issue=run["issue_id"],
+            attempt=run["attempt"],
             pid=proc.pid,
-            pgid=proc.pid,
             log_path=str(log_path),
-            active=len(self._active),
         )
-
         if proc.stdin is not None:
             try:
                 proc.stdin.write(prompt.encode("utf-8"))
@@ -332,157 +371,173 @@ class Runner:
                 with contextlib.suppress(Exception):
                     proc.stdin.close()
 
-        announce_comment_id: str | None = None
-        if workspace.announce_spawn:
-            announce_comment_id = await self._post_announce(
-                plane, workspace.project_id, nickname, issue_uuid
-            )
+        reg = StreamRegistrar(self.store, run_id, self._configs)
+        tower_up = asyncio.Event()
+        tower_bad: list[str] = []
+        bad_ev = asyncio.Event()
 
-        started_at = time.monotonic()
-        task = asyncio.create_task(
-            self._supervise(
-                proc=proc,
-                log_fp=log_fp,
-                plane=plane,
-                project_id=workspace.project_id,
-                workspace_slug=slug,
-                nickname=nickname,
-                issue_uuid=issue_uuid,
-                announce_comment_id=announce_comment_id,
-                started_at=started_at,
-            )
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        def on_event(kind: str, detail: str) -> None:
+            if kind in (EV_TOWER_UP, EV_TOWER_CALL):
+                tower_up.set()
+            elif kind == EV_TOWER_BAD and not tower_bad:
+                tower_bad.append(f"tower {detail}")
+                bad_ev.set()
 
-        return log_path
-
-    async def _supervise(
-        self,
-        *,
-        proc: asyncio.subprocess.Process,
-        log_fp: IO[bytes],
-        plane: PlaneClient,
-        project_id: UUID,
-        workspace_slug: str,
-        nickname: str,
-        issue_uuid: UUID,
-        announce_comment_id: str | None,
-        started_at: float,
-    ) -> None:
-        timeout = self.settings.session_timeout_seconds
-        timed_out = False
-        exit_code = -1
+        reader = asyncio.create_task(self._read(proc, reg, journal_fp, log_fp, on_event))
+        watchdog = asyncio.create_task(self._watchdog(proc, tower_up, bad_ev, tower_bad, res))
         try:
             try:
-                exit_code = await asyncio.wait_for(proc.wait(), timeout=timeout)
+                res.exit_code = await asyncio.wait_for(
+                    proc.wait(), timeout=self.settings.session_timeout_seconds
+                )
             except TimeoutError:
-                timed_out = True
-                exit_code = await self._kill_group(proc)
+                res.timed_out = True
+                res.exit_code = await self._kill_group(proc)
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+            await self._wait_group_gone(proc.pid)
+            await self._reader_barrier(reader)
+            await self._clean_registration(reg, run_id)
         finally:
-            with contextlib.suppress(Exception):
-                log_fp.close()
+            if proc.returncode is None:
+                # cancelled (shutdown) or crashed mid-run: never leave the group behind
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            for t in (reader, watchdog):
+                if not t.done():
+                    t.cancel()
+            for fp in (log_fp, journal_fp):
+                with contextlib.suppress(Exception):
+                    fp.close()
             transport = getattr(proc, "_transport", None)
             if transport is not None:
                 with contextlib.suppress(Exception):
                     transport.close()
-            key = (workspace_slug, nickname, issue_uuid)
-            self._active.discard(key)
             self._procs.pop(proc.pid, None)
-            self._clear_sentinel(workspace_slug, nickname, issue_uuid)
-            pending = self._pending.pop(key, None)
-            if pending is not None:
-                # Schedule the queued spawn on a fresh task — don't await it
-                # in the supervise `finally` because that would keep this
-                # supervisor (and its log fp / transport refs) alive longer
-                # than necessary and could deadlock if the new spawn itself
-                # blocks on something this supervisor is holding.
-                flush_task = asyncio.create_task(self._flush_pending(pending))
-                self._tasks.add(flush_task)
-                flush_task.add_done_callback(self._tasks.discard)
+        res.tower_seen = reg.tower_seen
+        res.registration_dirty = reg.dirty
+        if res.start_failure is None and not reg.tower_seen:
+            res.start_failure = f"exit_without_tower: exit code {res.exit_code}, no tower tool call"
+        return res
 
-        duration = time.monotonic() - started_at
-        log.info(
-            "agent_exited",
-            workspace=workspace_slug,
-            nickname=nickname,
-            issue=str(issue_uuid),
-            exit_code=exit_code,
-            timed_out=timed_out,
-            duration_s=round(duration, 1),
-            active=len(self._active),
-        )
-
-        if announce_comment_id is not None:
-            await self._update_announce(
-                plane,
-                project_id,
-                nickname,
-                issue_uuid,
-                announce_comment_id,
-                exit_code,
-                timed_out,
-                duration,
-            )
-        elif exit_code != 0 or timed_out:
-            await self._notify_failure(
-                plane, project_id, nickname, issue_uuid, exit_code, timed_out
-            )
-
-    async def _flush_pending(self, pending: _PendingSpawn) -> None:
-        """Fire a queued spawn from `_supervise`'s exit hook.
-
-        Errors are logged and swallowed — we never raise out of this path
-        because the original webhook that enqueued the pending spawn has
-        long since returned its 200 to Plane. There's no caller to surface
-        the error to. If capacity is now full, or the binary went missing,
-        we log it and the chain stops there; an initiator can re-trigger.
-        """
+    async def _watchdog(
+        self,
+        proc: asyncio.subprocess.Process,
+        tower_up: asyncio.Event,
+        bad_ev: asyncio.Event,
+        tower_bad: list[str],
+        res: AttemptResult,
+    ) -> None:
+        """Kill the group when tower is not connected (init) or never called within the limit."""
+        up = asyncio.create_task(tower_up.wait())
+        bad = asyncio.create_task(bad_ev.wait())
         try:
-            await self.spawn(
-                workspace=pending.workspace,
-                plane=pending.plane,
-                nickname=pending.nickname,
-                issue_uuid=pending.issue_uuid,
-                triggered_by_email=pending.triggered_by_email,
+            done, _ = await asyncio.wait(
+                {up, bad},
+                timeout=self.settings.start_no_tower_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        except SessionAlreadyRunningError:
-            # Lost the race with a fresh direct trigger that landed between
-            # `_active.discard` and this flush. The direct trigger covers
-            # the same intent; safe to drop.
-            log.info(
-                "pending_flush_skipped_already_running",
-                workspace=pending.workspace.workspace_slug,
-                nickname=pending.nickname,
-                issue=str(pending.issue_uuid),
+            if up in done and bad not in done:
+                return
+            res.start_failure = (
+                tower_bad[0]
+                if tower_bad
+                else f"start_hang: no tower in {self.settings.start_no_tower_timeout_seconds:g}s"
             )
-        except CapacityFullError:
-            log.warning(
-                "pending_flush_skipped_capacity_full",
-                workspace=pending.workspace.workspace_slug,
-                nickname=pending.nickname,
-                issue=str(pending.issue_uuid),
+            log.warning("start_failure_detected", pid=proc.pid, cause=res.start_failure)
+            await self._kill_group(proc)
+        finally:
+            for t in (up, bad):
+                t.cancel()
+
+    async def _read(
+        self,
+        proc: asyncio.subprocess.Process,
+        reg: StreamRegistrar,
+        journal_fp: IO[bytes],
+        log_fp: IO[bytes],
+        on_event: Callable[[str, str], None],
+    ) -> None:
+        """Drain stdout forever: journal first, then parse. Never stops on a write failure."""
+        stream = proc.stdout
+        assert stream is not None
+        discarding = False
+        write_failed = False
+        while True:
+            eof = False
+            try:
+                line = await stream.readuntil(b"\n")
+            except asyncio.IncompleteReadError as exc:
+                line, eof = exc.partial, True
+            except asyncio.LimitOverrunError as exc:
+                with contextlib.suppress(Exception):
+                    await stream.readexactly(exc.consumed)
+                if not discarding:
+                    log.error("stream_line_oversized", run_id=reg.run_id)
+                discarding = True
+                continue
+            if discarding:
+                # this chunk is the tail of the oversized line: drop it
+                discarding = False
+                if eof:
+                    return
+                continue
+            if line:
+                try:
+                    journal_fp.write(line if line.endswith(b"\n") else line + b"\n")
+                except OSError as exc:
+                    if not write_failed:
+                        write_failed = True
+                        log.error(
+                            "run_log_write_failed", run_id=reg.run_id, error=type(exc).__name__
+                        )
+                try:
+                    events = reg.feed(line)
+                except Exception:  # a parser bug must never stop the drain
+                    log.exception("stream_feed_crashed", run_id=reg.run_id)
+                    events = []
+                    reg.dirty = True
+                try:
+                    if reg.last_type:
+                        log_fp.write(f"# event {reg.last_type}\n".encode())
+                    if reg.last_type.startswith("result") and reg.result is not None:
+                        text = str(reg.result.get("result", ""))
+                        log_fp.write(f"# result: {text}\n".encode())
+                except OSError:
+                    pass
+                for kind, detail in events:
+                    on_event(kind, detail)
+            if eof:
+                return
+
+    async def _reader_barrier(self, reader: asyncio.Task[None]) -> None:
+        """Wait for stdout EOF (pipe closed by the group exit), bounded."""
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(reader), timeout=self.settings.reader_drain_seconds
             )
-        except AgentSpawnError as exc:
-            log.error(
-                "pending_flush_failed",
-                workspace=pending.workspace.workspace_slug,
-                nickname=pending.nickname,
-                issue=str(pending.issue_uuid),
-                error=str(exc),
-            )
-        except Exception as exc:
-            # Catch-all: this runs detached from any webhook caller, so an
-            # uncaught OSError / PermissionError / unexpected subprocess
-            # failure would just go into asyncio's unraisable handler with
-            # no operator-visible signal. Log it structurally instead.
-            log.exception(
-                "pending_flush_unexpected_error",
-                workspace=pending.workspace.workspace_slug,
-                nickname=pending.nickname,
-                issue=str(pending.issue_uuid),
-                error=str(exc),
-            )
+        except TimeoutError:
+            log.error("reader_drain_timeout")
+            reader.cancel()
+        except Exception:
+            log.exception("reader_crashed")
+
+    async def _clean_registration(self, reg: StreamRegistrar, run_id: str) -> None:
+        """Replay the journal until registration is clean (SPEC §4.2 "registration failure")."""
+        if not reg.dirty:
+            return
+        jpath = journal_path(self.settings.state_dir, run_id)
+        for _ in range(60):
+            replay = replay_journal(self.store, run_id, self._configs, jpath)
+            if not replay.dirty:
+                reg.tower_seen = reg.tower_seen or replay.tower_seen
+                reg.dirty = False
+                return
+            await self._sleep(1.0)
+        log.error("registration_still_dirty", run_id=run_id)
+
+    # -- process group ---------------------------------------------------------
 
     async def _kill_group(self, proc: asyncio.subprocess.Process) -> int:
         """SIGTERM the process group; SIGKILL after 5s if it didn't exit."""
@@ -495,28 +550,255 @@ class Runner:
                 os.killpg(proc.pid, signal.SIGKILL)
             return await proc.wait()
 
-    # -- Plane comment helpers ------------------------------------------------
+    async def _wait_group_gone(self, pgid: int) -> None:
+        """Block until no process of the group is left (descendants included).
+
+        The slot is released only after this: a grandchild still running means the role is
+        still "running" for FR-3. After ``GROUP_TERM_AFTER`` SIGTERM, +5 s SIGKILL; if the group
+        still does not vanish the slot stays and an ERROR is logged once a minute.
+        """
+        t0 = time.monotonic()
+        termed = killed = False
+        last_err = 0.0
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            elapsed = time.monotonic() - t0
+            if elapsed >= GROUP_TERM_AFTER and not termed:
+                termed = True
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pgid, signal.SIGTERM)
+            if elapsed >= GROUP_KILL_AFTER and not killed:
+                killed = True
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pgid, signal.SIGKILL)
+            if elapsed >= GROUP_KILL_AFTER + 1 and time.monotonic() - last_err >= 60:
+                last_err = time.monotonic()
+                log.error("process_group_survives_kill", pgid=pgid)
+            await self._sleep(0.5)
+
+    # -- outcome ---------------------------------------------------------------
+
+    def _finish_failed_attempt(self, run: sqlite3.Row, res: AttemptResult) -> None:
+        """A start-failed attempt that will be retried: close the process, no alert.
+
+        ``outcome_done`` stays 0: the *group* is not finished. A crash in the backoff must
+        reach recovery as an interrupted run (``conductor_restart`` alert), not as silently
+        done work. ``_complete`` closes every attempt of the group.
+        """
+        self.store.execute(
+            "UPDATE runs SET state='exited', exit_code=?, timed_out=?, start_failure=?,"
+            " outcome_done=0, replayed=1, ended_at=? WHERE run_id=?",
+            (res.exit_code, int(res.timed_out), res.start_failure, time.time(), run["run_id"]),
+        )
+
+    def _complete(self, run: sqlite3.Row, res: AttemptResult) -> str | None:
+        """Outcome + slot release in ONE transaction (all or nothing on a crash).
+
+        Alert table (SPEC §4.2): start_failed > abnormal_exit > no_handoff; a clean exit that
+        left a handoff or an initiator message needs nothing. Deferred triggers of the key take
+        the slot as one rerun; otherwise the slot is deleted.
+        """
+        now = time.time()
+        run_id = str(run["run_id"])
+        next_run: str | None = None
+        alert_made = False
+        with self.store.tx() as c:
+            fresh = c.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            in_doubt = int(fresh["in_doubt"]) + int(
+                c.execute(
+                    "SELECT count(*) AS n FROM handoffs WHERE run_id=? AND state='called'",
+                    (run_id,),
+                ).fetchone()["n"]
+            )
+            msg = c.execute(
+                "SELECT 1 FROM handoffs WHERE run_id=? AND state='posted' LIMIT 1", (run_id,)
+            ).fetchone()
+            clean = res.exit_code == 0 and not res.timed_out
+            facts: dict[str, Any] = {
+                "nickname": run["nickname"],
+                "issue": run["issue_id"],
+                "attempts": int(run["attempt"]) + 1,
+                "exit_code": res.exit_code,
+                "timed_out": res.timed_out or None,
+                "in_doubt_tool_calls": in_doubt or None,
+                "log": res.log_name or None,
+            }
+            reason: str | None = None
+            if res.start_failure:
+                reason = "start_failed"
+                facts["cause"] = res.start_failure
+            elif msg is not None:
+                reason = None if clean else "abnormal_exit"
+            else:
+                reason = "no_handoff"
+                if clean:
+                    log.warning(
+                        "finished_without_handoff",
+                        run_id=run_id,
+                        nickname=run["nickname"],
+                        issue=run["issue_id"],
+                    )
+            if reason:
+                alerts.enqueue(
+                    c,
+                    reason=reason,
+                    subject=str(run["group_id"]),
+                    workspace=run["workspace"],
+                    plane_base_url=run["plane_base_url"],
+                    project_id=run["project_id"],
+                    issue_id=run["issue_id"],
+                    facts=facts,
+                    now=now,
+                )
+                alert_made = True
+            c.execute(
+                "UPDATE runs SET state='exited', exit_code=?, timed_out=?, start_failure=?,"
+                " tower_seen=?, in_doubt=?, outcome_done=1, replayed=?, ended_at=? WHERE run_id=?",
+                (
+                    res.exit_code,
+                    int(res.timed_out),
+                    res.start_failure,
+                    int(res.tower_seen),
+                    in_doubt,
+                    0 if res.registration_dirty else 1,  # dirty: recovery replays it next start
+                    now,
+                    run_id,
+                ),
+            )
+            c.execute("UPDATE runs SET outcome_done=1 WHERE group_id=?", (run["group_id"],))
+            c.execute(
+                "UPDATE triggers SET state='done', finished_at=? WHERE state='running' AND run_id"
+                " IN (SELECT run_id FROM runs WHERE group_id=?)",
+                (now, run["group_id"]),
+            )
+            next_run = self._release_slot(c, run, now)
+        if alert_made:
+            self.on_alert()
+        return next_run
+
+    def _release_slot(self, c: sqlite3.Connection, run: sqlite3.Row, now: float) -> str | None:
+        """Hand the slot to the deferred triggers of its key (one rerun) or delete it."""
+        key = (run["workspace"], run["nickname"], run["root_id"])
+        deferred = c.execute(
+            "SELECT * FROM triggers WHERE workspace=? AND nickname=? AND root_id=?"
+            " AND state='deferred' ORDER BY id",
+            key,
+        ).fetchall()
+        if self.stopping or not deferred:
+            c.execute("DELETE FROM slots WHERE workspace=? AND nickname=? AND root_id=?", key)
+            return None
+        new_run = uuid.uuid4().hex
+        group = uuid.uuid4().hex
+        last = deferred[-1]
+        sources = sorted({str(t["source_run_id"]) for t in deferred if t["source_run_id"]})
+        c.execute(
+            "INSERT INTO runs(run_id, group_id, attempt, workspace, plane_base_url, project_id,"
+            " nickname, root_id, issue_id, triggered_by_email, state, started_at)"
+            " VALUES(?,?,0,?,?,?,?,?,?,?, 'starting', ?)",
+            (
+                new_run,
+                group,
+                run["workspace"],
+                run["plane_base_url"],
+                run["project_id"],
+                run["nickname"],
+                run["root_id"],
+                last["issue_id"],
+                last["triggered_by_email"],
+                now,
+            ),
+        )
+        c.execute(
+            "UPDATE slots SET group_id=?, run_id=?, issue_id=?, covered_sources=?"
+            " WHERE workspace=? AND nickname=? AND root_id=?",
+            (group, new_run, last["issue_id"], json.dumps(sources), *key),
+        )
+        c.execute(
+            "UPDATE triggers SET state='running', run_id=? WHERE id IN ({})".format(
+                ",".join("?" * len(deferred))
+            ),
+            (new_run, *[t["id"] for t in deferred]),
+        )
+        return new_run
+
+    def _emergency_release(self, run_id: str) -> None:
+        """Last resort when a supervisor crashed: never leak a slot (it would block its key)."""
+        try:
+            with self.store.tx() as c:
+                row = c.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if row is None:
+                    return
+                c.execute(
+                    "UPDATE runs SET state='lost', outcome_done=1, replayed=1, ended_at=? WHERE run_id=?",
+                    (time.time(), run_id),
+                )
+                c.execute(
+                    "DELETE FROM slots WHERE workspace=? AND nickname=? AND root_id=?",
+                    (row["workspace"], row["nickname"], row["root_id"]),
+                )
+        except Exception:
+            log.exception("emergency_release_failed", run_id=run_id)
+
+    # -- announce (optional, per workspace) --------------------------------------
+
+    def _start_announce(self, run: sqlite3.Row) -> asyncio.Task[str | None] | None:
+        entry = self.workspaces.get(str(run["workspace"]))
+        if entry is None or not entry[0].announce_spawn:
+            return None
+        ws, plane = entry
+        return asyncio.create_task(
+            self._post_announce(
+                plane, ws.project_id, str(run["nickname"]), UUID(str(run["issue_id"]))
+            )
+        )
+
+    async def _finish_announce(
+        self,
+        run: sqlite3.Row,
+        task: asyncio.Task[str | None] | None,
+        res: AttemptResult,
+        duration: float,
+    ) -> None:
+        if task is None:
+            return
+        try:
+            comment_id = await asyncio.wait_for(task, timeout=15)
+        except Exception:
+            return
+        if comment_id is None:
+            return
+        ws, plane = self.workspaces[str(run["workspace"])]
+        await self._update_announce(
+            plane,
+            ws.project_id,
+            str(run["nickname"]),
+            UUID(str(run["issue_id"])),
+            comment_id,
+            res,
+            duration,
+        )
 
     @staticmethod
     async def _post_announce(
-        plane: PlaneClient,
-        project_id: UUID,
-        nickname: str,
-        issue_uuid: UUID,
+        plane: PlaneClient, project_id: UUID, nickname: str, issue_uuid: UUID
     ) -> str | None:
         body = (
             f"<p><strong><code>@{nickname}</code> picking up.</strong> "
             f"Working on it — this comment will be updated when the agent finishes.</p>"
         )
         try:
-            resp = await plane.create_issue_comment(project_id, issue_uuid, body)
-        except PlaneAPIError as exc:
+            resp = await asyncio.wait_for(
+                plane.create_issue_comment(project_id, issue_uuid, body), timeout=10
+            )
+        except (PlaneAPIError, TimeoutError) as exc:
             log.warning(
                 "announce_comment_failed",
                 nickname=nickname,
                 issue=str(issue_uuid),
-                status_code=exc.status_code,
-                error=exc.message,
+                error=getattr(exc, "message", type(exc).__name__),
             )
             return None
         comment_id = resp.get("id") if isinstance(resp, dict) else None
@@ -529,16 +811,17 @@ class Runner:
         nickname: str,
         issue_uuid: UUID,
         comment_id: str,
-        exit_code: int,
-        timed_out: bool,
+        res: AttemptResult,
         duration: float,
     ) -> None:
-        if timed_out:
+        if res.start_failure:
+            verdict = "failed to start"
+        elif res.timed_out:
             verdict = "timed out"
-        elif exit_code == 0:
+        elif res.exit_code == 0:
             verdict = "done"
         else:
-            verdict = f"exited {exit_code}"
+            verdict = f"exited {res.exit_code}"
         body = (
             f"<p><strong><code>@{nickname}</code> {verdict}.</strong> "
             f"Duration: {_format_duration(duration)}.</p>"
@@ -554,178 +837,38 @@ class Runner:
                 error=exc.message,
             )
 
-    @staticmethod
-    async def _notify_failure(
-        plane: PlaneClient,
-        project_id: UUID,
-        nickname: str,
-        issue_uuid: UUID,
-        exit_code: int,
-        timed_out: bool,
-    ) -> None:
-        kind = "timed out" if timed_out else f"exited {exit_code}"
-        body = f"<p><strong><code>@{nickname}</code> {kind}.</strong> See orchestrator logs.</p>"
-        try:
-            await plane.create_issue_comment(project_id, issue_uuid, body)
-        except PlaneAPIError as exc:
-            log.error(
-                "failure_comment_post_failed",
-                nickname=nickname,
-                issue=str(issue_uuid),
-                status_code=exc.status_code,
-                error=exc.message,
-            )
-
-    # -- sentinel file helpers ------------------------------------------------
-
-    def _write_sentinel(
-        self,
-        workspace_slug: str,
-        nickname: str,
-        issue_uuid: UUID,
-        log_path: Path,
-    ) -> None:
-        path = _sentinel_path(self.settings.log_dir, workspace_slug, nickname, issue_uuid)
-        payload = {
-            "workspace_slug": workspace_slug,
-            "nickname": nickname,
-            "issue_uuid": str(issue_uuid),
-            "log_path": str(log_path),
-            "started_at": datetime.now(UTC).isoformat(),
-        }
-        with contextlib.suppress(OSError):
-            path.write_text(json.dumps(payload), encoding="utf-8")
-
-    def _clear_sentinel(self, workspace_slug: str, nickname: str, issue_uuid: UUID) -> None:
-        path = _sentinel_path(self.settings.log_dir, workspace_slug, nickname, issue_uuid)
-        with contextlib.suppress(FileNotFoundError, OSError):
-            path.unlink()
-
     # -- shutdown -------------------------------------------------------------
 
     async def wait_idle(self, grace_seconds: float = 30.0) -> None:
-        """Wait for in-flight supervisors. After `grace_seconds`, kill all groups.
+        """Wait for in-flight supervisors. After ``grace_seconds``, kill all groups.
 
-        Loops: a queued spawn flushed from an exiting supervisor adds a fresh
-        supervisor task, which `_flush_pending` schedules AFTER the parent
-        `_supervise` is already done — so a single `gather(*_tasks)` would
-        miss it. We re-snapshot until the set drains.
+        Deferred reruns are not started during shutdown (``stopping``): the supervisors finish
+        their current group and the slot is deleted; the deferred triggers survive in the store
+        and run after the next start. ``asyncio.wait`` (not ``wait_for(gather)``) is used on
+        purpose: a timeout must NOT cancel the supervisors, whose cleanup would drop the process
+        handles before the kill step below collects them and let the agent groups survive.
         """
-        deadline = asyncio.get_running_loop().time() + grace_seconds
-        try:
-            while self._tasks:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError
-                snapshot = list(self._tasks)
-                await asyncio.wait_for(
-                    asyncio.gather(*snapshot, return_exceptions=True),
-                    timeout=remaining,
-                )
-        except TimeoutError:
-            procs = list(self._procs.values())
-            log.warning("shutdown_grace_expired", killing_groups=len(procs))
-            for proc in procs:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-            for proc in procs:
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-            # Final drain — any flush tasks scheduled after we ran out of
-            # grace still get awaited so their file handles close. Bounded
-            # so a misbehaving flush (queued spawn that itself blocks on a
-            # broken plane API, etc.) can't park shutdown indefinitely.
-            post_kill_deadline = asyncio.get_running_loop().time() + 5.0
-            while self._tasks:
-                remaining = post_kill_deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    log.warning(
-                        "wait_idle_post_kill_drain_timeout",
-                        leftover_tasks=len(self._tasks),
-                    )
-                    break
-                snapshot = list(self._tasks)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*snapshot, return_exceptions=True),
-                        timeout=remaining,
-                    )
-                except TimeoutError:
-                    log.warning(
-                        "wait_idle_post_kill_drain_timeout",
-                        leftover_tasks=len(self._tasks),
-                    )
-                    break
-
-
-# ---------------------------------------------------------------------------
-# Recovery scan — called from server lifespan on startup.
-# ---------------------------------------------------------------------------
-
-
-async def recover_orphaned_sessions(
-    settings: Settings,
-    workspaces: dict[str, tuple[WorkspaceConfig, PlaneClient]],
-) -> int:
-    """Post a recovery comment for each leftover sentinel; remove them.
-
-    `workspaces` is a slug-keyed dict mapping to `(WorkspaceConfig, PlaneClient)`.
-    A sentinel for an unknown workspace (config removed since restart) is
-    logged and the file deleted — we can't post anywhere meaningful.
-    """
-    sentinel_dir = settings.log_dir / ".active"
-    if not sentinel_dir.exists():
-        return 0
-    found = 0
-    for path in sentinel_dir.iterdir():
-        if path.suffix != ".json":
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            issue_uuid = UUID(data["issue_uuid"])
-            nickname = data["nickname"]
-            slug = data.get("workspace_slug")
-            log_path = data.get("log_path", "(unknown)")
-            started_at = data.get("started_at", "(unknown)")
-        except (OSError, ValueError, KeyError) as exc:
-            log.warning("sentinel_unreadable", path=str(path), error=str(exc))
-            with contextlib.suppress(OSError):
-                path.unlink()
-            continue
-
-        if not slug or slug not in workspaces:
-            log.warning(
-                "sentinel_orphan_workspace_unknown",
-                path=str(path),
-                workspace_slug=slug,
-                nickname=nickname,
-            )
-            with contextlib.suppress(OSError):
-                path.unlink()
-            continue
-
-        workspace, plane = workspaces[slug]
-        body = (
-            f"<p><strong><code>@{nickname}</code> was running when "
-            f"the orchestrator restarted.</strong><br>"
-            f"Started: {started_at}. Log: <code>{log_path}</code>.<br>"
-            f"Mention me again to continue from where I left off.</p>"
-        )
-        try:
-            await plane.create_issue_comment(workspace.project_id, issue_uuid, body)
-        except PlaneAPIError as exc:
-            log.error(
-                "recovery_comment_failed",
-                workspace=slug,
-                nickname=nickname,
-                issue=str(issue_uuid),
-                status_code=exc.status_code,
-                error=exc.message,
-            )
-        finally:
-            with contextlib.suppress(OSError):
-                path.unlink()
-        found += 1
-    if found:
-        log.info("recovered_orphaned_sessions", count=found)
-    return found
+        self.stopping = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace_seconds
+        while self._tasks:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait(list(self._tasks), timeout=remaining)
+        if not self._tasks:
+            return
+        procs = list(self._procs.values())
+        log.warning("shutdown_grace_expired", killing_groups=len(procs))
+        for proc in procs:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        # the supervisors now see the exit, finish their outcome and release their slots
+        post_kill = loop.time() + 10.0
+        while self._tasks and loop.time() < post_kill:
+            await asyncio.wait(list(self._tasks), timeout=post_kill - loop.time())
+        if self._tasks:
+            log.warning("wait_idle_post_kill_drain_timeout", leftover_tasks=len(self._tasks))
+            for t in list(self._tasks):
+                t.cancel()
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)

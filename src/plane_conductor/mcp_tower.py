@@ -20,13 +20,15 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 from uuid import UUID
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from plane_conductor.conductor_config import (
     WorkspaceConfig,
@@ -52,8 +54,12 @@ def _esc(value: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-class TowerError(Exception):
-    """Base for plane-tower invariant violations and routing failures."""
+class TowerError(ToolError):
+    """Base for plane-tower invariant violations and routing failures.
+
+    A ``ToolError`` so the MCP SDK shows the *text* to the agent; any other exception
+    type reaches the model only as ``Error executing tool <name>`` (QSALE-55 FR-1).
+    """
 
 
 class WorkspaceNotResolvedError(TowerError):
@@ -301,6 +307,14 @@ async def build_registry(conductor_dir: Path | str) -> TowerRegistry:
     other tenant. Raises only if EVERY workspace failed to hydrate.
     """
     workspaces = load_workspaces(Path(conductor_dir))
+    # Before any hydration: a failing hydration must not leak a key into its own error text.
+    register_secrets(
+        [
+            v
+            for ws in workspaces.values()
+            for v in (ws.plane_api_key.get_secret_value(), ws.webhook_secret.get_secret_value())
+        ]
+    )
     registry = TowerRegistry()
     ws_list = list(workspaces.values())
     if not ws_list:
@@ -448,64 +462,143 @@ mcp = MCPServer("plane-tower")
 _REGISTRY: TowerRegistry | None = None
 
 
+# ---------------------------------------------------------------------------
+# Error text for the agent (QSALE-55 FR-1) + redaction
+# ---------------------------------------------------------------------------
+
+#: Exact secret values of every loaded workspace config (also workspaces that fail
+#: hydration). Filled by ``build_registry`` *before* hydration starts.
+_SECRET_VALUES: set[str] = set()
+_SECRET_RE = re.compile(r"(?i)(api[-_ ]?key|token|secret|authorization|bearer)\S*[=: ]+\S+")
+_MAX_BODY = 1000
+
+
+def register_secrets(values: list[str]) -> None:
+    """Add exact secret values to the redaction set (ignores short/empty ones)."""
+    _SECRET_VALUES.update(v for v in values if v and len(v) >= 4)
+
+
+def redact(text: str) -> str:
+    """Strip configured secret values and ``key=value`` credential shapes from ``text``."""
+    for secret in sorted(_SECRET_VALUES, key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
+    return _SECRET_RE.sub("[redacted]", text)
+
+
+class _RedactFilter(logging.Filter):
+    """Redact secrets from log message and traceback text of the tower logger."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            import traceback
+
+            record.exc_text = redact("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        return True
+
+
+logger.addFilter(_RedactFilter())
+
+
+def _agent_error_text(op: str, exc: BaseException) -> str:
+    """The text an agent sees for a failed tool call: operation, type, status, cause.
+
+    Never empty. ``outcome_unknown`` is appended to an ambiguous failure of a *write*
+    (transport error, 5xx, deadline, exhausted 429 budget): Plane may have committed it.
+    """
+    if isinstance(exc, PlaneAPIError):
+        body = redact(str(exc.message))[:_MAX_BODY] or "(empty body)"
+        text = f"plane_error: op={op} status={exc.status_code} path={exc.url or '-'} body={body}"
+        write = (exc.method or "").upper() not in {"", "GET", "HEAD"}
+        if write and (exc.is_transient):
+            text += (
+                " outcome_unknown: the comment/record may have been created — "
+                "list_comments / read the artifact before retrying"
+            )
+        return text
+    return f"internal_error: op={op} {type(exc).__name__}: {redact(str(exc))[:_MAX_BODY]}"
+
+
 # Call log: one JSON line per tool invocation, written to
 # $LOG_DIR/tower-<pid>.jsonl. Enabled by env `TOWER_CALL_LOG=1`. Off by
 # default. Used to diagnose «agent silently hung» — claude --print discards
 # child MCP server stderr, so without a sidecar log we can't tell which tool
 # call was in-flight at the time of a hang.
-if os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", "on"}:
+_CALL_LOG_ON = os.environ.get("TOWER_CALL_LOG", "").strip().lower() in {"1", "true", "yes", "on"}
+_log_fh: Any = None
+if _CALL_LOG_ON:
     _log_path = (
         Path(os.environ.get("LOG_DIR", "/var/log/plane-conductor")) / f"tower-{os.getpid()}.jsonl"
     )
     _log_path.parent.mkdir(parents=True, exist_ok=True)
     _log_fh = open(_log_path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115  (long-lived handle for process lifetime)
 
-    def _emit(**event: Any) -> None:
-        """Append a single JSON-line event to the tower call log; swallow IO errors."""
-        with contextlib.suppress(Exception):
-            _log_fh.write(json.dumps(event, default=str) + "\n")
 
-    _orig_tool = mcp.tool
+def _emit(**event: Any) -> None:
+    """Append a single JSON-line event to the tower call log (no-op when disabled)."""
+    if _log_fh is None:
+        return
+    with contextlib.suppress(Exception):
+        _log_fh.write(json.dumps(event, default=str) + "\n")
 
-    def _logged_tool(*a: Any, **kw: Any) -> Any:
-        """Shim around `mcp.tool` that wraps every registered tool with start/end/error log events."""
-        register = _orig_tool(*a, **kw)
 
-        def wrap(fn: Any) -> Any:
-            """Decorator returned by the shimmed `mcp.tool` — wraps `fn` in `inner` then registers it."""
+_F = TypeVar("_F", bound=Callable[..., Any])
+_orig_tool = mcp.tool
 
-            @wraps(fn)
-            async def inner(*args: Any, **kwargs: Any) -> Any:
-                """Timed wrapper around the wrapped tool: emit start, end (with ms+size), or error."""
-                t0 = time.monotonic()
-                _emit(event="start", tool=fn.__name__, args=sorted(kwargs))
-                try:
-                    result = await fn(*args, **kwargs)
-                except Exception as exc:
-                    _emit(
-                        event="error",
-                        tool=fn.__name__,
-                        ms=int((time.monotonic() - t0) * 1000),
-                        exc=type(exc).__name__,
-                        msg=str(exc)[:300],
-                    )
-                    raise
-                size = (
-                    len(json.dumps(result, default=str)) if isinstance(result, dict | list) else 0
-                )
+
+def _wrapped_tool(*a: Any, **kw: Any) -> Callable[[_F], _F]:
+    """Shim around ``mcp.tool``: every tool converts any exception into a readable ``ToolError``.
+
+    Always on (it used to be gated by ``TOWER_CALL_LOG``); only the JSONL logging stays gated.
+    """
+    register = _orig_tool(*a, **kw)
+
+    def wrap(fn: _F) -> _F:
+        """Decorator returned by the shimmed ``mcp.tool`` — wraps ``fn`` in ``inner`` then registers it."""
+
+        @wraps(fn)
+        async def inner(*args: Any, **kwargs: Any) -> Any:
+            """Timed wrapper: log start/end, map any failure to ``ToolError`` with a real message."""
+            t0 = time.monotonic()
+            _emit(event="start", tool=fn.__name__, args=sorted(kwargs))
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as exc:
                 _emit(
-                    event="end",
+                    event="error",
                     tool=fn.__name__,
                     ms=int((time.monotonic() - t0) * 1000),
-                    size=size,
+                    exc=type(exc).__name__,
+                    msg=redact(str(exc))[:300],
                 )
-                return result
+                if isinstance(exc, ToolError):
+                    if _SECRET_VALUES and redact(str(exc)) != str(exc):
+                        raise ToolError(redact(str(exc))) from None
+                    raise
+                logger.error(
+                    "tower tool %s failed: %s",
+                    fn.__name__,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                raise ToolError(_agent_error_text(fn.__name__, exc)) from None
+            size = len(json.dumps(result, default=str)) if isinstance(result, dict | list) else 0
+            _emit(
+                event="end",
+                tool=fn.__name__,
+                ms=int((time.monotonic() - t0) * 1000),
+                size=size,
+            )
+            return result
 
-            return register(inner)
+        return cast("_F", register(inner))
 
-        return wrap
+    return wrap
 
-    mcp.tool = _logged_tool  # type: ignore[method-assign]
+
+mcp.tool = _wrapped_tool  # type: ignore[method-assign]
 
 
 def _registry() -> TowerRegistry:
@@ -581,7 +674,7 @@ async def retrieve_work_item_by_identifier(
     cleaned = identifier.strip().upper()
     m = _IDENTIFIER_RE.match(cleaned)
     if not m:
-        raise ValueError(
+        raise TowerError(
             f"identifier {identifier!r} must match '<PROJECT_IDENTIFIER>-<N>' (e.g. 'COINEX-72')"
         )
     project_identifier, seq_str = m.group(1), m.group(2)
@@ -591,7 +684,7 @@ async def retrieve_work_item_by_identifier(
     async with await _client_for(ctx) as plane:
         issue = await plane.retrieve_issue_by_sequence_id(ctx.config.project_id, sequence_id)
     if issue is None:
-        raise ValueError(
+        raise TowerError(
             f"work item {cleaned} not found in workspace {ctx.config.workspace_slug!r}"
         )
     return {
@@ -906,7 +999,9 @@ async def create_sub_issue(
             ctx.config.project_id,
             name=title,
             parent=root_uuid,
-            description_html=description_html,
+            # Plane's serializer rejects an empty string ("Invalid HTML passed"); a blank
+            # description is a valid call (QSALE-55 FR-1), so send an empty paragraph.
+            description_html=description_html if description_html.strip() else "<p></p>",
             labels=[label_uuid],
             assignees=assignees,
         )
@@ -1521,6 +1616,7 @@ async def post_bug_report(
         f"<p>{_initiator_mention(ctx)}{next_mention}</p>"
     )
 
+    back_link_warning = ""
     async with await _client_for(ctx) as plane:
         comment = await plane.create_issue_comment(
             ctx.config.project_id, test_sub_uuid, comment_html
@@ -1539,16 +1635,21 @@ async def post_bug_report(
                     url=link_url,
                     title=f"[{severity}] {title}",
                 )
-            except PlaneAPIError:
-                # Best-effort — the bug comment is the source of truth.
-                pass
+            except Exception as exc:
+                # Best-effort — the bug comment is the source of truth. Any failure (not
+                # only PlaneAPIError) must not hide the committed comment: conductor
+                # registers a handoff only from a *successful* tool result.
+                back_link_warning = f"back-link failed: {type(exc).__name__}"
 
-    return {
+    result: dict[str, Any] = {
         "comment_id": comment.get("id"),
         "test_sub_uuid": test_sub_uuid,
         "affected_sub_uuid": affected_sub_uuid,
         "severity": severity,
     }
+    if back_link_warning:
+        result["warnings"] = [back_link_warning]
+    return result
 
 
 # ----- escalate_upstream_gap -----------------------------------------------

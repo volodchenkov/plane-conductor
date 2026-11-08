@@ -49,12 +49,34 @@ Full template lives at [`examples/runtime.env.example`](../examples/runtime.env.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `LOG_DIR` | `./logs` | Where per-run agent log files (and `.active/` sentinels) live. Shared across workspaces; filenames carry the workspace slug. |
+| `LOG_DIR` | `./logs` | Where per-run agent log files live. Shared across workspaces; filenames carry the workspace slug. |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. |
 | `LOG_FORMAT` | `pretty` | `pretty` (console renderer with colours) or `json` (one JSON object per line). |
 | `MAX_CONCURRENT_SESSIONS` | `5` | **Host-wide** cap on simultaneously-running agents (across ALL workspaces). N+1th spawn is rejected with `CapacityFullError`. |
 | `SESSION_TIMEOUT_SECONDS` | `3600` | Per-agent timeout. After that the supervisor kills the whole process group (SIGTERM, then SIGKILL after 5s). |
 | `SHUTDOWN_GRACE_SECONDS` | `30` | On `systemctl stop`, how long to wait for in-flight agents to finish before SIGKILL. Keep below systemd's `TimeoutStopSec` (default 90s). |
+
+### Reliability state (durable queue, handoff watcher, alerts)
+
+Conductor keeps its operational state in one SQLite (WAL) file and guards it with a `flock`:
+a second conductor on the same `STATE_DIR` refuses to start. Every retry and limit is
+configurable; "N times" counts **retries after the first attempt**.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `STATE_DIR` | `<LOG_DIR>/state` | `conductor.db`, `conductor.lock` and `streams/<run>.ndjson` (the raw agent stream, journalled before parsing). Must be writable under the unit sandbox (`LOG_DIR` already is). Mode `0700`. |
+| `START_RETRIES` / `START_RETRY_BACKOFF_SECONDS` | `3` / `[5,15,45]` | A run that never reaches tower is restarted this many times with this backoff, then one `start_failed` comment to the initiator. |
+| `START_NO_TOWER_TIMEOUT_SECONDS` | `180` | A start that reaches no tower call within this time is killed and treated as a failed start. |
+| `HANDOFF_ACK_SECONDS` / `HANDOFF_RETRY_INTERVAL_SECONDS` / `HANDOFF_MAX_RETRIES` | `300` / `300` / `3` | A handoff addressed to an agent that no trigger covers after the first value is redelivered; after the retries, one `handoff_undelivered` alert. Handoffs to the initiator (gates) are never watched. |
+| `QUEUE_MAX_AGE_SECONDS` | `5400` | A trigger waiting (queued / deferred) longer expires with one `queue_timeout` alert. Must exceed `SESSION_TIMEOUT_SECONDS`. |
+| `SOURCE_WAIT_SECONDS` | `10` | How long a trigger waits for the tool result that identifies its source run before it is treated as foreign. |
+| `READER_DRAIN_SECONDS` | `10` | Bound on waiting for the agent's stdout to hit EOF after the process group is gone. |
+| `ALERT_MAX_ATTEMPTS` | `20` | Publish attempts (backoff 30 s → 300 s) before an alert is dropped with an ERROR. |
+| `RETRY_AFTER_MAX_SECONDS` / `RETRY_TOTAL_MAX_SECONDS` / `REQUEST_DEADLINE_SECONDS` | `30` / `60` / `90` | Bounds on Plane `429 Retry-After` handling and on one request's wall-clock time. |
+| `STATE_RETENTION_DAYS` / `DEDUPE_RETENTION_DAYS` | `14` / `365` | Retention of finished rows; triggers are kept longest ("no second run for the same comment + addressee"). |
+
+Alerts are ordinary Plane comments that start with an initiator mention and end with a
+`conductor-alert:<key>` marker; one cause gives one comment.
 
 ### Gate notifications to workbench (optional)
 

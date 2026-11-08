@@ -58,10 +58,12 @@ reviews:
     - path: "src/plane_conductor/webhook.py"
       instructions: |
         HMAC verification must be constant-time. Plane sends webhooks
-        at-least-once — the handler must be idempotent (the dedup is in
-        Runner, not here, but webhook must surface SessionAlreadyRunningError
-        as `skipped`, not 500). Transient Plane API errors must return 503;
-        4xx must return 200 with a skipped[] entry.
+        at-least-once and never redelivers a non-2xx answer — the handler is
+        thin and durable-first: no Plane call on the request path, one
+        `INSERT OR IGNORE` per (comment, addressee) into `triggers` (dedup by
+        unique key), 200 means "durably accepted", a failed state write
+        answers 503. Resolution, merge/defer/queue and spawning belong to the
+        Dispatcher (`dispatcher.py`), not here.
     - path: "tests/**/*.py"
       instructions: |
         Tests should not call out to real services unless gated by

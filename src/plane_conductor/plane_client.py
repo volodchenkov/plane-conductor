@@ -36,8 +36,17 @@ class PlaneClient:
         max_retries: int = 3,
         backoff_base: float = 1.0,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        retry_after_max_seconds: float = 30.0,
+        retry_total_max_seconds: float = 60.0,
+        request_deadline_seconds: float = 90.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        #: One ``Retry-After`` sleep longer than this ends the retry loop (exhausted).
+        self.retry_after_max_seconds = retry_after_max_seconds
+        #: Sum of all ``Retry-After`` sleeps of one request.
+        self.retry_total_max_seconds = retry_total_max_seconds
+        #: Wall-clock cap around the whole retry loop of one request.
+        self.request_deadline_seconds = request_deadline_seconds
         self.workspace_slug = workspace_slug
         self.max_retries = max_retries
         self.backoff_base = backoff_base
@@ -80,32 +89,63 @@ class PlaneClient:
         json: Any | None = None,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        """Issue one request, retrying on HTTP 429 up to `max_retries` times.
+        """Issue one request, retrying on HTTP 429 within bounded budgets.
 
         Retry-After is honoured when the server provides it (Plane sends a
         whole number of seconds via DRF's `ApiKeyRateThrottle`). Without
         Retry-After, falls back to exponential backoff `backoff_base * 2**attempt`.
-        Other 4xx/5xx pass through to the existing PlaneAPIError path.
+        The loop is bounded three ways (QSALE-55): one sleep above
+        ``retry_after_max_seconds`` or a running total above ``retry_total_max_seconds``
+        ends it with ``PlaneAPIError(429, retry_exhausted=True)``; an outer
+        ``asyncio.timeout(request_deadline_seconds)`` turns a hang into
+        ``PlaneAPIError(0, "deadline exceeded")``. Other 4xx/5xx pass through.
 
         Retries are safe because 429 is raised by the throttle layer **before**
         the request handler runs — the side-effecting handler is never entered
         on a throttled call, so retrying a POST does not duplicate work.
         """
+        try:
+            async with asyncio.timeout(self.request_deadline_seconds):
+                return await self._request_loop(method, path, json=json, params=params)
+        except TimeoutError as exc:
+            raise PlaneAPIError(0, "deadline exceeded", url=path, method=method) from exc
+
+    async def _request_loop(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any | None,
+        params: dict[str, Any] | None,
+    ) -> Any:
+        slept = 0.0
         for attempt in range(self.max_retries + 1):
             try:
                 resp = await self._client.request(method, path, json=json, params=params)
             except httpx.HTTPError as exc:
-                raise PlaneAPIError(0, f"transport error: {exc}", url=path) from exc
+                raise PlaneAPIError(0, f"transport error: {exc}", url=path, method=method) from exc
 
             if resp.status_code == 429 and attempt < self.max_retries:
                 delay = self._parse_retry_after(resp.headers.get("Retry-After"), attempt)
+                if (
+                    delay > self.retry_after_max_seconds
+                    or slept + delay > self.retry_total_max_seconds
+                ):
+                    raise PlaneAPIError(
+                        429,
+                        f"rate limited; Retry-After={delay:g}s exceeds the retry budget",
+                        url=path,
+                        method=method,
+                        retry_exhausted=True,
+                    )
+                slept += delay
                 await self._sleep(delay)
                 continue
             break
 
         if resp.status_code >= 400:
             text = resp.text
-            raise PlaneAPIError(resp.status_code, text, url=path)
+            raise PlaneAPIError(resp.status_code, text, url=path, method=method)
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()
@@ -468,18 +508,59 @@ class PlaneClient:
         )
         return self._results(payload)
 
+    async def list_issue_comments_all(
+        self,
+        project_id: str | UUID,
+        issue_id: str | UUID,
+        *,
+        per_page: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List ALL comments of an issue, following the cursor.
+
+        Stops on ``next_page_results == false``, an empty page or a repeated cursor
+        (Plane keeps minting fresh-looking cursors after the last row — same hazard
+        as ``list_issues``). Vendor: ``plane/utils/paginator.py``,
+        ``plane/api/views/issue.py`` (``next_cursor``, ``next_page_results``).
+        """
+        path = f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/{issue_id}/comments/"
+        params: dict[str, Any] = {"per_page": per_page}
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while True:
+            payload = await self._request("GET", path, params=params)
+            page = self._results(payload)
+            out.extend(page)
+            if not isinstance(payload, dict) or not page:
+                break
+            if payload.get("next_page_results") is False:
+                break
+            cursor = payload.get("next_cursor")
+            if not cursor or not isinstance(cursor, str) or cursor in seen:
+                break
+            seen.add(cursor)
+            params = {"per_page": per_page, "cursor": cursor}
+        return out
+
     async def create_issue_comment(
         self,
         project_id: str | UUID,
         issue_id: str | UUID,
         comment_html: str,
+        *,
+        external_source: str | None = None,
+        external_id: str | None = None,
     ) -> dict[str, Any]:
+        """POST a comment. ``external_source``/``external_id`` make a repeat idempotent (409)."""
+        body: dict[str, Any] = {"comment_html": comment_html}
+        if external_id:
+            body["external_source"] = external_source or "conductor"
+            body["external_id"] = external_id
         return cast(
             "dict[str, Any]",
             await self._request(
                 "POST",
                 f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/{issue_id}/comments/",
-                json={"comment_html": comment_html},
+                json=body,
             ),
         )
 

@@ -24,6 +24,7 @@ from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
 from plane_conductor.exceptions import PlaneAPIError
 from plane_conductor.runner import spawn_env
+from plane_conductor.store import Store
 from plane_conductor.webhook import build_router
 from plane_conductor.workbench_client import (
     BACKOFF_CAP,
@@ -75,11 +76,6 @@ class Plane:
 
     async def list_issue_comments(self, project_id: Any, issue_id: Any) -> list[dict[str, Any]]:
         return []
-
-
-class Runner:
-    async def request_spawn(self, **kwargs: Any) -> dict[str, Any]:
-        return {"status": "spawned"}
 
 
 def cfg(tmp_path: Path, **kw: Any) -> NotifyConfig:
@@ -170,8 +166,15 @@ def post_gate(client: TestClient, workspace: WorkspaceConfig, body: bytes) -> ht
 
 def app_with(settings: Settings, workspace: WorkspaceConfig, notifier: Notifier) -> TestClient:
     app = FastAPI()
+    store = Store(settings.state_dir / "conductor.db")
     app.include_router(
-        build_router(settings, {workspace.workspace_slug: (workspace, Plane())}, Runner(), notifier)
+        build_router(
+            settings,
+            {workspace.workspace_slug: (workspace, Plane())},
+            store,
+            lambda: None,
+            notifier,
+        )
     )
     return TestClient(app)
 
