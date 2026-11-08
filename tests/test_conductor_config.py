@@ -255,7 +255,7 @@ def test_webhook_secret_rejects_too_short() -> None:
 
 def test_webhook_secret_accepts_32_chars() -> None:
     cfg = _ws(webhook_secret="x" * 32)
-    assert cfg.webhook_secret == "x" * 32
+    assert cfg.webhook_secret.get_secret_value() == "x" * 32
 
 
 @pytest.mark.parametrize(

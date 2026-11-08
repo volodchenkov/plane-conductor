@@ -251,7 +251,7 @@ async def _hydrate_workspace(config: WorkspaceConfig) -> WorkspaceContext:
     """Fetch labels / states / members for one workspace and snapshot in memory."""
     async with PlaneClient(
         config.plane_base_url,
-        config.plane_api_key,
+        config.plane_api_key.get_secret_value(),
         config.workspace_slug,
     ) as plane:
         project, labels, states, members = await asyncio.gather(
@@ -434,7 +434,7 @@ async def _client_for(ctx: WorkspaceContext) -> PlaneClient:
     """Build a fresh PlaneClient for this workspace context (per-call, not singleton — see PR #18)."""
     return PlaneClient(
         ctx.config.plane_base_url,
-        ctx.config.plane_api_key,
+        ctx.config.plane_api_key.get_secret_value(),
         ctx.config.workspace_slug,
     )
 

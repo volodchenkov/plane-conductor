@@ -242,7 +242,7 @@ def _register_workspace_route(
     sig_header = workspace.webhook_signature_header
     agents_by_nick = workspace.agents_by_nickname()
     initiator_uuid = workspace.initiator_uuid
-    secret = workspace.webhook_secret
+    secret = workspace.webhook_secret.get_secret_value()
 
     @router.post(f"/{slug}/webhook", name=f"webhook_{slug}")
     async def receive(  # type: ignore[no-untyped-def]

@@ -160,7 +160,7 @@ def gate_body(comment_id: str = "c1", actor: str = "agent-1", text: str = "appro
 
 
 def post_gate(client: TestClient, workspace: WorkspaceConfig, body: bytes) -> httpx.Response:
-    sig = hmac.new(workspace.webhook_secret.encode(), body, sha256).hexdigest()
+    sig = hmac.new(workspace.webhook_secret.get_secret_value().encode(), body, sha256).hexdigest()
     return client.post(
         f"/{workspace.workspace_slug}/webhook",
         content=body,

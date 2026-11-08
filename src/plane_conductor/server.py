@@ -29,7 +29,7 @@ def _build_clients(
     return {
         slug: (
             ws,
-            PlaneClient(ws.plane_base_url, ws.plane_api_key, ws.workspace_slug),
+            PlaneClient(ws.plane_base_url, ws.plane_api_key.get_secret_value(), ws.workspace_slug),
         )
         for slug, ws in workspaces.items()
     }
@@ -95,6 +95,11 @@ def create_app(
             "status": "ok",
             "version": __version__,
             "workspaces": sorted(workspaces),
+            # Where each workspace's credentials were read from (file|inline),
+            # never the values: lets the host check a move to the file form.
+            "credential_sources": {
+                slug: ws.credential_sources() for slug, ws in sorted(workspaces.items())
+            },
         }
 
     app.include_router(build_router(settings, workspaces_with_clients, runner, notifier))

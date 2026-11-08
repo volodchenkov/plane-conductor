@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
@@ -81,7 +82,11 @@ def _send(client: TestClient, settings: Settings, workspace: WorkspaceConfig, bo
     return client.post(
         _url(workspace),
         content=body,
-        headers={workspace.webhook_signature_header: _sign(workspace.webhook_secret, body)},
+        headers={
+            workspace.webhook_signature_header: _sign(
+                workspace.webhook_secret.get_secret_value(), body
+            )
+        },
     )
 
 
@@ -262,7 +267,7 @@ def test_webhook_respects_allowlist(settings: Settings, workspace_config: Worksp
     resp = client.post(
         _url(ws),
         content=body,
-        headers={ws.webhook_signature_header: _sign(ws.webhook_secret, body)},
+        headers={ws.webhook_signature_header: _sign(ws.webhook_secret.get_secret_value(), body)},
     )
     assert resp.json()["spawned"] == ["sark"]
 
@@ -295,10 +300,10 @@ def test_each_workspace_has_its_own_secret(
 ) -> None:
     """Two workspaces, two secrets. A signature good for one is bad for the other."""
     ws_a = workspace_config.model_copy(
-        update={"workspace_slug": "alpha", "webhook_secret": "secret-alpha"}
+        update={"workspace_slug": "alpha", "webhook_secret": SecretStr("secret-alpha")}
     )
     ws_b = workspace_config.model_copy(
-        update={"workspace_slug": "beta", "webhook_secret": "secret-beta"}
+        update={"workspace_slug": "beta", "webhook_secret": SecretStr("secret-beta")}
     )
     app = FastAPI()
     plane = StubPlane()
@@ -315,8 +320,8 @@ def test_each_workspace_has_its_own_secret(
     )
     client = TestClient(app)
     body = b'{"event":"x"}'
-    sig_a = _sign(ws_a.webhook_secret, body)
-    sig_b = _sign(ws_b.webhook_secret, body)
+    sig_a = _sign(ws_a.webhook_secret.get_secret_value(), body)
+    sig_b = _sign(ws_b.webhook_secret.get_secret_value(), body)
 
     # Right secret → 200 (event is ignored, but route accepted).
     r = client.post("/alpha/webhook", content=body, headers={ws_a.webhook_signature_header: sig_a})

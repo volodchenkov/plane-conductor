@@ -153,16 +153,24 @@ allowed_nicknames: []      # empty = allow all configured agents
 |---|---|---|
 | `workspace_slug` | yes | Lowercase. Filename stem must equal this. Path segment of the webhook URL: `POST /<workspace_slug>/webhook`. |
 | `plane_base_url` | yes | Plane base URL (cloud or self-hosted). Trailing slash stripped. |
-| `plane_api_key` | yes | Plane API token from Profile → Workspace settings → API tokens. |
+| `plane_api_key` | yes¹ | Plane API token from Profile → Workspace settings → API tokens. |
+| `plane_api_key_file` | yes¹ | Path to a file holding the token, instead of `plane_api_key`. Relative paths are taken from the YAML's directory; surrounding whitespace is stripped. |
 | `project_id` | yes | Project UUID inside the workspace. |
 | `initiator_uuid` | yes | Your Plane member UUID. Mentions of this UUID are silently ignored — we don't trigger you as an agent. |
-| `webhook_secret` | yes | Per-workspace HMAC secret. Generate with `openssl rand -hex 32`. Must match the secret in Plane → Webhooks for this workspace. |
+| `webhook_secret` | yes¹ | Per-workspace HMAC secret. Generate with `openssl rand -hex 32`. Must match the secret in Plane → Webhooks for this workspace. |
+| `webhook_secret_file` | yes¹ | Path to a file holding the secret, instead of `webhook_secret`. Same checks as the inline value. |
 | `webhook_signature_header` | no | Default `X-Plane-Signature`. Adjust if your Plane build uses a different header. |
 | `email_domain` | yes | Bot email domain. `setup` invites `<nickname>@<email_domain>`. |
 | `prompts_dir` | yes | Absolute path to your Claude Code agent prompt files (`<role>.md`). |
 | `agent_working_dir` | no | Working dir passed to spawned `claude`. Defaults to the orchestrator's cwd. Usually your project root. |
 | `agents` | yes | At least one entry. See below. |
 | `labels` | no | `{artifacts: [...], roles: [...]}`. Each label is `{name, color?, description?}`. |
+
+¹ Exactly one of `<name>` and `<name>_file` per credential. The file form keeps
+the YAML value-free: the host lays the files out at start (for example from a
+vault into a `RuntimeDirectory`) and the YAML can live in git. Validation and
+YAML syntax errors never print credential values; `GET /health` reports
+`credential_sources` (`file` / `inline` per workspace), never the values.
 | `states` | no | List of `{name, group, color?}`. `group` ∈ `backlog`/`unstarted`/`started`/`completed`/`cancelled`. |
 | `announce_spawn` | no | Default `true`. Posts a 'Picking up @nick…' comment on spawn and edits it on exit. |
 | `allowed_nicknames` | no | Allow-list of nicknames. Empty = allow all configured agents. Use to gate access during testing. |

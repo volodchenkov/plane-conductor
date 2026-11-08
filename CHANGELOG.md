@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PlaneClient.retrieve_issue_by_sequence_id` — underlying lookup, walks
   `list_issues` and short-circuits on first match (Plane v1 silently ignores
   `?sequence_id=` as a query filter).
+- `plane_api_key_file` / `webhook_secret_file` in workspace YAML: the
+  credential is read from a file, so the YAML itself holds no values.
+  `GET /health` reports `credential_sources` per workspace (`file` / `inline`).
+
+### Security
+- Credentials are `SecretStr`; config validation errors hide input values
+  (`hide_input_in_errors`) and YAML syntax errors report the position only,
+  so a malformed config no longer prints a key or secret into the journal.
 
 ## [0.1.0] — 2026-05-03
 

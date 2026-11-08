@@ -99,7 +99,8 @@ flowchart LR
 FastAPI app factory. On startup it loads every `*.yaml` in
 `settings.conductor_dir` into a `dict[slug, WorkspaceConfig]`, builds one
 `PlaneClient` per workspace, mounts a `/<slug>/webhook` route per
-workspace, and exposes `GET /health` (which lists the loaded slugs).
+workspace, and exposes `GET /health` (which lists the loaded slugs and where each
+workspace's credentials were read from — `file` or `inline`, never the values).
 The `lifespan` runs [restart recovery](#restart-recovery) on startup and
 waits for in-flight agents on shutdown (with a configurable grace
 window), then closes every `PlaneClient`.
