@@ -18,16 +18,35 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+
+# Credentials of a workspace. Each is given either inline (`<name>: value`) or
+# as a file (`<name>_file: path`), never both. The file form keeps the YAML
+# value-free, so the values can live in a vault and be laid out at start.
+SECRET_FIELDS = ("plane_api_key", "webhook_secret")
+
+# Validation errors of these models are printed by `serve` into the journal.
+# Pydantic includes the offending input in the message by default — for an
+# extra key or a bad secret that input is the secret itself.
+_CONFIG = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
 class AgentDef(BaseModel):
     """One agent the orchestrator will spawn when its nickname is mentioned."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _CONFIG
 
     nickname: str = Field(
         ..., description="Email local-part. Becomes the @mention name and the --agent flag."
@@ -54,7 +73,7 @@ class AgentDef(BaseModel):
 
 
 class LabelDef(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = _CONFIG
 
     name: str
     color: str | None = None
@@ -62,7 +81,7 @@ class LabelDef(BaseModel):
 
 
 class StateDef(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = _CONFIG
 
     name: str
     group: str = Field(
@@ -91,7 +110,7 @@ def _default_pipeline_labels() -> list[LabelDef]:
 
 
 class LabelsConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = _CONFIG
 
     artifacts: list[LabelDef] = Field(default_factory=list)
     roles: list[LabelDef] = Field(default_factory=list)
@@ -101,7 +120,7 @@ class LabelsConfig(BaseModel):
 class WorkspaceConfig(BaseModel):
     """Self-contained per-workspace config. One YAML file per workspace."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = _CONFIG
 
     # --- identity / Plane connection ---------------------------------------
     workspace_slug: str = Field(
@@ -109,7 +128,11 @@ class WorkspaceConfig(BaseModel):
         description="Workspace slug (lowercase). Path segment of the webhook URL: /<slug>/webhook.",
     )
     plane_base_url: str = Field(..., description="Plane base URL, e.g. https://plane.example.io")
-    plane_api_key: str = Field(..., description="Plane API token (workspace-scoped)")
+    plane_api_key: SecretStr = Field(..., description="Plane API token (workspace-scoped)")
+    plane_api_key_file: Path | None = Field(
+        default=None,
+        description="File holding the Plane API token; instead of `plane_api_key`.",
+    )
     project_id: UUID = Field(..., description="Project UUID inside the workspace.")
     initiator_uuid: UUID = Field(
         ...,
@@ -117,8 +140,12 @@ class WorkspaceConfig(BaseModel):
     )
 
     # --- webhook -----------------------------------------------------------
-    webhook_secret: str = Field(
+    webhook_secret: SecretStr = Field(
         ..., description="HMAC secret for inbound webhook verification (per workspace)."
+    )
+    webhook_secret_file: Path | None = Field(
+        default=None,
+        description="File holding the webhook secret; instead of `webhook_secret`.",
     )
     webhook_signature_header: str = Field(
         default="X-Plane-Signature", description="Header Plane uses to send the signature."
@@ -153,6 +180,37 @@ class WorkspaceConfig(BaseModel):
 
     # --- validators / helpers ---------------------------------------------
 
+    @model_validator(mode="before")
+    @classmethod
+    def _read_secret_files(cls, data: Any, info: ValidationInfo) -> Any:
+        # Resolve `<name>_file` into `<name>` before field validation, so the
+        # value goes through the same checks as an inline one. Relative paths
+        # are taken from the YAML's directory (`load_workspace` passes it).
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        base_dir = (info.context or {}).get("base_dir")
+        for name in SECRET_FIELDS:
+            file_key = f"{name}_file"
+            inline = data.get(name) is not None
+            from_file = data.get(file_key) is not None
+            if inline == from_file:
+                raise ValueError(f"{name}: set exactly one of {name} or {file_key}")
+            if not from_file:
+                continue
+            path = Path(str(data[file_key])).expanduser()
+            if not path.is_absolute() and base_dir is not None:
+                path = Path(base_dir) / path
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ValueError(f"{file_key}: cannot read {path}: {exc.strerror}") from None
+            if not value:
+                raise ValueError(f"{file_key}: {path} is empty")
+            data[name] = value
+            data[file_key] = path
+        return data
+
     @field_validator("workspace_slug", mode="before")
     @classmethod
     def _validate_slug(cls, v: object) -> str:
@@ -170,13 +228,13 @@ class WorkspaceConfig(BaseModel):
 
     @field_validator("webhook_secret", mode="after")
     @classmethod
-    def _validate_webhook_secret(cls, v: str) -> str:
+    def _validate_webhook_secret(cls, v: SecretStr) -> SecretStr:
         # The HMAC secret is the only thing standing between an attacker who
         # knows the URL and a remote agent spawn. Reject:
         #   - the shipped placeholder string
         #   - anything below 32 chars
         #   - obviously-not-random "secrets" like 64 zeros / 64 fs
-        secret = v.strip()
+        secret = v.get_secret_value().strip()
         if secret == "replace-me-with-openssl-rand-hex-32":
             raise ValueError(
                 "webhook_secret is still the example placeholder; replace it "
@@ -192,7 +250,7 @@ class WorkspaceConfig(BaseModel):
                 "webhook_secret looks like a monorepeat hex string "
                 "(e.g. all zeros) — replace with `openssl rand -hex 32`"
             )
-        return secret
+        return SecretStr(secret)
 
     @model_validator(mode="after")
     def _normalize(self) -> WorkspaceConfig:
@@ -213,6 +271,13 @@ class WorkspaceConfig(BaseModel):
             seen.add(a.nickname)
         return self
 
+    def credential_sources(self) -> dict[str, str]:
+        """Where each credential came from: `file` or `inline`. Holds no values."""
+        return {
+            name: "file" if getattr(self, f"{name}_file") is not None else "inline"
+            for name in SECRET_FIELDS
+        }
+
     def agents_by_nickname(self) -> dict[str, AgentDef]:
         return {a.nickname: a for a in self.agents}
 
@@ -228,11 +293,20 @@ class WorkspaceConfig(BaseModel):
 
 
 def load_workspace(path: Path) -> WorkspaceConfig:
-    """Load + validate one workspace YAML."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    """Load + validate one workspace YAML.
+
+    A YAML syntax error is re-raised with the position only: PyYAML's own
+    message quotes the offending line, which may be a credential.
+    """
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ValueError(f"{path}: invalid YAML{where}") from None
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: top-level must be a mapping, got {type(raw).__name__}")
-    return WorkspaceConfig.model_validate(raw)
+    return WorkspaceConfig.model_validate(raw, context={"base_dir": path.parent})
 
 
 def load_workspaces(directory: Path) -> dict[str, WorkspaceConfig]:

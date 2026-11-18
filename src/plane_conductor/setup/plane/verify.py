@@ -23,7 +23,7 @@ async def run_verify(workspace: WorkspaceConfig) -> int:
     """Return 0 if all configured agents + labels are present in Plane, 1 otherwise."""
     async with PlaneClient(
         workspace.plane_base_url,
-        workspace.plane_api_key,
+        workspace.plane_api_key.get_secret_value(),
         workspace.workspace_slug,
     ) as plane:
         try:

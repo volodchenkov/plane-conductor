@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — reliability (QSALE-55)
+- **Tower errors have a text.** `TowerError` is now an MCP `ToolError`, and an always-on wrapper turns
+  every other exception into `plane_error: op= status= path= body=` / `internal_error: op= Type: msg`
+  (secrets redacted; a failed *write* adds `outcome_unknown`). `create_sub_issue` without a
+  description no longer fails with Plane's `Invalid HTML passed`. `post_bug_report`'s back-link is
+  best-effort.
+- **Conductor reads the agent's `stream-json`** and keeps its state in one SQLite file
+  (`STATE_DIR`). The webhook is a thin, durable receiver (Plane never redelivers a non-2xx answer);
+  a Dispatcher resolves, claims, merges, defers and queues. One run per `(workspace, nickname, root
+  issue)`; triggers from the same source run merge, others coalesce into exactly one rerun; a full
+  host queues durably instead of dropping.
+- **Start failure** (tower not connected / no tower call within a limit) is killed and retried, then
+  one `start_failed` comment. **A run that ends without a handoff or a message to the initiator**
+  gets one `no_handoff` comment (no auto-retry). A handoff whose webhook was lost is redelivered after
+  5 minutes, then alerted. Alerts are idempotent (`external_id` + marker reconcile).
+- A conductor **restart interrupts running agents**; survivors are killed on start (marked by
+  `CONDUCTOR_RUN_ID`), the queue and accepted triggers survive, killed runs get a `conductor_restart`
+  comment. `.active/` sentinels are no longer used.
+- `PlaneClient`: bounded `Retry-After`, request deadline, `list_issue_comments_all`, `external_id`.
+- `/health` reports the real package version.
+
 ### Added
 - **`finalize_done`** MCP tool on tower — closes a finished task (plane-api.md
   §6.12): moves every direct sub-issue, then the root, to the `completed`-group
@@ -30,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PlaneClient.retrieve_issue_by_sequence_id` — underlying lookup, walks
   `list_issues` and short-circuits on first match (Plane v1 silently ignores
   `?sequence_id=` as a query filter).
+- `plane_api_key_file` / `webhook_secret_file` in workspace YAML: the
+  credential is read from a file, so the YAML itself holds no values.
+  `GET /health` reports `credential_sources` per workspace (`file` / `inline`).
+
+### Security
+- Credentials are `SecretStr`; config validation errors hide input values
+  (`hide_input_in_errors`) and YAML syntax errors report the position only,
+  so a malformed config no longer prints a key or secret into the journal.
 
 ## [0.1.0] — 2026-05-03
 

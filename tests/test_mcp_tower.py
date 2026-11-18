@@ -259,11 +259,11 @@ async def test_retrieve_work_item_by_identifier_malformed_raises(
     registry: TowerRegistry,
 ) -> None:
     """Identifier shape is part of the contract — reject early with a clear message."""
-    with pytest.raises(ValueError, match="must match"):
+    with pytest.raises(TowerError, match="must match"):
         await retrieve_work_item_by_identifier(identifier="not-an-identifier")
-    with pytest.raises(ValueError, match="must match"):
+    with pytest.raises(TowerError, match="must match"):
         await retrieve_work_item_by_identifier(identifier="42")
-    with pytest.raises(ValueError, match="must match"):
+    with pytest.raises(TowerError, match="must match"):
         await retrieve_work_item_by_identifier(identifier="TEST-")
 
 
@@ -283,7 +283,7 @@ async def test_retrieve_work_item_by_identifier_not_found_raises(
             json={"results": [{"id": "uuid-1", "sequence_id": 1}], "next_cursor": None},
         )
     )
-    with pytest.raises(ValueError, match="TEST-999 not found"):
+    with pytest.raises(TowerError, match="TEST-999 not found"):
         await retrieve_work_item_by_identifier(identifier="TEST-999")
 
 
@@ -1829,3 +1829,136 @@ async def test_finalize_done_fails_loudly_on_a_child_opened_meanwhile(
 
     with pytest.raises(TowerError, match=late):
         await finalize_done(ROOT_UUID, workspace=ctx.config.workspace_slug)
+
+
+# ---------------------------------------------------------------------------
+# QSALE-55 FR-1 — the agent sees a reason, never an empty error
+# ---------------------------------------------------------------------------
+
+
+def _mock_create_flow(
+    base: str, created_status: int = 201, created_json: Any = None
+) -> respx.Route:
+    respx.get(f"{base}/issues/").mock(return_value=httpx.Response(200, json={"results": []}))
+    respx.get(f"{base}/issues/{ROOT_UUID}/").mock(
+        return_value=httpx.Response(200, json={"id": ROOT_UUID, "name": "Root", "sequence_id": 1})
+    )
+    return respx.post(f"{base}/issues/").mock(
+        return_value=httpx.Response(
+            created_status,
+            json=created_json
+            if created_json is not None
+            else {"id": SPEC_SUB_UUID, "name": "SPEC", "labels": [LABEL_SPEC]},
+        )
+    )
+
+
+@respx.mock
+async def test_fr1_create_sub_issue_without_description_succeeds(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Given create_sub_issue without description_html; Then it is sent as a valid paragraph."""
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    route = _mock_create_flow(base)
+    result = await create_sub_issue(role="spec", root_uuid=ROOT_UUID, workspace="testws")
+    assert result["id"] == SPEC_SUB_UUID
+    import json as _json
+
+    sent = _json.loads(route.calls.last.request.content)
+    assert sent["description_html"] == "<p></p>"  # an empty string is a Plane 400
+
+
+@respx.mock
+async def test_fr1_plane_400_on_create_reaches_agent_with_status_and_body(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Given Plane answers 400; Then the ToolError names operation, status and Plane's text."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    _mock_create_flow(base, 400, {"error": "Invalid HTML passed"})
+    with pytest.raises(ToolError) as ei:
+        await create_sub_issue(role="spec", root_uuid=ROOT_UUID, workspace="testws")
+    msg = str(ei.value)
+    assert "op=create_sub_issue" in msg and "status=400" in msg and "Invalid HTML passed" in msg
+    assert "outcome_unknown" not in msg  # a definite 4xx is not ambiguous
+
+
+@respx.mock
+async def test_fr1_5xx_on_write_says_outcome_unknown(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    _mock_create_flow(base, 502, {"error": "bad gateway"})
+    with pytest.raises(ToolError, match=r"status=502.*outcome_unknown"):
+        await create_sub_issue(role="spec", root_uuid=ROOT_UUID, workspace="testws")
+
+
+async def test_fr1_unknown_exception_has_type_and_message_without_secrets(
+    registry: TowerRegistry, ctx: WorkspaceContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Given an unexpected exception carrying the API key; Then type+message are shown, key redacted."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp_tower.register_secrets(
+        [ctx.config.plane_api_key.get_secret_value(), ctx.config.webhook_secret.get_secret_value()]
+    )
+
+    async def boom(*_a: Any, **_k: Any) -> Any:
+        raise KeyError(
+            f"lookup failed for key {ctx.config.plane_api_key.get_secret_value()} api_key=abcd1234"
+        )
+
+    monkeypatch.setattr(mcp_tower, "_client_for", boom)
+    with pytest.raises(ToolError) as ei:
+        await post_comment(work_item_uuid=ROOT_UUID, comment_html="<p>x</p>", workspace="testws")
+    msg = str(ei.value)
+    assert "internal_error" in msg and "KeyError" in msg and "op=post_comment" in msg
+    assert ctx.config.plane_api_key.get_secret_value() not in msg and "abcd1234" not in msg
+
+
+async def test_fr1_unknown_role_lists_allowed_roles(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    with pytest.raises(ToolError) as ei:
+        await create_sub_issue(role="nonsense", root_uuid=ROOT_UUID, workspace="testws")
+    assert "backend" in str(ei.value) and "api-tests" in str(ei.value)
+
+
+async def test_fr1_unknown_handoff_role_lists_configured_roles(
+    registry: TowerRegistry, ctx: WorkspaceContext
+) -> None:
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    with pytest.raises(ToolError) as ei:
+        await request_handoff(sub_uuid=ROOT_UUID, target_role="ghost-role", workspace="testws")
+    assert "system-analyst" in str(ei.value) or "python-developer" in str(ei.value)
+
+
+@respx.mock
+async def test_fr1_post_bug_report_backlink_failure_keeps_handoff_visible(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Back-link raising any error still returns the committed comment id + a warning."""
+    from plane_conductor.mcp_tower import post_bug_report
+
+    base = f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/projects/{project_id}"
+    respx.post(f"{base}/issues/{SPEC_SUB_UUID}/comments/").mock(
+        return_value=httpx.Response(201, json={"id": "c-1"})
+    )
+    respx.post(f"{base}/issues/{BACKEND_SUB_UUID}/links/").mock(side_effect=RuntimeError("boom"))
+    result = await post_bug_report(
+        test_sub_uuid=SPEC_SUB_UUID,
+        severity="minor",
+        title="t",
+        repro_steps=["a"],
+        actual="x",
+        expected="y",
+        affected_sub_uuid=BACKEND_SUB_UUID,
+        workspace="testws",
+    )
+    assert result["comment_id"] == "c-1" and result["warnings"]

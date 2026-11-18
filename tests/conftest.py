@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 
 from plane_conductor.conductor_config import (
     AgentDef,
@@ -98,6 +99,7 @@ def settings(
         "SESSION_TIMEOUT_SECONDS",
         "SHUTDOWN_GRACE_SECONDS",
         "CLAUDE_BINARY",
+        "STATE_DIR",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -107,8 +109,18 @@ def settings(
         webhook_port=8000,
         conductor_dir=tmp_path / "conductor.d",
         log_dir=log_dir,
+        state_dir=tmp_path / "state",
         log_level="WARNING",
         log_format="pretty",
         claude_binary="claude",
         _env_file=None,  # type: ignore[call-arg]
     )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _kill_leftover_agents() -> AsyncIterator[None]:
+    """After every test: no fake-claude group or supervisor task outlives it (QSALE-55 harness)."""
+    yield
+    from tests.helpers import cleanup_harnesses
+
+    await cleanup_harnesses()
