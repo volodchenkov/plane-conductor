@@ -474,13 +474,31 @@ async def test_cancelled_supervisor_still_kills_its_process_group(
     for t in list(h.runner._tasks):
         t.cancel()
     await asyncio.gather(*list(h.runner._tasks), return_exceptions=True)
-    time.sleep(0.2)
-    try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        return
-    os.killpg(pid, _signal.SIGKILL)
+    # SIGKILL is sent at once, but the group leader stays a zombie until the loop reaps
+    # it, and kill(0) counts zombies: wait (without blocking the loop) for no LIVE member.
+    for _ in range(50):
+        if not _live_group_members(pid):
+            return
+        await asyncio.sleep(0.1)
+    with __import__("contextlib").suppress(ProcessLookupError):
+        os.killpg(pid, _signal.SIGKILL)
     raise AssertionError("cancelling the supervisor left the agent group running")
+
+
+def _live_group_members(pgid: int) -> list[int]:
+    """PIDs of processes in group ``pgid`` that are not zombies (Linux /proc)."""
+    live = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if fields[0] != "Z" and int(fields[2]) == pgid:
+            live.append(int(entry.name))
+    return live
 
 
 async def test_incomplete_registration_keeps_replayed_zero_for_the_next_start(

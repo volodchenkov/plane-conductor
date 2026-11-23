@@ -37,7 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=8.0,<9.2",  # 9.2 deprecates CallSpec2, anyio's plugin still imports it (error under filterwarnings)
     "pytest-asyncio>=0.24",  # asyncio_default_fixture_loop_scope needs >=0.24
     "pytest-cov>=4.1",
     "respx>=0.21",
