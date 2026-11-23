@@ -70,7 +70,10 @@ flowchart LR
         Server["Server<br/><i>FastAPI app + lifespan</i>"]
         WebhookA["Webhook /qsale/webhook<br/><i>HMAC verify (qsale secret), dispatch</i>"]
         WebhookB["Webhook /aist/webhook<br/><i>HMAC verify (aist secret), dispatch</i>"]
-        Runner["Runner<br/><i>spawn, supervise, comment lifecycle</i>"]
+        Dispatcher["Dispatcher<br/><i>resolve, claim, merge, defer, queue</i>"]
+        Runner["Runner<br/><i>spawn, stream reader, watchdog, outcome</i>"]
+        Watcher["Watcher<br/><i>handoff delivery, alert outbox</i>"]
+        Store[("conductor.db<br/><i>SQLite WAL</i>")]
         PlaneA["PlaneClient (qsale)"]
         PlaneB["PlaneClient (aist)"]
         Loader["WorkspaceConfig loader<br/><i>scans conductor.d/*.yaml</i>"]
@@ -81,15 +84,19 @@ flowchart LR
     Server --> WebhookB
     Server --> Loader
     Server --> Settings
-    WebhookA --> Runner
-    WebhookB --> Runner
-    WebhookA --> PlaneA
-    WebhookB --> PlaneB
-    Runner --> PlaneA
-    Runner --> PlaneB
+    WebhookA --> Store
+    WebhookB --> Store
+    Store --> Dispatcher
+    Dispatcher --> Runner
+    Runner --> Store
+    Watcher --> Store
+    Dispatcher --> PlaneA
+    Dispatcher --> PlaneB
+    Watcher --> PlaneA
+    Watcher --> PlaneB
 
     Runner -->|spawn| Subprocess["claude --agent X --print"]
-    Runner -. writes .-> Log["log file<br/>+ sentinel"]
+    Runner -. writes .-> Log["run log +<br/>stream journal"]
     PlaneA -->|HTTPS| PlaneREST["Plane REST API"]
     PlaneB -->|HTTPS| PlaneREST
 ```
@@ -99,61 +106,72 @@ flowchart LR
 FastAPI app factory. On startup it loads every `*.yaml` in
 `settings.conductor_dir` into a `dict[slug, WorkspaceConfig]`, builds one
 `PlaneClient` per workspace, mounts a `/<slug>/webhook` route per
-workspace, and exposes `GET /health` (which lists the loaded slugs).
+workspace, and exposes `GET /health` (which lists the loaded slugs and where each
+workspace's credentials were read from — `file` or `inline`, never the values).
 The `lifespan` runs [restart recovery](#restart-recovery) on startup and
 waits for in-flight agents on shutdown (with a configurable grace
 window), then closes every `PlaneClient`.
 
-### Webhook handler (`webhook.py`)
+### Webhook receiver (`webhook.py`)
 
-One route per workspace, mounted as `POST /<slug>/webhook`. Each route
-closes over its own workspace config + Plane client, so they run
-independently. Steps inside the route:
+One route per workspace, mounted as `POST /<slug>/webhook`. It is **thin and
+durable-first**: Plane retries only *transport* failures of a delivery (never a
+non-2xx answer), so the receiver makes no Plane call on the request path.
 
 1. Constant-time HMAC-SHA256 verification of the raw body against
    that workspace's `webhook_secret`.
 2. Parse JSON; ignore everything except `issue_comment` events with
    `created` or `updated` action.
-3. Extract every `<mention-component entity_identifier="<UUID>">` from
-   `comment_html` (regex, document order, dedup).
-4. For each UUID: skip the workspace's `initiator_uuid` (the human),
-   resolve the rest to emails via `PlaneClient.get_member()`, split the
-   local-part to a nickname, look it up in this workspace's `agents`
-   list, and dispatch to the runner with `(workspace, plane)` context.
-5. On a *transient* Plane API error (5xx / network) return **503** so
-   Plane retries the webhook delivery. On a permanent error (4xx) skip
-   the offending mention and return **200** with a `skipped[]` report.
+3. Hand gates / role handoffs to the workbench notifier (unchanged).
+4. For every mentioned member (the initiator is skipped) `INSERT OR IGNORE` one
+   `triggers` row, unique on `(comment_id, member_uuid)`: a redelivered webhook, or an
+   edit that adds no addressee, creates nothing; an edit that adds one creates one. An
+   initiator reply with no mention becomes an `auto_resume` row.
+5. Wake the Dispatcher and answer `200` ("durably accepted"). A failed write answers
+   `503` and logs `state_write_failed`.
+
+### Dispatcher (`dispatcher.py`)
+
+The single task that turns accepted triggers into runs. It resolves member →
+nickname (allow-list), the **root issue** (top-level ancestor, so a sub-issue and its
+root share a key) and the **source run** of the trigger (the run whose tower call created
+the comment, read from the agent's stream). Then, per trigger and in one transaction:
+
+| Situation | Result |
+|---|---|
+| source run already covered by the key's slot (or an earlier trigger of the same effect) | `merged` — no second process (COINEX-184) |
+| a slot exists and the trigger comes from anyone else (another run, a human, the slot's own run = self-handoff) | `deferred` — exactly one rerun after the run |
+| no slot, host at `MAX_CONCURRENT_SESSIONS` | `queued` — durable, FIFO, expires after `QUEUE_MAX_AGE_SECONDS` with one alert |
+| otherwise | claim the slot (`slots` PK = the atomic claim), insert the run, start |
+
+Before a start it re-validates destination, allow-list and project membership.
 
 ### Runner (`runner.py`)
 
-One shared `Runner` for all workspaces. The host-wide capacity cap
-(`MAX_CONCURRENT_SESSIONS`) counts agents across every workspace. Per-spawn
-it:
+Supervises one process group per slot:
 
-- Checks dedup on `(workspace_slug, nickname, issue_uuid)` — the slug is in
-  the key so two workspaces can share nicknames safely
-- Checks capacity (`MAX_CONCURRENT_SESSIONS` ceiling → reject)
-- Opens a per-run log file `logs/<ts>-<slug>-<nick>-<issue>.log`
-- `asyncio.create_subprocess_exec(claude, --agent, X, --print,
-  start_new_session=True, stdin=PIPE, stdout=log, stderr=log,
-  cwd=workspace.agent_working_dir)` — process group of its own
-- Pipes a 5-line trigger prompt to stdin, closes stdin
-- Optionally posts the `picking up…` announce comment via that workspace's
-  Plane client
-- Writes a sentinel JSON file under
-  `logs/.active/<slug>-<nick>-<issue>.json` (carries the slug so recovery
-  knows where to comment)
-- Spawns an `asyncio.Task` (the *supervisor*) that awaits exit
+- starts `claude --agent X --print --output-format stream-json --verbose` in its own
+  session with `CONDUCTOR_RUN_ID` in the environment, reads stdout line by line
+  (`stream.py`) and journals every raw line to `<state_dir>/streams/<run>.ndjson` before
+  parsing it;
+- **watchdog**: `init` must show `plane-tower` as `connected` (or a tower tool call must
+  appear) within `START_NO_TOWER_TIMEOUT_SECONDS`; otherwise the group is killed and the
+  start is retried (`START_RETRIES`, backoff) — then one `start_failed` alert;
+- **outcome** in one transaction once the *whole process group* is gone and stdout hit EOF:
+  no handoff and no message to the initiator → `no_handoff` alert (no auto-retry); non-zero
+  exit / timeout after a handoff → `abnormal_exit` alert; deferred triggers → one rerun in
+  the same slot, else the slot is freed;
+- timeout kills the whole group (SIGTERM, SIGKILL after 5 s).
 
-The supervisor:
+### Watcher (`watcher.py`)
 
-- `wait_for(proc.wait(), timeout=SESSION_TIMEOUT_SECONDS)`
-- On timeout: `killpg(SIGTERM)` then SIGKILL after 5s — the whole process
-  group, so `claude`'s descendants (MCP servers, helper procs) die too
-- On exit: closes the log fp, releases the subprocess transport,
-  removes the sentinel, updates the announce comment (or posts a fresh
-  failure note when announce was off / failed)
-- All bookkeeping sets (`_active`, `_procs`, `_tasks`) self-clean
+Two jobs. The **handoff watcher** compares the handoffs the stream reader saw (written the
+moment tower's tool result was read, independent of the webhook) with the triggers that
+exist: an unsettled one older than `HANDOFF_ACK_SECONDS` is redelivered (conductor inserts
+the trigger itself), up to `HANDOFF_MAX_RETRIES`, then one `handoff_undelivered` alert.
+Handoffs to the initiator (gates) are never watched. The **alert outbox** publishes the
+`alerts` rows to Plane with retries, `external_id` idempotency and reconcile-by-marker after
+an ambiguous failure.
 
 ### PlaneClient (`plane_client.py`)
 
@@ -185,24 +203,27 @@ for the full schema.
 
 | Failure mode | Defence |
 |---|---|
-| Plane retries the same webhook (at-least-once delivery) or human double-mentions | Dedup on `(workspace_slug, nickname, issue_uuid)` — second `runner.spawn()` raises `SessionAlreadyRunningError`, webhook reports `skipped` and returns 200. |
-| Mention storm melts the box / blows the API quota | `MAX_CONCURRENT_SESSIONS` cap, host-wide across all workspaces — N+1th spawn raises `CapacityFullError`. |
+| Plane retries the same webhook (at-least-once delivery) or human double-mentions | Unique `(comment_id, member_uuid)` in `triggers`; one run per `(workspace, nickname, root issue)` via the `slots` primary key; triggers of the same source run merge, others defer to exactly one rerun. |
+| Mention storm melts the box / blows the API quota | `MAX_CONCURRENT_SESSIONS` cap, host-wide across all workspaces — the N+1th trigger is **queued durably** and starts when a slot frees. |
 | Agent (or its MCP server / helper procs) hangs past timeout | Process group spawned with `start_new_session=True`; on timeout `killpg(SIGTERM)` then SIGKILL after 5s — kills the whole tree. |
-| Plane API has a transient hiccup during member lookup | Webhook returns **503** instead of 200 — Plane retries the delivery. 4xx errors are not retried (genuine misconfigs surface as `skipped`). |
+| Plane API has a transient hiccup during member lookup | The trigger is already stored (`received`); the Dispatcher retries on its next tick. (Plane never redelivers a non-2xx answer, so the old 503 contract was void.) |
 | systemd `TimeoutStopSec` kills agents mid-flight | `SHUTDOWN_GRACE_SECONDS` (default 30s) lets them finish first; only after the grace window does `wait_idle()` SIGKILL the remaining process groups. |
-| Conductor crashes / is restarted while an agent was running | Sentinel file `logs/.active/<slug>-<nick>-<issue>.json` survives. On startup the lifespan calls `recover_orphaned_sessions()`, posts a recovery comment to the **right** workspace (looked up by slug from the sentinel), removes the sentinel. Sentinels referencing now-removed workspaces are dropped silently. |
+| Conductor crashes / is restarted while an agent was running | Agents are children of conductor and die with it. On startup `recovery.py` kills any survivor (found by `CONDUCTOR_RUN_ID` in `/proc/*/environ`), clears the slots, marks the runs lost with one `conductor_restart` alert per run, replays their stream journals (so a handoff committed just before the crash is still watched). The queue and accepted triggers survive. |
+| Agent never reaches tower / ends without telling anyone | Start failure: killed and retried, then one `start_failed` alert. Finished with no handoff and no message to the initiator: `no_handoff` alert. A handoff whose webhook was lost is redelivered by the Watcher, then alerted. |
 | Agent slow to produce its own startup comment / falls over silently | `announce_spawn=true` posts a "picking up…" comment immediately on spawn and updates it on exit. Surface signal independent of agent behaviour. |
 | Webhook secret leaks for one workspace | Each workspace has its own secret; the leak doesn't grant access to others. The URL path `/<slug>/webhook` is also workspace-scoped. |
 
 ### Restart recovery
 
-Every spawned subprocess gets a sentinel file with `{workspace_slug,
-nickname, issue_uuid, log_path, started_at}`. On clean exit it's removed;
-on a process kill (kernel OOM, container restart, machine reboot) it
-stays. At next startup the server iterates `logs/.active/`, looks up the
-sentinel's `workspace_slug` in the loaded workspaces, and posts a comment
-to the affected issue via the matching Plane client. The human sees what
-was running and can re-mention to continue.
+See `recovery.py`. At start, before the Dispatcher: (a) kill every process marked
+with a known `CONDUCTOR_RUN_ID` (independent of stored pids, immune to pid reuse); (b) delete
+every slot; (c) mark `starting|running` runs `lost`, their triggers `done` (not replayed — no
+duplicate work) and raise one `conductor_restart` alert per run; (d) replay each run's
+stream journal through the normal parser; (e) alerts left `sending` become `unknown` and are
+reconciled before any new POST. A restart **interrupts running agents** (they are children of
+conductor, `KillMode=mixed`); restart when no agent runs. After a conductor outage longer than
+~30 minutes check in Plane that the webhook is still active — Plane deactivates a webhook after
+five transport failures.
 
 ---
 
@@ -218,8 +239,9 @@ was running and can re-mention to continue.
   multi-workspace is shared-process, shared-capacity. This is a
   pet-project orchestrator, not a multi-tenant SaaS; the host trusts
   every workspace it serves. Run separate hosts if you need isolation.
-- **Persistence** — no DB, no Redis. State lives in Plane (issues,
-  sub-issues, comments) and on disk (logs, sentinels).
+- **Persistence beyond operational state** — no Redis, no external DB. Work
+  state lives in Plane; conductor keeps only its own operational state (triggers, slots,
+  runs, handoffs, alert outbox) in one SQLite file, `<state_dir>/conductor.db`.
 - **Distributed deployment** — single process, single host. Add Redis
   + a coordinator if you ever need multi-instance, but most users
   won't.

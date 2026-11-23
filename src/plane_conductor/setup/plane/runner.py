@@ -52,7 +52,7 @@ async def run_setup(
     """Run the full setup for one workspace. Returns 0 on success, 1 if any step failed."""
     async with PlaneClient(
         workspace.plane_base_url,
-        workspace.plane_api_key,
+        workspace.plane_api_key.get_secret_value(),
         workspace.workspace_slug,
     ) as plane:
         try:

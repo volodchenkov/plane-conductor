@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -74,6 +74,46 @@ class Settings(BaseSettings):
     )
     workbench_notify_spool_max: int = Field(default=200, ge=1)
     workbench_notify_spool_max_age: int = Field(default=24 * 3600, ge=60, description="Seconds.")
+
+    # --- Reliability state (QSALE-55) ---
+    state_dir: Path = Field(
+        default=Path(),
+        description="Directory of conductor.db (SQLite WAL), conductor.lock and run stream "
+        "journals. Empty = <LOG_DIR>/state (absolute) — writable under the unit sandbox.",
+    )
+    start_retries: int = Field(
+        default=3, ge=0, description="Retries after the first start attempt."
+    )
+    start_retry_backoff_seconds: list[float] = Field(default_factory=lambda: [5.0, 15.0, 45.0])
+    start_no_tower_timeout_seconds: float = Field(default=180.0, gt=0)
+    handoff_ack_seconds: float = Field(default=300.0, gt=0)
+    handoff_retry_interval_seconds: float = Field(default=300.0, gt=0)
+    handoff_max_retries: int = Field(default=3, ge=0)
+    queue_max_age_seconds: float = Field(default=5400.0, gt=0)
+    source_wait_seconds: float = Field(default=10.0, ge=0)
+    reader_drain_seconds: float = Field(default=10.0, ge=0)
+    alert_max_attempts: int = Field(default=20, ge=1)
+    retry_after_max_seconds: float = Field(default=30.0, ge=0)
+    retry_total_max_seconds: float = Field(default=60.0, ge=0)
+    request_deadline_seconds: float = Field(default=90.0, gt=0)
+    state_retention_days: int = Field(default=14, ge=1)
+    dedupe_retention_days: int = Field(default=365, ge=1)
+    dispatcher_tick_seconds: float = Field(default=5.0, gt=0)
+    watcher_tick_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _default_state_dir(self) -> Settings:
+        if self.state_dir == Path():
+            self.state_dir = self.log_dir.absolute() / "state"
+        else:
+            self.state_dir = self.state_dir.absolute()
+        return self
+
+    @model_validator(mode="after")
+    def _queue_age_exceeds_session(self) -> Settings:
+        if self.queue_max_age_seconds <= self.session_timeout_seconds:
+            raise ValueError("queue_max_age_seconds must exceed session_timeout_seconds")
+        return self
 
     @field_validator("log_format")
     @classmethod

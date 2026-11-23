@@ -1,676 +1,564 @@
-# mypy: disable-error-code="arg-type, dict-item, unused-ignore"
+# mypy: disable-error-code="arg-type, dict-item, unused-ignore, attr-defined"
+"""Runner: stream reader, start failure (FR-2), outcome (FR-5), process-group release.
+
+End to end through the Dispatcher with a fake ``claude`` that prints scripted ``stream-json``.
+"""
+
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
-from typing import Any
 from uuid import UUID
-
-import pytest
 
 from plane_conductor.conductor_config import WorkspaceConfig
 from plane_conductor.config import Settings
-from plane_conductor.exceptions import AgentSpawnError
-from plane_conductor.runner import Runner, build_prompt, log_path_for
-
-ISSUE = UUID("33333333-3333-3333-3333-333333333333")
-
-
-class StubPlane:
-    def __init__(self) -> None:
-        self.comments: list[tuple[Any, Any, str]] = []
-        self.updates: list[tuple[Any, Any, Any, str]] = []
-        self._next_id = 0
-
-    async def create_issue_comment(
-        self, project_id: Any, issue_id: Any, comment_html: str
-    ) -> dict[str, Any]:
-        self.comments.append((project_id, issue_id, comment_html))
-        self._next_id += 1
-        return {"id": f"c{self._next_id}"}
-
-    async def update_issue_comment(
-        self, project_id: Any, issue_id: Any, comment_id: Any, comment_html: str
-    ) -> dict[str, Any]:
-        self.updates.append((project_id, issue_id, comment_id, comment_html))
-        return {"id": comment_id}
-
-    async def aclose(self) -> None:
-        pass
-
-
-def _ws(workspace_config: WorkspaceConfig, **overrides: object) -> WorkspaceConfig:
-    return workspace_config.model_copy(update=overrides)
+from plane_conductor.runner import build_prompt, journal_path, log_path_for, spawn_env
+from tests.helpers import (
+    ISSUE,
+    SUB,
+    Harness,
+    good_run,
+    handoff_lines,
+    init_line,
+    invocations,
+    result_line,
+    tool_result_line,
+    tool_use_line,
+)
 
 
 def test_build_prompt_includes_url_and_issue(workspace_config: WorkspaceConfig) -> None:
     prompt = build_prompt(
         nickname="rinzler",
-        issue_uuid=ISSUE,
+        issue_uuid=UUID(ISSUE),
         plane_base_url=workspace_config.plane_base_url,
         workspace_slug=workspace_config.workspace_slug,
         project_id=workspace_config.project_id,
         triggered_by_email="dmitry@example.io",
     )
-    assert "@rinzler" in prompt
-    assert str(ISSUE) in prompt
-    assert "dmitry@example.io" in prompt
-    assert workspace_config.plane_base_url in prompt
+    assert "@rinzler" in prompt and ISSUE in prompt and "dmitry@example.io" in prompt
 
 
 def test_log_path_includes_workspace_slug(tmp_path: Path) -> None:
-    p = log_path_for(tmp_path / "logs", "qsale", "rinzler", ISSUE)
-    assert p.parent.exists()
-    assert "qsale" in p.name
-    assert "rinzler" in p.name
-    assert p.suffix == ".log"
+    p = log_path_for(tmp_path / "logs", "qsale", "rinzler", UUID(ISSUE))
+    assert p.parent.exists() and "qsale" in p.name and "rinzler" in p.name and p.suffix == ".log"
 
 
-async def test_runner_spawns_subprocess_and_records_zero_exit(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+def test_spawn_env_marks_run_and_workspace() -> None:
+    env = spawn_env("ws", "abc123")
+    assert env["CONDUCTOR_RUN_ID"] == "abc123" and env["WORKSPACE_SLUG"] == "ws"
+    assert "TMUX" not in env
+
+
+async def test_agent_with_handoff_runs_once_and_raises_no_alert(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
-    plane = StubPlane()
-    runner = Runner(settings=s)
-
-    log_path = await runner.spawn(
-        workspace=workspace_config,
-        plane=plane,  # type: ignore[arg-type]
-        nickname="rinzler",
-        issue_uuid=ISSUE,
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1"))}],
     )
-    await runner.wait_idle()
+    h.add_trigger()
+    await h.settle()
+    assert invocations(tmp_path) == 1
+    assert h.alert_reasons() == []
+    assert h.slots() == 0
+    (run,) = h.runs()
+    assert run["state"] == "exited" and run["tower_seen"] == 1 and run["outcome_done"] == 1
+    # the journal is the replayable record of the stream
+    assert journal_path(h.settings.state_dir, run["run_id"]).read_text().count("\n") >= 4
 
-    assert log_path.exists()
-    assert plane.comments == []  # announce_spawn=False on workspace_config
+
+# --- FR-2: start failure ------------------------------------------------------------
 
 
-async def test_runner_posts_failure_comment_on_nonzero_exit(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr2_exit_zero_without_tower_is_retried_then_one_alert(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    s = settings.model_copy(update={"claude_binary": "/bin/false", "log_dir": tmp_path / "logs"})
-    plane = StubPlane()
-    runner = Runner(settings=s)
-
-    await runner.spawn(
-        workspace=workspace_config,
-        plane=plane,  # type: ignore[arg-type]
-        nickname="rinzler",
-        issue_uuid=ISSUE,
-    )
-    await runner.wait_idle()
-
-    assert len(plane.comments) == 1
-    _, issue_id, html = plane.comments[0]
-    assert issue_id == ISSUE
-    assert "@rinzler" in html
-    assert "exited" in html
+    """Given a run that exits 0 in seconds with no tower call; Then 1+retries attempts, 1 alert."""
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": [], "exit": 0}], start_retries=2)
+    h.add_trigger()
+    await h.settle()
+    assert invocations(tmp_path) == 3  # first attempt + 2 retries
+    assert h.alert_reasons() == ["start_failed"]
+    alert = h.store.one("SELECT facts FROM alerts")
+    assert '"attempts": 3' in alert["facts"] and "exit_without_tower" in alert["facts"]
+    assert h.slots() == 0
 
 
-async def test_runner_raises_when_binary_missing(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr2_first_attempt_fails_second_succeeds_no_alert(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(tmp_path / "definitely-not-here"),
-            "log_dir": tmp_path / "logs",
-        }
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": []}, {"lines": good_run(*handoff_lines("t1", "c-1"))}],
     )
-    plane = StubPlane()
-    runner = Runner(settings=s)
-
-    with pytest.raises(AgentSpawnError):
-        await runner.spawn(
-            workspace=workspace_config,
-            plane=plane,  # type: ignore[arg-type]
-            nickname="rinzler",
-            issue_uuid=ISSUE,
-        )
+    h.add_trigger()
+    await h.settle()
+    assert invocations(tmp_path) == 2
+    assert h.alert_reasons() == []
+    assert [r["attempt"] for r in h.runs()] == [0, 1]
+    assert h.runs()[0]["start_failure"].startswith("exit_without_tower")
 
 
-async def test_wait_idle_no_tasks(settings: Settings) -> None:
-    runner = Runner(settings=settings)
-    await runner.wait_idle()
-
-
-async def test_runner_injects_workspace_slug_into_subprocess_env(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr2_tower_failed_in_init_kills_and_retries(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """The conductor knows the workspace at spawn time; agents should not
-    have to discover it from the URL. Tower auto-resolves workspace when
-    `WORKSPACE_SLUG` is in env."""
-    fake_claude = tmp_path / "fake_claude"
-    # Dump env to the log so we can assert WORKSPACE_SLUG was injected.
-    fake_claude.write_text("#!/bin/sh\n/usr/bin/env\n")
-    fake_claude.chmod(0o755)
-
-    s = settings.model_copy(
-        update={"claude_binary": str(fake_claude), "log_dir": tmp_path / "logs"}
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [
+            {"lines": [init_line("failed")], "sleep": 20},
+            {"lines": good_run(*handoff_lines("t", "c"))},
+        ],
     )
-    plane = StubPlane()
-    runner = Runner(settings=s)
-
-    log_path = await runner.spawn(
-        workspace=workspace_config,
-        plane=plane,  # type: ignore[arg-type]
-        nickname="rinzler",
-        issue_uuid=ISSUE,
-    )
-    await runner.wait_idle()
-
-    body = log_path.read_text()
-    assert f"WORKSPACE_SLUG={workspace_config.workspace_slug}" in body
+    h.add_trigger()
+    t0 = time.monotonic()
+    await h.settle()
+    assert time.monotonic() - t0 < 10  # killed at once, not after the 20 s sleep
+    assert invocations(tmp_path) == 2 and h.alert_reasons() == []
+    assert "tower failed" in h.runs()[0]["start_failure"]
 
 
-async def test_runner_kills_subprocess_on_timeout(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr2_hang_before_tower_is_killed_by_the_limit(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 60\n")
-    fake_claude.chmod(0o755)
-
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(fake_claude),
-            "session_timeout_seconds": 1,
-            "log_dir": tmp_path / "logs",
-        }
+    """Given a start that never reaches tower; Then it is killed at the limit and handled as a failed start."""
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": [init_line("pending")], "sleep": 30}],
+        start_retries=0,
+        start_no_tower_timeout_seconds=0.5,
     )
-    plane = StubPlane()
-    runner = Runner(settings=s)
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["start_failed"]
+    assert "start_hang" in h.runs()[0]["start_failure"]
 
-    await runner.spawn(
-        workspace=workspace_config,
-        plane=plane,  # type: ignore[arg-type]
-        nickname="rinzler",
-        issue_uuid=ISSUE,
+
+async def test_fr2_unknown_init_status_waits_for_first_tower_call(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    lines = [init_line("pending"), *handoff_lines("t1", "c-1"), result_line()]
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": lines}])
+    h.add_trigger()
+    await h.settle()
+    assert invocations(tmp_path) == 1 and h.alert_reasons() == []
+
+
+async def test_fr2_spawn_error_is_a_start_failure(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    h = Harness(
+        tmp_path, settings, workspace_config, claude_binary="/no/such/claude", start_retries=1
     )
-    await runner.wait_idle()
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["start_failed"]
+    assert "spawn_error" in h.store.one("SELECT facts FROM alerts")["facts"]
+    assert h.slots() == 0
 
-    assert len(plane.comments) == 1
-    assert "timed out" in plane.comments[0][2]
 
-
-async def test_notify_failure_swallows_plane_errors(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr2_log_dir_failure_is_a_start_failure_not_a_leaked_slot(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    from plane_conductor.exceptions import PlaneAPIError
+    blocker = tmp_path / "file-not-dir"
+    blocker.write_text("x")
+    h = Harness(tmp_path, settings, workspace_config, log_dir=blocker / "logs", start_retries=0)
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["start_failed"] and h.slots() == 0
 
-    class FlakyPlane:
-        async def create_issue_comment(
-            self, project_id: Any, issue_id: Any, comment_html: str
-        ) -> dict[str, Any]:
-            raise PlaneAPIError(503, "service unavailable")
 
-    s = settings.model_copy(update={"claude_binary": "/bin/false", "log_dir": tmp_path / "logs"})
-    runner = Runner(settings=s)
-    await runner.spawn(
-        workspace=workspace_config,
-        plane=FlakyPlane(),  # type: ignore[arg-type]
-        nickname="rinzler",
-        issue_uuid=ISSUE,
+# --- FR-5: outcome ---------------------------------------------------------------------
+
+
+async def test_fr5_exit_zero_without_handoff_or_message_alerts_once_no_retry(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    """COINEX-184: the role posted a plain comment and ended — nobody was told."""
+    lines = good_run(
+        tool_use_line("t1", "post_comment", work_item_uuid=SUB, comment_html="<p>done</p>"),
+        tool_result_line("t1", {"id": "c9"}),
     )
-    await runner.wait_idle()
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": lines}])
+    h.add_trigger()
+    await h.settle()
+    assert invocations(tmp_path) == 1  # no auto retry
+    assert h.alert_reasons() == ["no_handoff"]
+    assert "exit_code" in h.store.one("SELECT facts FROM alerts")["facts"]
 
 
-# --- protections -------------------------------------------------------------
-
-
-async def test_runner_dedupes_active_triple(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr5_no_output_at_all_after_tower_up_alerts(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """Spawning the same (slug, nick, issue) twice while first is alive raises."""
-    from plane_conductor.exceptions import SessionAlreadyRunningError
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": [init_line()]}])
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["no_handoff"]
 
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={"claude_binary": str(fake_claude), "log_dir": tmp_path / "logs"}
+
+async def test_fr5_message_to_initiator_on_a_sub_issue_counts(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    lines = good_run(
+        tool_use_line("t1", "post_review", sub_uuid=SUB, verdict="APPROVED", body_html="x"),
+        tool_result_line("t1", {"comment_id": "c-r"}),
     )
-    runner = Runner(settings=s)
-    plane = StubPlane()
-
-    await runner.spawn(
-        workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    with pytest.raises(SessionAlreadyRunningError):
-        await runner.spawn(
-            workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=ISSUE
-        )  # type: ignore[arg-type]
-
-    other = UUID("44444444-4444-4444-4444-444444444444")
-    await runner.spawn(
-        workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=other
-    )  # type: ignore[arg-type]
-
-    await runner.wait_idle(grace_seconds=0.1)
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": lines}])
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == []
 
 
-async def test_runner_dedup_separates_workspaces(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr5_nonzero_exit_with_handoff_is_abnormal_exit(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """Same (nick, issue) in TWO different workspaces is allowed."""
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={"claude_binary": str(fake_claude), "log_dir": tmp_path / "logs"}
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1")), "exit": 3}],
     )
-    runner = Runner(settings=s)
-    plane = StubPlane()
-
-    ws_a = workspace_config.model_copy(update={"workspace_slug": "alpha"})
-    ws_b = workspace_config.model_copy(update={"workspace_slug": "beta"})
-
-    await runner.spawn(workspace=ws_a, plane=plane, nickname="rinzler", issue_uuid=ISSUE)  # type: ignore[arg-type]
-    await runner.spawn(workspace=ws_b, plane=plane, nickname="rinzler", issue_uuid=ISSUE)  # type: ignore[arg-type]
-    assert runner.active_count == 2
-    await runner.wait_idle(grace_seconds=0.1)
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["abnormal_exit"]
 
 
-async def test_runner_capacity_cap(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr5_nonzero_exit_without_message_is_no_handoff_with_exit_in_facts(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    from plane_conductor.exceptions import CapacityFullError
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": [init_line()], "exit": 2}])
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["no_handoff"]
+    assert '"exit_code": 2' in h.store.one("SELECT facts FROM alerts")["facts"]
 
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(fake_claude),
-            "max_concurrent_sessions": 2,
-            "log_dir": tmp_path / "logs",
-        }
+
+async def test_fr5_timeout_with_handoff_is_abnormal_exit(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1")), "sleep": 30}],
+        session_timeout_seconds=1,
     )
-    runner = Runner(settings=s)
-    plane = StubPlane()
-
-    await runner.spawn(
-        workspace=workspace_config, plane=plane, nickname="a", issue_uuid=UUID(int=1)
-    )  # type: ignore[arg-type]
-    await runner.spawn(
-        workspace=workspace_config, plane=plane, nickname="b", issue_uuid=UUID(int=2)
-    )  # type: ignore[arg-type]
-    assert runner.active_count == 2
-    with pytest.raises(CapacityFullError):
-        await runner.spawn(
-            workspace=workspace_config, plane=plane, nickname="c", issue_uuid=UUID(int=3)
-        )  # type: ignore[arg-type]
-
-    await runner.wait_idle(grace_seconds=0.1)
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["abnormal_exit"]
+    assert h.runs()[0]["timed_out"] == 1
 
 
-async def test_request_spawn_immediate_when_not_active(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_fr5_failed_start_gets_one_comment_not_two(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """When the triple isn't running, request_spawn fires immediately."""
-    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
-    runner = Runner(settings=s)
-
-    result = await runner.request_spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    assert result["status"] == "spawned"
-    assert "log_path" in result
-
-    await runner.wait_idle()
-    assert runner.active_count == 0
-    assert runner.pending_count == 0
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": [], "exit": 1}])
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == ["start_failed"]  # not also no_handoff
 
 
-async def test_request_spawn_queues_when_active(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_late_final_tool_result_is_registered_before_the_outcome(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """Second request for the same triple queues instead of raising."""
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={"claude_binary": str(fake_claude), "log_dir": tmp_path / "logs"}
+    """The last tool result is buffered in the pipe when the process exits: still seen (reader barrier)."""
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": [init_line(), *handoff_lines("t1", "c-last")], "exit": 0}],
     )
-    runner = Runner(settings=s)
-
-    first = await runner.request_spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    assert first["status"] == "spawned"
-
-    second = await runner.request_spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    assert second["status"] == "queued"
-    assert runner.pending_count == 1
-
-    third = await runner.request_spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    assert third["status"] == "queued"
-    assert runner.pending_count == 1  # coalesced — same key, overwrites
-
-    await runner.wait_idle(grace_seconds=0.1)
+    h.add_trigger()
+    await h.settle()
+    assert h.alert_reasons() == []
+    assert h.store.one("SELECT state FROM handoffs")["state"] == "posted"
 
 
-async def test_request_spawn_flushes_pending_on_active_exit(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_oversized_line_is_discarded_and_later_handoff_still_registered(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """A queued spawn fires after the active session for the same key exits."""
-    # First session uses a short-lived /bin/true so it exits ~immediately.
-    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
-    runner = Runner(settings=s)
+    import plane_conductor.runner as runner_mod
 
-    plane = StubPlane()
-    first = await runner.request_spawn(
-        workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    assert first["status"] == "spawned"
-
-    # Queue a second spawn for the same triple before the first finishes.
-    second = await runner.request_spawn(
-        workspace=workspace_config, plane=plane, nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    assert second["status"] == "queued"
-
-    # First session exits → pending must flush → second session runs → both
-    # eventually drain. wait_idle waits for ALL active + flushed sessions.
-    await runner.wait_idle(grace_seconds=0.2)
-    assert runner.active_count == 0
-    assert runner.pending_count == 0
+    big = "x" * (200 * 1024)
+    lines = [init_line(), big, *handoff_lines("t1", "c-after-big")]
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": lines}])
+    orig = runner_mod.STREAM_LIMIT
+    runner_mod.STREAM_LIMIT = 64 * 1024  # a "40 MiB line" scaled down for the test
+    try:
+        h.add_trigger()
+        await h.settle()
+    finally:
+        runner_mod.STREAM_LIMIT = orig
+    assert h.store.one("SELECT comment_id FROM handoffs")["comment_id"] == "c-after-big"
+    assert h.alert_reasons() == []
 
 
-async def test_request_spawn_capacity_full_still_raises(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_unwritable_journal_does_not_stop_the_drain(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig, monkeypatch
 ) -> None:
-    """Capacity is a hard cap — request_spawn raises rather than queueing."""
-    from plane_conductor.exceptions import CapacityFullError
+    """A failing journal write is logged once and parsing continues (no stalled pipe)."""
+    import io
 
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(fake_claude),
-            "max_concurrent_sessions": 1,
-            "log_dir": tmp_path / "logs",
-        }
+    class Boom(io.RawIOBase):
+        def writable(self) -> bool:
+            return True
+
+        def write(self, b):  # type: ignore[no-untyped-def]
+            raise OSError("disk full")
+
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1"))}],
     )
-    runner = Runner(settings=s)
+    real_path = journal_path
 
-    await runner.request_spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="a", issue_uuid=UUID(int=1)
-    )  # type: ignore[arg-type]
-    with pytest.raises(CapacityFullError):
-        await runner.request_spawn(
-            workspace=workspace_config, plane=StubPlane(), nickname="b", issue_uuid=UUID(int=2)
-        )  # type: ignore[arg-type]
+    def fake_journal_path(state_dir: Path, run_id: str) -> Path:
+        return real_path(state_dir, run_id)
 
-    await runner.wait_idle(grace_seconds=0.1)
+    # make the journal file read-only after creation: open("ab") on a read-only file fails →
+    # that is a start failure; instead make writes fail by pointing at /dev/full
+    import plane_conductor.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "journal_path", lambda *_a: Path("/dev/full"))
+    h.add_trigger()
+    await h.settle()
+    # handoff still registered from the live stream although every journal write failed
+    assert h.store.one("SELECT state FROM handoffs")["state"] == "posted"
+    assert h.alert_reasons() == []
 
 
-async def test_request_spawn_independent_triples_run_in_parallel(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+# --- process group ------------------------------------------------------------------------
+
+
+async def test_slot_is_held_until_the_whole_group_is_gone(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """request_spawn for a different (nick, issue) doesn't queue against an unrelated active."""
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 5\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(fake_claude),
-            "max_concurrent_sessions": 4,
-            "log_dir": tmp_path / "logs",
-        }
+    """A grandchild outliving the leader keeps the role 'running' (FR-3)."""
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1")), "bg": 2}],
     )
-    runner = Runner(settings=s)
-    plane = StubPlane()
-
-    a = await runner.request_spawn(
-        workspace=workspace_config, plane=plane, nickname="a", issue_uuid=UUID(int=1)
-    )  # type: ignore[arg-type]
-    b = await runner.request_spawn(
-        workspace=workspace_config, plane=plane, nickname="b", issue_uuid=UUID(int=2)
-    )  # type: ignore[arg-type]
-    assert a["status"] == b["status"] == "spawned"
-    assert runner.active_count == 2
-    assert runner.pending_count == 0
-
-    await runner.wait_idle(grace_seconds=0.1)
+    h.add_trigger()
+    await h.dispatcher.tick()
+    await asyncio.sleep(1.0)  # leader long gone, grandchild alive
+    assert h.slots() == 1
+    t0 = time.monotonic()
+    await h.settle()
+    assert h.slots() == 0
+    assert time.monotonic() - t0 < 6
 
 
-async def test_active_set_clears_after_exit(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_timeout_kills_descendants(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
-    runner = Runner(settings=s)
-    await runner.spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    await runner.wait_idle()
-    assert runner.active_count == 0
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1")), "sleep": 30, "bg": 30}],
+        session_timeout_seconds=1,
+    )
+    h.add_trigger()
+    t0 = time.monotonic()
+    await h.settle()
+    assert time.monotonic() - t0 < 12
+    assert h.slots() == 0
 
 
-async def test_kill_group_kills_descendants(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+# --- announce -------------------------------------------------------------------------------
+
+
+async def test_announce_posts_and_updates_without_delaying_start(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    marker = tmp_path / "child_alive"
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text(
-        f"#!/bin/sh\n(while true; do touch {marker}; sleep 1; done) &\nCHILD=$!\nsleep 30\n"
-    )
-    fake_claude.chmod(0o755)
-
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(fake_claude),
-            "session_timeout_seconds": 1,
-            "log_dir": tmp_path / "logs",
-        }
-    )
-    runner = Runner(settings=s)
-    await runner.spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    await runner.wait_idle()
-
-    await asyncio.sleep(0.2)
-    if not marker.exists():
-        return
-    mtime_a = marker.stat().st_mtime
-    await asyncio.sleep(2.5)
-    mtime_b = marker.stat().st_mtime
-    assert mtime_a == mtime_b, "grandchild process survived process-group kill"
-
-
-async def test_sentinel_written_and_cleared(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
-    runner = Runner(settings=s)
-
-    await runner.spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-    await runner.wait_idle()
-
-    sentinel_dir = s.log_dir / ".active"
-    if sentinel_dir.exists():
-        assert list(sentinel_dir.iterdir()) == []
-
-
-async def test_recover_orphaned_sessions_posts_comment(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    from plane_conductor.runner import recover_orphaned_sessions
-
-    s = settings.model_copy(update={"log_dir": tmp_path / "logs"})
-    sentinel_dir = s.log_dir / ".active"
-    sentinel_dir.mkdir(parents=True)
-    sentinel = sentinel_dir / f"{workspace_config.workspace_slug}-rinzler-{ISSUE}.json"
-    sentinel.write_text(
-        f'{{"workspace_slug":"{workspace_config.workspace_slug}","nickname":"rinzler",'
-        f'"issue_uuid":"{ISSUE}","log_path":"/tmp/x.log",'
-        f'"started_at":"2026-04-30T10:00:00+00:00"}}'
-    )
-
-    plane = StubPlane()
-    n = await recover_orphaned_sessions(
-        s,
-        {workspace_config.workspace_slug: (workspace_config, plane)},  # type: ignore[arg-type]
-    )
-    assert n == 1
-    assert len(plane.comments) == 1
-    assert "restarted" in plane.comments[0][2]
-    assert not sentinel.exists()
-
-
-async def test_recover_skips_unknown_workspace_sentinels(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    """If a sentinel references a workspace that is no longer configured, drop it."""
-    from plane_conductor.runner import recover_orphaned_sessions
-
-    s = settings.model_copy(update={"log_dir": tmp_path / "logs"})
-    sentinel_dir = s.log_dir / ".active"
-    sentinel_dir.mkdir(parents=True)
-    sentinel = sentinel_dir / f"deleted-rinzler-{ISSUE}.json"
-    sentinel.write_text(
-        f'{{"workspace_slug":"deleted","nickname":"rinzler",'
-        f'"issue_uuid":"{ISSUE}","log_path":"/tmp/x.log",'
-        f'"started_at":"2026-04-30T10:00:00+00:00"}}'
-    )
-    plane = StubPlane()
-    n = await recover_orphaned_sessions(
-        s,
-        {workspace_config.workspace_slug: (workspace_config, plane)},  # type: ignore[arg-type]
-    )
-    assert n == 0
-    assert plane.comments == []
-    assert not sentinel.exists()
-
-
-async def test_recover_orphaned_sessions_handles_corrupt_sentinel(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    from plane_conductor.runner import recover_orphaned_sessions
-
-    s = settings.model_copy(update={"log_dir": tmp_path / "logs"})
-    sentinel_dir = s.log_dir / ".active"
-    sentinel_dir.mkdir(parents=True)
-    bad = sentinel_dir / "broken.json"
-    bad.write_text("not-json")
-    plane = StubPlane()
-    n = await recover_orphaned_sessions(
-        s,
-        {workspace_config.workspace_slug: (workspace_config, plane)},  # type: ignore[arg-type]
-    )
-    assert n == 0
-    assert plane.comments == []
-    assert not bad.exists()
-
-
-async def test_recover_when_sentinel_dir_missing(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    from plane_conductor.runner import recover_orphaned_sessions
-
-    s = settings.model_copy(update={"log_dir": tmp_path / "no-such"})
-    plane = StubPlane()
-    assert (
-        await recover_orphaned_sessions(
-            s,
-            {workspace_config.workspace_slug: (workspace_config, plane)},  # type: ignore[arg-type]
-        )
-        == 0
-    )
-
-
-async def test_wait_idle_force_kills_after_grace(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    fake_claude = tmp_path / "fake_claude"
-    fake_claude.write_text("#!/bin/sh\nsleep 60\n")
-    fake_claude.chmod(0o755)
-    s = settings.model_copy(
-        update={
-            "claude_binary": str(fake_claude),
-            "session_timeout_seconds": 600,
-            "log_dir": tmp_path / "logs",
-        }
-    )
-    runner = Runner(settings=s)
-    await runner.spawn(
-        workspace=workspace_config, plane=StubPlane(), nickname="rinzler", issue_uuid=ISSUE
-    )  # type: ignore[arg-type]
-
-    started = asyncio.get_event_loop().time()
-    await runner.wait_idle(grace_seconds=0.5)
-    elapsed = asyncio.get_event_loop().time() - started
-    assert elapsed < 5.0, f"wait_idle did not return promptly (took {elapsed:.1f}s)"
-
-
-# --- announce_spawn ---------------------------------------------------------
-
-
-async def test_announce_spawn_posts_comment_and_updates_on_success(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
-) -> None:
-    s = settings.model_copy(update={"claude_binary": "/bin/true", "log_dir": tmp_path / "logs"})
-    plane = StubPlane()
-    runner = Runner(settings=s)
     ws = workspace_config.model_copy(update={"announce_spawn": True})
-
-    await runner.spawn(workspace=ws, plane=plane, nickname="rinzler", issue_uuid=ISSUE)  # type: ignore[arg-type]
-    await runner.wait_idle()
-
-    assert len(plane.comments) == 1
-    assert "picking up" in plane.comments[0][2]
-    assert len(plane.updates) == 1
-    _, _, comment_id, html = plane.updates[0]
-    assert comment_id == "c1"
-    assert "done" in html
+    h = Harness(tmp_path, settings, ws, [{"lines": good_run(*handoff_lines("t1", "c-1"))}])
+    h.add_trigger()
+    await h.settle()
+    assert len(h.plane.created) == 1 and "picking up" in h.plane.created[0]["html"]
+    assert h.plane.updated and "done" in h.plane.updated[0][1]
 
 
-async def test_announce_spawn_updates_comment_on_failure(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+async def test_announce_update_says_failed_to_start(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    s = settings.model_copy(update={"claude_binary": "/bin/false", "log_dir": tmp_path / "logs"})
-    plane = StubPlane()
-    runner = Runner(settings=s)
     ws = workspace_config.model_copy(update={"announce_spawn": True})
-
-    await runner.spawn(workspace=ws, plane=plane, nickname="rinzler", issue_uuid=ISSUE)  # type: ignore[arg-type]
-    await runner.wait_idle()
-
-    assert len(plane.comments) == 1
-    assert len(plane.updates) == 1
-    assert "exited 1" in plane.updates[0][3]
+    h = Harness(tmp_path, settings, ws, [{"lines": []}], start_retries=0)
+    h.add_trigger()
+    await h.settle()
+    assert "failed to start" in h.plane.updated[0][1]
 
 
-async def test_announce_spawn_falls_back_to_failure_when_create_failed(
-    settings: Settings, workspace_config: WorkspaceConfig, tmp_path: Path
+# --- codex-review findings --------------------------------------------------------------------
+
+
+async def test_grace_expiry_kills_the_agent_group_instead_of_leaking_it(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
 ) -> None:
-    """If the initial announce-comment POST fails, no comment_id is captured;
-    on nonzero exit, supervisor falls back to posting a fresh failure comment.
-    """
-    from plane_conductor.exceptions import PlaneAPIError
+    """wait_idle(grace) must SIGKILL the running group; cancelling the supervisors first would
+    drop the process handles before the kill step and let the agent survive shutdown."""
+    import os
+    import signal as _signal
 
-    class CreateFailsPlane(StubPlane):
-        async def create_issue_comment(
-            self, project_id: Any, issue_id: Any, comment_html: str
-        ) -> dict[str, Any]:
-            self.comments.append((project_id, issue_id, comment_html))
-            if "picking up" in comment_html:
-                raise PlaneAPIError(503, "down")
-            return {"id": "c-fail"}
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1")), "sleep": 60, "bg": 60}],
+    )
+    h.add_trigger()
+    await h.dispatcher.tick()
+    for _ in range(100):  # wait for the process to exist
+        row = h.store.one("SELECT pid FROM runs")
+        if row is not None and row["pid"]:
+            break
+        await asyncio.sleep(0.05)
+    pid = h.store.one("SELECT pid FROM runs")["pid"]
+    await h.runner.wait_idle(grace_seconds=0.5)
+    time.sleep(0.2)
+    with __import__("contextlib").suppress(ProcessLookupError):
+        os.killpg(pid, _signal.SIGKILL)  # cleanup if the test is about to fail
+        raise AssertionError("agent process group survived wait_idle")
 
-    s = settings.model_copy(update={"claude_binary": "/bin/false", "log_dir": tmp_path / "logs"})
-    plane = CreateFailsPlane()
-    runner = Runner(settings=s)
-    ws = workspace_config.model_copy(update={"announce_spawn": True})
 
-    await runner.spawn(workspace=ws, plane=plane, nickname="rinzler", issue_uuid=ISSUE)  # type: ignore[arg-type]
-    await runner.wait_idle()
+async def test_start_retry_is_not_attempted_during_shutdown(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    """After shutdown began, a failed start must not spawn another attempt (codex-review P2)."""
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": []}], start_retries=3)
+    real_sleep = h.runner._sleep
 
-    assert len(plane.comments) == 2
-    assert plane.updates == []
+    async def stopping_sleep(delay: float) -> None:
+        h.runner.stopping = True  # shutdown begins during the backoff
+        await real_sleep(delay)
+
+    h.runner._sleep = stopping_sleep
+    h.add_trigger()
+    await h.settle()
+    assert invocations(tmp_path) == 1  # no second attempt after the stop flag
+
+
+async def test_cancelled_supervisor_still_kills_its_process_group(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    import os
+    import signal as _signal
+
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": good_run(*handoff_lines("t1", "c-1")), "sleep": 60, "bg": 60}],
+    )
+    h.add_trigger()
+    await h.dispatcher.tick()
+    for _ in range(100):
+        row = h.store.one("SELECT pid FROM runs")
+        if row is not None and row["pid"]:
+            break
+        await asyncio.sleep(0.05)
+    pid = h.store.one("SELECT pid FROM runs")["pid"]
+    for t in list(h.runner._tasks):
+        t.cancel()
+    await asyncio.gather(*list(h.runner._tasks), return_exceptions=True)
+    # SIGKILL is sent at once, but the group leader stays a zombie until the loop reaps
+    # it, and kill(0) counts zombies: wait (without blocking the loop) for no LIVE member.
+    for _ in range(50):
+        if not _live_group_members(pid):
+            return
+        await asyncio.sleep(0.1)
+    with __import__("contextlib").suppress(ProcessLookupError):
+        os.killpg(pid, _signal.SIGKILL)
+    raise AssertionError("cancelling the supervisor left the agent group running")
+
+
+def _live_group_members(pgid: int) -> list[int]:
+    """PIDs of processes in group ``pgid`` that are not zombies (Linux /proc)."""
+    live = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if fields[0] != "Z" and int(fields[2]) == pgid:
+            live.append(int(entry.name))
+    return live
+
+
+async def test_incomplete_registration_keeps_replayed_zero_for_the_next_start(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig, monkeypatch
+) -> None:
+    """Journal registration that never became clean must be retried at startup (codex-review P2)."""
+    import sqlite3
+
+    import plane_conductor.runner as runner_mod
+    from plane_conductor.stream import StreamRegistrar
+
+    def boom(self, block):  # type: ignore[no-untyped-def]
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(StreamRegistrar, "_on_tool_result", boom)
+    real_replay = runner_mod.replay_journal
+
+    def dirty_replay(store, run_id, ws, jpath):  # type: ignore[no-untyped-def]
+        reg = real_replay(store, run_id, ws, jpath)
+        reg.dirty = True
+        return reg
+
+    monkeypatch.setattr(runner_mod, "replay_journal", dirty_replay)
+    h = Harness(
+        tmp_path, settings, workspace_config, [{"lines": good_run(*handoff_lines("t1", "c-1"))}]
+    )
+    h.add_trigger()
+    await h.settle()
+    assert h.store.one("SELECT replayed FROM runs")["replayed"] == 0
+
+
+async def test_all_attempts_of_a_group_are_closed_when_the_group_completes(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    h = Harness(
+        tmp_path,
+        settings,
+        workspace_config,
+        [{"lines": []}, {"lines": good_run(*handoff_lines("t1", "c-1"))}],
+    )
+    h.add_trigger()
+    await h.settle()
+    rows = h.store.all("SELECT attempt, state, outcome_done FROM runs ORDER BY attempt")
+    assert [(r["attempt"], r["outcome_done"]) for r in rows] == [(0, 1), (1, 1)]
+
+
+async def test_failed_attempt_stays_open_until_the_group_completes(
+    tmp_path: Path, settings: Settings, workspace_config: WorkspaceConfig
+) -> None:
+    h = Harness(tmp_path, settings, workspace_config, [{"lines": []}], start_retries=1)
+    seen: list[int] = []
+    real_sleep = h.runner._sleep
+
+    async def spying_sleep(delay: float) -> None:
+        row = h.store.one("SELECT outcome_done FROM runs WHERE attempt=0")
+        seen.append(int(row["outcome_done"]))
+        await real_sleep(delay)
+
+    h.runner._sleep = spying_sleep
+    h.add_trigger()
+    await h.settle()
+    assert seen == [0]  # open during the backoff, closed at completion
+    assert h.store.one("SELECT outcome_done FROM runs WHERE attempt=0")["outcome_done"] == 1
