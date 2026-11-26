@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — agent implementer
+- **`agents[].implementer: claude | codex`** in `conductor.d/<workspace>.yaml` (default `claude`). `codex`
+  adds `Implementer: codex` to the agent's spawn prompt; the agent then has Codex write its PLAN steps
+  (claude-sdlc-agents agent-base §9.5 step 3b).
+
 ### Added — pipeline route
 - **`pickup_issue` / `retrieve_work_item_by_identifier` return the root's route**: `root_uuid`,
   `route` (`bug` / `doc-only` / None — the root's one `pipeline:*` label, read from Plane on every

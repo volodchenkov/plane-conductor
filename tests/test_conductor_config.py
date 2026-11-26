@@ -68,6 +68,13 @@ def test_extra_keys_rejected() -> None:
         AgentDef(nickname="x", prompt_role="y", unknown_field="oops")  # type: ignore[call-arg]
 
 
+def test_agent_implementer_defaults_to_claude_and_rejects_unknown() -> None:
+    assert AgentDef(nickname="beck", prompt_role="react-developer").implementer == "claude"
+    assert AgentDef(nickname="beck", prompt_role="r", implementer="codex").implementer == "codex"
+    with pytest.raises(ValidationError):
+        AgentDef(nickname="beck", prompt_role="r", implementer="gpt")  # type: ignore[arg-type]
+
+
 def test_workspace_extra_keys_rejected() -> None:
     with pytest.raises(ValidationError):
         _ws(unsupported_root_key="oops")
