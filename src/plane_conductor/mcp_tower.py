@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 from uuid import UUID
 
 from mcp.server.mcpserver import MCPServer
@@ -109,7 +109,9 @@ ARTIFACT_LABEL_BY_ROLE: dict[str, str] = {
     "requirements": "artifact:requirements",
 }
 
-PIPELINE_DOC_ONLY_LABEL = "pipeline:doc-only"
+# Route of a root = its one `pipeline:<route>` label (claude-sdlc-agents plane-api.md §6.13b).
+PIPELINE_LABEL_PREFIX = "pipeline:"
+PipelineRoute = Literal["bug", "doc-only"]
 
 # Soft cap on artifact description size (Markdown chars after HTML-strip). Tower
 # does not reject above this — it just stamps `description_size_warning: True`
@@ -621,12 +623,15 @@ async def pickup_issue(
     """Resolve an issue by UUID. Conductor always passes UUID in the spawn
     prompt, so the lookup is a single GET.
 
-    Returns the full work item record plus the resolved workspace slug.
+    Returns the full work item record plus the resolved workspace slug, and the
+    route of its root (`_root_route`): `root_uuid`, `route`, `route_conflict`.
     """
     ctx = _registry().resolve(workspace=workspace)
     async with await _client_for(ctx) as plane:
         issue = await plane.get_issue(ctx.config.project_id, issue_uuid)
+        route = await _root_route(plane, ctx, issue)
     return {
+        **route,
         "id": issue.get("id"),
         "name": issue.get("name"),
         "sequence_id": issue.get("sequence_id"),
@@ -683,11 +688,13 @@ async def retrieve_work_item_by_identifier(
     ctx = _registry().resolve(workspace=workspace, project_identifier=project_identifier)
     async with await _client_for(ctx) as plane:
         issue = await plane.retrieve_issue_by_sequence_id(ctx.config.project_id, sequence_id)
-    if issue is None:
-        raise TowerError(
-            f"work item {cleaned} not found in workspace {ctx.config.workspace_slug!r}"
-        )
+        if issue is None:
+            raise TowerError(
+                f"work item {cleaned} not found in workspace {ctx.config.workspace_slug!r}"
+            )
+        route = await _root_route(plane, ctx, issue)
     return {
+        **route,
         "id": issue.get("id"),
         "sequence_id": issue.get("sequence_id"),
         "identifier": f"{ctx.project_identifier}-{issue.get('sequence_id')}",
@@ -811,6 +818,98 @@ async def finalize_done(
             f"Re-run finalize_done."
         )
     return {"root": root_uuid, "state": done, "closed": closed, "already_done": already}
+
+
+# ----- pipeline route ------------------------------------------------------
+
+
+async def _pipeline_labels(plane: PlaneClient, ctx: WorkspaceContext) -> dict[str, str]:
+    """`{label uuid: route}` of the project's `pipeline:*` labels, read from Plane on every call.
+
+    Not the boot-time `ctx.label_by_name` cache: a route label created or renamed after the
+    tower started must count at once.
+    """
+    labels = await plane.list_labels(ctx.config.project_id)
+    return {
+        str(lbl.get("id")): name[len(PIPELINE_LABEL_PREFIX) :]
+        for lbl in labels
+        if (name := str(lbl.get("name") or "")).startswith(PIPELINE_LABEL_PREFIX)
+    }
+
+
+async def _root_route(
+    plane: PlaneClient, ctx: WorkspaceContext, issue: dict[str, Any]
+) -> dict[str, Any]:
+    """Route of the root of `issue` (itself when it has no parent).
+
+    The root is found by following `parent` to the top (the pipeline keeps two levels, a
+    deeper tree made by hand in Plane still resolves; a cycle raises).
+    `route` is the one `pipeline:*` label on the root, without the prefix, or None.
+    Two or more → `route` None and `route_conflict` lists them: the initiator picks one.
+    """
+    root, seen = issue, {str(issue.get("id"))}
+    while root.get("parent"):
+        parent = str(root.get("parent"))
+        if parent in seen:
+            raise TowerError(f"parent cycle at {parent} — fix the hierarchy in Plane")
+        seen.add(parent)
+        root = await plane.get_issue(ctx.config.project_id, parent)
+    pipeline = await _pipeline_labels(plane, ctx)
+    routes = sorted({pipeline[str(u)] for u in root.get("labels") or [] if str(u) in pipeline})
+    return {
+        "root_uuid": str(root.get("id")),
+        "route": routes[0] if len(routes) == 1 else None,
+        "route_conflict": routes if len(routes) > 1 else [],
+    }
+
+
+@mcp.tool()
+async def set_pipeline_route(
+    root_uuid: str,
+    route: PipelineRoute | None,
+    *,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Set the route of a root issue: its one `pipeline:<route>` label (plane-api.md §6.13b).
+
+    `route` replaces any other `pipeline:*` label on the root; None removes them all. Every
+    other label stays. Refuses a sub-issue. Idempotent: labels already as asked → no write,
+    `changed: False`; so after an ambiguous write, call it again — it re-reads the root first.
+
+    The write replaces the whole label list (Plane has no add-one-label call): a label someone
+    adds in the Plane UI between this read and the write is lost. Route writers are the
+    business-analyst (once per root) and Tron at filing time, so the window is accepted.
+    """
+    ctx = _registry().resolve(workspace=workspace)
+    root_uuid = _ensure_uuid(root_uuid, "root_uuid")
+    async with await _client_for(ctx) as plane:
+        root = await plane.get_issue(ctx.config.project_id, root_uuid)
+        if root.get("parent"):
+            raise TowerError(
+                f"{root_uuid} has parent {root.get('parent')} — the route goes on the root, "
+                f"pass the root issue"
+            )
+        pipeline = await _pipeline_labels(plane, ctx)
+        wanted: list[str] = []
+        if route is not None:
+            wanted = [u for u, r in pipeline.items() if r == route][:1]
+            if not wanted:
+                raise LabelNotFoundError(
+                    f"workspace {ctx.config.workspace_slug!r}: no label "
+                    f"{PIPELINE_LABEL_PREFIX}{route} in the project — run `plane-conductor setup`"
+                )
+        current = [str(u) for u in root.get("labels") or []]
+        target = [u for u in current if u not in pipeline] + wanted
+        if set(target) == set(current):
+            return {"root_uuid": root_uuid, "route": route, "changed": False, "labels": current}
+        updated = await plane.update_issue(ctx.config.project_id, root_uuid, {"labels": target})
+    got = {str(u) for u in updated.get("labels") or []}
+    if got != set(target):
+        raise TowerError(
+            f"root {root_uuid}: Plane returned labels {sorted(got)}, expected {sorted(target)} — "
+            f"call set_pipeline_route again"
+        )
+    return {"root_uuid": root_uuid, "route": route, "changed": True, "labels": target}
 
 
 def _summarize_issue(item: dict[str, Any]) -> dict[str, Any]:

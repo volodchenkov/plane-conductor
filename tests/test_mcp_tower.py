@@ -11,6 +11,7 @@ already hydrated and inspect the tower's calls.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
@@ -45,6 +46,7 @@ from plane_conductor.mcp_tower import (
     post_review,
     request_handoff,
     retrieve_work_item_by_identifier,
+    set_pipeline_route,
 )
 
 # ---------------------------------------------------------------------------
@@ -184,6 +186,7 @@ async def test_pickup_issue_by_uuid(
             },
         )
     )
+    _mock_labels(ctx, project_id, [])
     result = await pickup_issue(
         issue_uuid=ROOT_UUID,
         workspace=ctx.config.workspace_slug,
@@ -192,6 +195,271 @@ async def test_pickup_issue_by_uuid(
     assert result["sequence_id"] == 42
     assert result["workspace_slug"] == ctx.config.workspace_slug
     assert result["project_identifier"] == "TEST"
+    assert result["root_uuid"] == ROOT_UUID
+    assert result["route"] is None
+    assert result["route_conflict"] == []
+
+
+# ---------------------------------------------------------------------------
+# pipeline route: pickup_issue.route / set_pipeline_route
+# ---------------------------------------------------------------------------
+
+LABEL_BUG = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+LABEL_DOC = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+LABEL_OTHER = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+PROJECT_LABELS = [
+    {"id": LABEL_SPEC, "name": "artifact:spec"},
+    {"id": LABEL_BUG, "name": "pipeline:bug"},
+    {"id": LABEL_DOC, "name": "pipeline:doc-only"},
+    {"id": LABEL_OTHER, "name": "frontend"},
+]
+
+
+def _labels_url(ctx: WorkspaceContext, project_id: str) -> str:
+    return (
+        f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/"
+        f"projects/{project_id}/labels/"
+    )
+
+
+def _issue_url(ctx: WorkspaceContext, project_id: str, uuid: str) -> str:
+    return (
+        f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/"
+        f"projects/{project_id}/issues/{uuid}/"
+    )
+
+
+def _mock_labels(ctx: WorkspaceContext, project_id: str, labels: list[dict[str, Any]]) -> None:
+    respx.get(_labels_url(ctx, project_id)).mock(return_value=httpx.Response(200, json=labels))
+
+
+def _mock_issue(
+    ctx: WorkspaceContext, project_id: str, uuid: str, labels: list[str], parent: str | None = None
+) -> None:
+    respx.get(_issue_url(ctx, project_id, uuid)).mock(
+        return_value=httpx.Response(
+            200, json={"id": uuid, "name": "x", "labels": labels, "parent": parent}
+        )
+    )
+
+
+@respx.mock
+async def test_pickup_issue_on_sub_issue_reads_route_of_root(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Agents are spawned on sub-issues; the route lives on the root."""
+    _mock_issue(ctx, project_id, SPEC_SUB_UUID, [LABEL_SPEC], parent=ROOT_UUID)
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_OTHER, LABEL_BUG])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    result = await pickup_issue(issue_uuid=SPEC_SUB_UUID, workspace="testws")
+    assert result["id"] == SPEC_SUB_UUID
+    assert result["root_uuid"] == ROOT_UUID
+    assert result["route"] == "bug"
+    assert result["route_conflict"] == []
+
+
+@respx.mock
+async def test_pickup_issue_follows_parents_to_the_top(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """A grandchild made by hand in Plane still resolves to the top root's route."""
+    _mock_issue(ctx, project_id, BACKEND_SUB_UUID, [], parent=SPEC_SUB_UUID)
+    _mock_issue(ctx, project_id, SPEC_SUB_UUID, [LABEL_SPEC], parent=ROOT_UUID)
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_BUG])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    result = await pickup_issue(issue_uuid=BACKEND_SUB_UUID, workspace="testws")
+    assert result["root_uuid"] == ROOT_UUID
+    assert result["route"] == "bug"
+
+
+@respx.mock
+async def test_pickup_issue_parent_cycle_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, SPEC_SUB_UUID, [], parent=ROOT_UUID)
+    _mock_issue(ctx, project_id, ROOT_UUID, [], parent=SPEC_SUB_UUID)
+    with pytest.raises(TowerError, match="parent cycle"):
+        await pickup_issue(issue_uuid=SPEC_SUB_UUID, workspace="testws")
+
+
+@respx.mock
+async def test_pickup_issue_route_reads_labels_fresh_not_from_cache(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """A route label created after the tower booted (absent from ctx cache) still counts."""
+    assert "pipeline:doc-only" not in ctx.label_by_name
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_DOC])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    assert (await pickup_issue(issue_uuid=ROOT_UUID, workspace="testws"))["route"] == "doc-only"
+
+
+@respx.mock
+async def test_pickup_issue_route_follows_label_pages(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """The route label on a second page of /labels/ is found."""
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_BUG])
+    url = _labels_url(ctx, project_id)
+    respx.get(url, params={"cursor": "100:1:0"}).mock(
+        return_value=httpx.Response(
+            200, json={"results": [{"id": LABEL_BUG, "name": "pipeline:bug"}], "next_cursor": "x"}
+        )
+    )
+    respx.get(url, params={"cursor": "x"}).mock(
+        return_value=httpx.Response(200, json={"results": [], "next_cursor": "y"})
+    )
+    respx.get(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": [{"id": LABEL_OTHER, "name": "frontend"}], "next_cursor": "100:1:0"},
+        )
+    )
+    assert (await pickup_issue(issue_uuid=ROOT_UUID, workspace="testws"))["route"] == "bug"
+
+
+@respx.mock
+async def test_pickup_issue_two_routes_is_a_conflict(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_BUG, LABEL_DOC])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    result = await pickup_issue(issue_uuid=ROOT_UUID, workspace="testws")
+    assert result["route"] is None
+    assert result["route_conflict"] == ["bug", "doc-only"]
+
+
+@respx.mock
+async def test_retrieve_work_item_by_identifier_returns_route(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Same shape as pickup_issue, route included."""
+    respx.get(
+        f"https://plane.test/api/v1/workspaces/{ctx.config.workspace_slug}/"
+        f"projects/{project_id}/issues/"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [{"id": ROOT_UUID, "sequence_id": 42, "labels": [LABEL_DOC]}],
+                "next_cursor": None,
+            },
+        )
+    )
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    result = await retrieve_work_item_by_identifier(identifier="TEST-42")
+    assert result["route"] == "doc-only"
+    assert result["root_uuid"] == ROOT_UUID
+
+
+@respx.mock
+async def test_set_pipeline_route_adds_route_and_keeps_other_labels(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_OTHER])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    patch = respx.patch(_issue_url(ctx, project_id, ROOT_UUID)).mock(
+        return_value=httpx.Response(200, json={"id": ROOT_UUID, "labels": [LABEL_OTHER, LABEL_BUG]})
+    )
+    result = await set_pipeline_route(root_uuid=ROOT_UUID, route="bug", workspace="testws")
+    assert result == {
+        "root_uuid": ROOT_UUID,
+        "route": "bug",
+        "changed": True,
+        "labels": [LABEL_OTHER, LABEL_BUG],
+    }
+    assert json.loads(patch.calls.last.request.content) == {"labels": [LABEL_OTHER, LABEL_BUG]}
+
+
+@respx.mock
+async def test_set_pipeline_route_replaces_another_route(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """One route per root: setting one drops the other `pipeline:*` labels."""
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_DOC, LABEL_OTHER])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    patch = respx.patch(_issue_url(ctx, project_id, ROOT_UUID)).mock(
+        return_value=httpx.Response(200, json={"id": ROOT_UUID, "labels": [LABEL_OTHER, LABEL_BUG]})
+    )
+    await set_pipeline_route(root_uuid=ROOT_UUID, route="bug", workspace="testws")
+    assert json.loads(patch.calls.last.request.content) == {"labels": [LABEL_OTHER, LABEL_BUG]}
+
+
+@respx.mock
+async def test_set_pipeline_route_none_clears_every_route(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_BUG, LABEL_DOC, LABEL_OTHER])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    patch = respx.patch(_issue_url(ctx, project_id, ROOT_UUID)).mock(
+        return_value=httpx.Response(200, json={"id": ROOT_UUID, "labels": [LABEL_OTHER]})
+    )
+    result = await set_pipeline_route(root_uuid=ROOT_UUID, route=None, workspace="testws")
+    assert result["changed"] is True
+    assert json.loads(patch.calls.last.request.content) == {"labels": [LABEL_OTHER]}
+
+
+@respx.mock
+async def test_set_pipeline_route_is_idempotent(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """Already as asked → no write; a retry after an ambiguous write is safe."""
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_BUG, LABEL_OTHER])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    patch = respx.patch(_issue_url(ctx, project_id, ROOT_UUID))
+    result = await set_pipeline_route(root_uuid=ROOT_UUID, route="bug", workspace="testws")
+    assert result["changed"] is False
+    assert patch.call_count == 0
+
+
+@respx.mock
+async def test_set_pipeline_route_refuses_sub_issue(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, SPEC_SUB_UUID, [LABEL_SPEC], parent=ROOT_UUID)
+    with pytest.raises(TowerError, match="goes on the root"):
+        await set_pipeline_route(root_uuid=SPEC_SUB_UUID, route="bug", workspace="testws")
+
+
+async def test_set_pipeline_route_malformed_uuid_raises(registry: TowerRegistry) -> None:
+    with pytest.raises(TowerError, match="not a valid UUID"):
+        await set_pipeline_route(root_uuid="TEST-42", route="bug", workspace="testws")
+
+
+@respx.mock
+async def test_set_pipeline_route_label_missing_in_project_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, ROOT_UUID, [])
+    _mock_labels(ctx, project_id, [{"id": LABEL_DOC, "name": "pipeline:doc-only"}])
+    with pytest.raises(LabelNotFoundError, match="plane-conductor setup"):
+        await set_pipeline_route(root_uuid=ROOT_UUID, route="bug", workspace="testws")
+
+
+@respx.mock
+async def test_set_pipeline_route_response_without_route_raises(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    _mock_issue(ctx, project_id, ROOT_UUID, [LABEL_OTHER])
+    _mock_labels(ctx, project_id, PROJECT_LABELS)
+    respx.patch(_issue_url(ctx, project_id, ROOT_UUID)).mock(
+        return_value=httpx.Response(200, json={"id": ROOT_UUID, "labels": [LABEL_OTHER]})
+    )
+    with pytest.raises(TowerError, match="call set_pipeline_route again"):
+        await set_pipeline_route(root_uuid=ROOT_UUID, route="bug", workspace="testws")
+
+
+@respx.mock
+async def test_set_pipeline_route_plane_error_surfaces(
+    registry: TowerRegistry, ctx: WorkspaceContext, project_id: str
+) -> None:
+    """A root deleted or access revoked → Plane's error reaches the agent, nothing is written."""
+    respx.get(_issue_url(ctx, project_id, ROOT_UUID)).mock(
+        return_value=httpx.Response(404, json={"error": "not found"})
+    )
+    patch = respx.patch(_issue_url(ctx, project_id, ROOT_UUID))
+    with pytest.raises(Exception, match="404"):
+        await set_pipeline_route(root_uuid=ROOT_UUID, route="bug", workspace="testws")
+    assert patch.call_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +496,7 @@ async def test_retrieve_work_item_by_identifier_happy_path(
             },
         )
     )
+    _mock_labels(ctx, project_id, [])
     result = await retrieve_work_item_by_identifier(identifier="TEST-42")
     assert result["id"] == ROOT_UUID
     assert result["sequence_id"] == 42
@@ -251,6 +520,7 @@ async def test_retrieve_work_item_by_identifier_case_insensitive(
             json={"results": [{"id": ROOT_UUID, "sequence_id": 42}], "next_cursor": None},
         )
     )
+    _mock_labels(ctx, project_id, [])
     result = await retrieve_work_item_by_identifier(identifier="test-42")
     assert result["sequence_id"] == 42
 

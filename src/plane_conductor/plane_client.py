@@ -270,11 +270,10 @@ class PlaneClient:
     # ------------------------------------------------------------------
 
     async def list_labels(self, project_id: str | UUID) -> list[dict[str, Any]]:
-        payload = await self._request(
-            "GET",
-            f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/labels/",
+        """List ALL labels of a project, following pagination cursors."""
+        return await self._get_all_pages(
+            f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/labels/"
         )
-        return self._results(payload)
 
     async def create_label(
         self,
@@ -369,9 +368,14 @@ class PlaneClient:
         caller genuinely needs the body, which tower paths don't.
         """
         path = f"/api/v1/workspaces/{self.workspace_slug}/projects/{project_id}/issues/"
-        params: dict[str, Any] = {"per_page": per_page}
-        if fields:
-            params["fields"] = fields
+        extra = {"fields": fields} if fields else {}
+        return await self._get_all_pages(path, per_page=per_page, extra=extra)
+
+    async def _get_all_pages(
+        self, path: str, *, per_page: int = 100, extra: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """GET every page of a Plane list endpoint, following its cursors."""
+        params: dict[str, Any] = {"per_page": per_page, **(extra or {})}
         out: list[dict[str, Any]] = []
         seen_cursors: set[str] = set()
         while True:
@@ -393,9 +397,7 @@ class PlaneClient:
             if not cursor or not isinstance(cursor, str) or cursor in seen_cursors:
                 break
             seen_cursors.add(cursor)
-            params = {"per_page": per_page, "cursor": cursor}
-            if fields:
-                params["fields"] = fields
+            params = {"per_page": per_page, "cursor": cursor, **(extra or {})}
         return out
 
     async def retrieve_issue_by_sequence_id(
