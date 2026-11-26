@@ -38,6 +38,19 @@ def test_build_prompt_includes_url_and_issue(workspace_config: WorkspaceConfig) 
         triggered_by_email="dmitry@example.io",
     )
     assert "@rinzler" in prompt and ISSUE in prompt and "dmitry@example.io" in prompt
+    assert "Implementer:" not in prompt  # the default (claude) adds nothing
+
+
+def test_build_prompt_names_a_codex_implementer(workspace_config: WorkspaceConfig) -> None:
+    prompt = build_prompt(
+        nickname="beck",
+        issue_uuid=UUID(ISSUE),
+        plane_base_url=workspace_config.plane_base_url,
+        workspace_slug=workspace_config.workspace_slug,
+        project_id=workspace_config.project_id,
+        implementer="codex",
+    )
+    assert "\nImplementer: codex\n" in prompt
 
 
 def test_log_path_includes_workspace_slug(tmp_path: Path) -> None:

@@ -63,6 +63,7 @@ def build_prompt(
     workspace_slug: str,
     project_id: str | UUID,
     triggered_by_email: str | None = None,
+    implementer: str = "claude",
 ) -> str:
     """Compose the trigger prompt fed to `claude --print` on stdin."""
     issue_url = f"{plane_base_url}/{workspace_slug}/projects/{project_id}/issues/{issue_uuid}/"
@@ -73,6 +74,8 @@ def build_prompt(
     if triggered_by_email:
         lines.append(f"Triggered by: {triggered_by_email}")
     lines.append(f"Plane URL: {issue_url}")
+    if implementer != "claude":
+        lines.append(f"Implementer: {implementer}")
     lines.append("")
     lines.append("Pick up the issue and proceed per your role's protocol.")
     return "\n".join(lines)
@@ -292,6 +295,7 @@ class Runner:
             jpath.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             log_fp = log_path.open("ab", buffering=0)
             journal_fp = jpath.open("ab", buffering=0)
+            agent_cfg = ws.agents_by_nickname().get(str(run["nickname"]))
             prompt = build_prompt(
                 nickname=str(run["nickname"]),
                 issue_uuid=UUID(str(run["issue_id"])),
@@ -299,8 +303,8 @@ class Runner:
                 workspace_slug=str(run["workspace"]),
                 project_id=str(run["project_id"]),
                 triggered_by_email=run["triggered_by_email"],
+                implementer=agent_cfg.implementer if agent_cfg else "claude",
             )
-            agent_cfg = ws.agents_by_nickname().get(str(run["nickname"]))
             agent_name = agent_cfg.prompt_role if agent_cfg else str(run["nickname"])
             argv = [
                 self.settings.claude_binary,

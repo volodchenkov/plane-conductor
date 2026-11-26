@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import yaml
@@ -54,6 +54,13 @@ class AgentDef(BaseModel):
     prompt_role: str = Field(
         ...,
         description="Filename stem in PROMPTS_DIR (e.g. 'system-analyst' → 'system-analyst.md').",
+    )
+    implementer: Literal["claude", "codex"] = Field(
+        default="claude",
+        description=(
+            "Who writes the code of the agent's PLAN steps. `codex` adds `Implementer: codex` to the "
+            "spawn prompt (claude-sdlc-agents agent-base §9.5 step 3b); the agent keeps everything else."
+        ),
     )
     display_name: str = Field(
         default="",
