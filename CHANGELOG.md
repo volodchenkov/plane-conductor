@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — pipeline route
+- **`pickup_issue` / `retrieve_work_item_by_identifier` return the root's route**: `root_uuid`,
+  `route` (`bug` / `doc-only` / None — the root's one `pipeline:*` label, read from Plane on every
+  call, not the boot cache) and `route_conflict`. Agents spawned on a sub-issue see the root's route.
+- **`set_pipeline_route(root_uuid, route)`** sets or clears the route label of a root, idempotent;
+  every other label stays. Default pipeline label `pipeline:bug`.
+- `list_labels` follows pagination cursors.
+
 ### Changed — reliability (QSALE-55)
 - **Tower errors have a text.** `TowerError` is now an MCP `ToolError`, and an always-on wrapper turns
   every other exception into `plane_error: op= status= path= body=` / `internal_error: op= Type: msg`

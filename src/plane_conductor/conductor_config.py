@@ -96,6 +96,8 @@ def _default_pipeline_labels() -> list[LabelDef]:
     `pipeline:doc-only` triggers the short doc pipeline (see
     claude-sdlc-agents `plane-api.md` §6.13b): initiator triggers a coder
     directly, no SPEC / ARCH_REVIEW / tests / final REVIEW.
+    `pipeline:bug` is set by the business-analyst (tower `set_pipeline_route`)
+    when the root is one bug fix: short SPEC, tests scoped to the bug.
     """
     return [
         LabelDef(
@@ -105,6 +107,11 @@ def _default_pipeline_labels() -> list[LabelDef]:
                 "Short pipeline: documentation-only. Initiator triggers a "
                 "coder directly; no SPEC/ARCH_REVIEW/tests/REVIEW."
             ),
+        ),
+        LabelDef(
+            name="pipeline:bug",
+            color="#d9534f",
+            description="Bug route: one fix — short SPEC, tests scoped to the bug and its screen.",
         ),
     ]
 
